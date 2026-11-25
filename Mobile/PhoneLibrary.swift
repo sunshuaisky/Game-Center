@@ -309,10 +309,14 @@ struct PhoneLibrary {
                     _ = try Format.read([Format.SwitchEntry].self, at: source)
                     try Data(contentsOf: source).write(to: switchRoot.appendingPathComponent(Format.catalog), options: .atomic)
                 } else {
-                    guard let platform,
-                          platform.extensions.contains(source.pathExtension.lowercased())
-                            || Format.isGameFolder(source, runtime: platform.runtime) else { throw Error.wrongFile }
-                    try copyROM(source, platform: platform)
+                    let ext = source.pathExtension.lowercased()
+                    let resolvedPlatform: Format.Platform? = platform
+                        ?? platforms.first(where: { $0.extensions.contains(ext) })
+                        ?? platforms.first(where: { $0.runtime != nil && Format.isGameFolder(source, runtime: $0.runtime) })
+                    guard let resolvedPlatform,
+                          resolvedPlatform.extensions.contains(ext)
+                            || Format.isGameFolder(source, runtime: resolvedPlatform.runtime) else { throw Error.wrongFile }
+                    try copyROM(source, platform: resolvedPlatform)
                 }
             }
         }
@@ -391,6 +395,21 @@ struct PhoneLibrary {
             try S2ArmGameLauncher.validate(at: folder, titleID: build.titleID)
         }
         return build
+    }
+
+    func deleteROM(_ rom: ROM) throws {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: rom.url.path) {
+            try fm.removeItem(at: rom.url)
+        }
+    }
+
+    func deleteSwitchBuilds(for game: SwitchGame) throws {
+        let fm = FileManager.default
+        let buildsFolder = switchRoot.appendingPathComponent("\(game.id)/Builds", isDirectory: true)
+        if fm.fileExists(atPath: buildsFolder.path) {
+            try fm.removeItem(at: buildsFolder)
+        }
     }
 
     private func children(_ url: URL) -> [URL] {

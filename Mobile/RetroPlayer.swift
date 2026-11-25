@@ -9,6 +9,11 @@ import GameCenterSaveSupport
 struct RetroPlayer: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var session = RetroSession()
+    @State private var showingPauseMenu = false
+    @State private var hasController = !GCController.controllers().isEmpty
+    @State private var showVirtualPad = GCController.controllers().isEmpty
+    @AppStorage("phone.player.padOpacity") private var padOpacity = 0.86
+    @AppStorage(TouchPadHaptics.defaultsKey) private var hapticsEnabled = true
     let rom: PhoneLibrary.ROM
     let library: PhoneLibrary
 
@@ -32,54 +37,214 @@ struct RetroPlayer: View {
     var body: some View {
         GeometryReader { size in
             let wide = size.size.width > size.size.height
-            let padSide: CGFloat = wide ? min(136, size.size.height * 0.42) : min(132, size.size.width * 0.36)
-            VStack(spacing: 8) {
-                HStack {
-                    Button("返回", systemImage: "xmark") { dismiss() }
-                        .foregroundStyle(.white)
-                    Spacer()
-                    Text(rom.title).foregroundStyle(.white).lineLimit(1)
-                    Spacer()
-                }
-                .padding(.horizontal, 4)
+            let padSide: CGFloat = wide ? min(132, size.size.height * 0.42) : min(136, size.size.width * 0.36)
+
+            ZStack {
+                Color.black.ignoresSafeArea()
 
                 if let error = session.error {
-                    ContentUnavailableView("无法启动", systemImage: "exclamationmark.circle", description: Text(error))
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if wide {
-                    HStack(spacing: 12) {
-                        leftControls(padSide: padSide)
-                        screenArea
-                        rightControls(padSide: padSide)
+                    VStack(spacing: 16) {
+                        ContentUnavailableView("无法启动", systemImage: "exclamationmark.circle", description: Text(error))
+                            .foregroundStyle(.white)
+                        Button("返回游戏库") { dismiss() }
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color(white: 0.06))
+                            .padding(.horizontal, 22)
+                            .frame(height: 42)
+                            .background(Color(white: 0.94), in: Capsule())
+                            .buttonStyle(.plain)
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    VStack(spacing: 12) {
+                    .padding(24)
+                } else if wide {
+                    ZStack {
                         screenArea
-                        HStack(alignment: .bottom) {
-                            leftControls(padSide: padSide)
-                            Spacer()
-                            rightControls(padSide: padSide)
+                            .ignoresSafeArea(edges: showVirtualPad ? [] : .all)
+
+                        if showVirtualPad {
+                            HStack {
+                                leftControls(padSide: padSide, compact: true)
+                                Spacer()
+                                rightControls(padSide: padSide, compact: true)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 12)
+                            .opacity(padOpacity)
+                            .transition(.opacity)
                         }
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .overlay(alignment: .top) {
+                        PlayerFloatingPill(title: rom.title, hasController: hasController) {
+                            openPauseMenu()
+                        }
+                        .padding(.top, 10)
+                    }
+                } else {
+                    VStack(spacing: 0) {
+                        HStack {
+                            Spacer()
+                            PlayerFloatingPill(title: rom.title, hasController: hasController) {
+                                openPauseMenu()
+                            }
+                            Spacer()
+                        }
+                        .padding(.top, 6)
+                        .padding(.bottom, 8)
+
+                        screenArea
+                            .padding(.horizontal, 10)
+                            .padding(.bottom, 10)
+
+                        if showVirtualPad {
+                            VStack(spacing: 14) {
+                                if hasShoulders {
+                                    HStack {
+                                        HStack(spacing: 8) {
+                                            shoulderButton(isPlayStation ? "L1" : "L", bit: 10)
+                                            if hasTriggers { shoulderButton("L2", bit: 12) }
+                                        }
+                                        Spacer()
+                                        HStack(spacing: 8) {
+                                            if hasTriggers { shoulderButton("R2", bit: 13) }
+                                            shoulderButton(isPlayStation ? "R1" : "R", bit: 11)
+                                        }
+                                    }
+                                }
+
+                                HStack(alignment: .center) {
+                                    TouchDPad { state in
+                                        session.setButton(4, pressed: state.up)
+                                        session.setButton(5, pressed: state.down)
+                                        session.setButton(6, pressed: state.left)
+                                        session.setButton(7, pressed: state.right)
+                                    }
+                                    .frame(width: padSide, height: padSide)
+
+                                    Spacer()
+
+                                    TouchDiamondPad(labels: faceLabels) { state in
+                                        session.setButton(9, pressed: state.top)
+                                        session.setButton(1, pressed: state.left)
+                                        session.setButton(8, pressed: state.right)
+                                        session.setButton(0, pressed: state.bottom)
+                                    }
+                                    .frame(width: padSide, height: padSide)
+                                }
+
+                                if hasLeftStick || hasRightStick {
+                                    HStack {
+                                        if hasLeftStick {
+                                            TouchAnalogStick(invertY: false) { x, y in
+                                                session.setAnalog(0, x: x, y: y)
+                                            }
+                                            .frame(width: 74, height: 74)
+                                        }
+                                        Spacer()
+                                        if hasRightStick {
+                                            TouchAnalogStick(invertY: false) { x, y in
+                                                session.setAnalog(1, x: x, y: y)
+                                            }
+                                            .frame(width: 74, height: 74)
+                                        }
+                                    }
+                                    .padding(.horizontal, 12)
+                                }
+
+                                HStack(spacing: 18) {
+                                    TouchPadButton(title: "SELECT") { pressed in
+                                        session.setButton(2, pressed: pressed)
+                                    }
+                                    .frame(width: 82, height: 34)
+
+                                    TouchPadButton(title: "START") { pressed in
+                                        session.setButton(3, pressed: pressed)
+                                    }
+                                    .frame(width: 82, height: 34)
+                                }
+                            }
+                            .padding(.horizontal, 20)
+                            .padding(.top, 14)
+                            .padding(.bottom, 16)
+                            .background(Color.white.opacity(0.03))
+                            .overlay(alignment: .top) {
+                                Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+                            }
+                            .opacity(padOpacity)
+                            .transition(.opacity)
+                        } else {
+                            VStack(spacing: 6) {
+                                Image(systemName: "gamecontroller.fill")
+                                    .font(.system(size: 20))
+                                    .foregroundStyle(.white.opacity(0.45))
+                                Text(hasController ? "已连接实体手柄 · 虚拟按键已自动隐藏" : "虚拟按键已隐藏")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.6))
+                                Text("点击顶部菜单可随时重新显示")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.white.opacity(0.38))
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 36)
+                        }
+                    }
+                }
+
+                if showingPauseMenu {
+                    PlayerPauseOverlay(
+                        title: rom.title,
+                        hasController: hasController,
+                        showVirtualPad: $showVirtualPad,
+                        padOpacity: $padOpacity,
+                        hapticsEnabled: $hapticsEnabled,
+                        onResume: { closePauseMenu() },
+                        onExit: { dismiss() }
+                    )
+                    .transition(.opacity)
                 }
             }
-            .padding(12)
+            .animation(.easeOut(duration: 0.18), value: showVirtualPad)
+            .animation(.easeOut(duration: 0.16), value: showingPauseMenu)
         }
-        .background(Color.black.ignoresSafeArea())
-        .task { session.start(rom: rom, library: library) }
+        .statusBarHidden(true)
+        .task {
+            syncControllerState()
+            session.start(rom: rom, library: library)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidConnect)) { _ in
+            syncControllerState()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidDisconnect)) { _ in
+            syncControllerState()
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in session.setPaused(true) }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in session.setPaused(false) }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            if !showingPauseMenu { session.setPaused(false) }
+        }
         .onDisappear { session.stop() }
+    }
+
+    private func openPauseMenu() {
+        session.setPaused(true)
+        showingPauseMenu = true
+    }
+
+    private func closePauseMenu() {
+        showingPauseMenu = false
+        session.setPaused(false)
+    }
+
+    private func syncControllerState() {
+        let connected = !GCController.controllers().isEmpty
+        if connected != hasController {
+            hasController = connected
+            showVirtualPad = !connected
+        }
     }
 
     private var screenArea: some View {
         ZStack {
             RetroScreenView(view: session.screenView)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             if !session.hasFrame {
                 ProgressView("正在读取游戏")
                     .tint(.white)
@@ -89,14 +254,15 @@ struct RetroPlayer: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func leftControls(padSide: CGFloat) -> some View {
-        VStack(spacing: 10) {
+    private func leftControls(padSide: CGFloat, compact: Bool) -> some View {
+        VStack(spacing: compact ? 8 : 10) {
             if hasShoulders {
                 HStack(spacing: 8) {
                     shoulderButton(isPlayStation ? "L1" : "L", bit: 10)
                     if hasTriggers { shoulderButton("L2", bit: 12) }
                 }
             }
+            Spacer(minLength: 0)
             TouchDPad { state in
                 session.setButton(4, pressed: state.up)
                 session.setButton(5, pressed: state.down)
@@ -109,24 +275,26 @@ struct RetroPlayer: View {
                 TouchAnalogStick(invertY: false) { x, y in
                     session.setAnalog(0, x: x, y: y)
                 }
-                .frame(width: 76, height: 76)
+                .frame(width: 72, height: 72)
             }
 
+            Spacer(minLength: 0)
             TouchPadButton(title: "Select") { pressed in
                 session.setButton(2, pressed: pressed)
             }
-            .frame(width: 76, height: 34)
+            .frame(width: 76, height: 32)
         }
     }
 
-    private func rightControls(padSide: CGFloat) -> some View {
-        VStack(spacing: 10) {
+    private func rightControls(padSide: CGFloat, compact: Bool) -> some View {
+        VStack(spacing: compact ? 8 : 10) {
             if hasShoulders {
                 HStack(spacing: 8) {
                     if hasTriggers { shoulderButton("R2", bit: 13) }
                     shoulderButton(isPlayStation ? "R1" : "R", bit: 11)
                 }
             }
+            Spacer(minLength: 0)
             TouchDiamondPad(labels: faceLabels) { state in
                 session.setButton(9, pressed: state.top)
                 session.setButton(1, pressed: state.left)
@@ -139,13 +307,14 @@ struct RetroPlayer: View {
                 TouchAnalogStick(invertY: false) { x, y in
                     session.setAnalog(1, x: x, y: y)
                 }
-                .frame(width: 76, height: 76)
+                .frame(width: 72, height: 72)
             }
 
+            Spacer(minLength: 0)
             TouchPadButton(title: "Start") { pressed in
                 session.setButton(3, pressed: pressed)
             }
-            .frame(width: 76, height: 34)
+            .frame(width: 76, height: 32)
         }
     }
 
@@ -153,7 +322,7 @@ struct RetroPlayer: View {
         TouchPadButton(title: title) { pressed in
             session.setButton(bit, pressed: pressed)
         }
-        .frame(width: hasTriggers ? 58 : 88, height: 38)
+        .frame(width: hasTriggers ? 56 : 82, height: 36)
     }
 }
 

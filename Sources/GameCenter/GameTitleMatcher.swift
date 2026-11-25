@@ -1,8 +1,16 @@
 import Foundation
 
 enum GameTitleMatcher {
+    private static let knownExtensionPattern = #"(?i)\.(gba|gb|gbc|nds|3ds|3dsx|cci|cxi|cia|iso|cso|pbp|chd|nes|unf|unif|fds|sfc|smc|fig|swc|n64|v64|z64|ndd|gen|md|smd|cue|ccd|img|m3u|bin|app|nsp|xci|nsz|xcz|nup|nro|nso|nca|vpk|zip|gcm|rvz|gcz|ciso|tgc|dol|elf|wbfs|wad|wua|wux|wud|rpx|wuhb|gdi|cdi|a26|col|rom|msx|cas|pce|sgx|sms|ms|gg|32x|sg|sg1000|sc|ws|wsc|ngp|ngpc|ng|pc2|pcv2|myv|tap|tzx|wav|mmi|gz)$"#
+
     static func normalize(_ value: String) -> String {
-        var title = URL(fileURLWithPath: value).deletingPathExtension().lastPathComponent
+        var title = value.replacingOccurrences(of: "\0", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return "" }
+        if title.hasPrefix("/") || title.hasPrefix("~/") {
+            title = (title as NSString).lastPathComponent
+        }
+        title = title.replacingOccurrences(of: knownExtensionPattern, with: "", options: .regularExpression)
         title = title.replacingOccurrences(of: #"\([^)]*\)|\[[^]]*\]"#, with: " ", options: .regularExpression)
         title = title.applyingTransform(StringTransform("Traditional-Simplified"), reverse: false) ?? title
         title = title.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))

@@ -1,3 +1,4 @@
+import GameController
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -12,465 +13,1350 @@ final class ShellLibrary: NSObject {
     @MainActor @objc static func handleOpenURL(_ url: URL) -> Bool { false }
 }
 
+private enum PhoneTheme {
+    static let action = Color(white: 0.94)
+    static let inverseText = Color(white: 0.06)
+    static let surface = Color.white.opacity(0.055)
+    static let surfaceElevated = Color.white.opacity(0.10)
+    static let border = Color.white.opacity(0.11)
+    static let favoriteForeground = Color(red: 1.0, green: 0.52, blue: 0.58)
+    static let favoriteBackground = Color.red.opacity(0.20)
+    static let favoriteBorder = Color.red.opacity(0.36)
+    static let destructiveForeground = Color(red: 1.0, green: 0.52, blue: 0.56)
+    static let destructiveBackground = Color.red.opacity(0.14)
+    static let destructiveBorder = Color.red.opacity(0.28)
+    static let ready = Color(red: 0.28, green: 0.84, blue: 0.50)
+}
+
+private enum PhoneFilter: Hashable, Identifiable {
+    case recent
+    case favorites
+    case platform(String)
+
+    var id: String {
+        switch self {
+        case .recent: "recent"
+        case .favorites: "favorites"
+        case .platform(let value): "platform:" + value
+        }
+    }
+}
+
 private struct LibraryView: View {
     @StateObject private var metadata = PhoneGameMetadata()
+    @StateObject private var gamepad = PhoneGamepadNavigator()
+
     @State private var library: PhoneLibrary?
     @State private var roms: [PhoneLibrary.ROM] = []
     @State private var switchGames: [PhoneLibrary.SwitchGame] = []
-    @State private var platformID = "switch"
+    @State private var activeFilter: PhoneFilter = .recent
+    @State private var selectedEntryID: String?
+    @State private var searchText = ""
+    @State private var showingPortraitSearch = false
+    @FocusState private var searchFocused: Bool
+
     @State private var importing = false
     @State private var refreshing = false
     @State private var importingFiles = false
     @State private var notice: String?
     @State private var selectedROM: PhoneLibrary.ROM?
+    @State private var detailEntry: Entry?
+    @State private var pendingDeleteEntry: Entry?
     @State private var showingSaveSync = false
 
-    private var platform: PhoneLibrary.Format.Platform? { library?.platforms.first { $0.id == platformID } }
-    private var switchPackageType: UTType { UTType(exportedAs: "com.phoenixicarus.gamecenter.switch-build", conformingTo: .package) }
-
-    @State private var inGallery = false
-    @State private var approaching = false
-    @State private var hallExpanded = true
-    @State private var flight: Task<Void, Never>?
-    @State private var gameIndex = 0
-    @State private var showingFavorites = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("phone.library.favorites") private var favoriteData = Data()
+    @AppStorage("museum.recent") private var recentData = Data()
+    @AppStorage("phone.library.hideEmptyPlatforms") private var hideEmptyPlatforms = true
+    @Namespace private var filterPillNamespace
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private enum Entry: Identifiable {
-        case rom(PhoneLibrary.ROM, String), console(PhoneLibrary.SwitchGame)
-        var id: String {
-            switch self { case let .rom(_, path): "rom:" + path; case let .console(game): "switch:" + game.id }
-        }
-        var title: String {
-            switch self { case let .rom(rom, _): rom.title; case let .console(game): game.title }
-        }
-        var platform: String {
-            switch self { case let .rom(rom, _): rom.platform.id; case .console: "switch" }
-        }
-        var label: String {
-            switch self { case let .rom(rom, _): rom.platform.folder.uppercased(); case .console: "SWITCH" }
-        }
+    private var switchPackageType: UTType {
+        UTType(exportedAs: "com.phoenixicarus.gamecenter.switch-build", conformingTo: .package)
     }
 
-    private var entries: [Entry] {
+    private enum Entry: Identifiable, Hashable {
+        case rom(PhoneLibrary.ROM, String)
+        case console(PhoneLibrary.SwitchGame)
+
+        var id: String {
+            switch self {
+            case let .rom(_, path): "rom:" + path
+            case let .console(game): "switch:" + game.id
+            }
+        }
+
+        var title: String {
+            switch self {
+            case let .rom(rom, _): rom.title
+            case let .console(game): game.title
+            }
+        }
+
+        var platformID: String {
+            switch self {
+            case let .rom(rom, _): rom.platform.id
+            case .console: "switch"
+            }
+        }
+
+        var platformTitle: String {
+            switch self {
+            case let .rom(rom, _): rom.platform.name
+            case .console: "Nintendo Switch"
+            }
+        }
+
+        var shortLabel: String {
+            switch self {
+            case let .rom(rom, _): rom.platform.folder.uppercased()
+            case .console: "SWITCH"
+            }
+        }
+
+        var isLaunchable: Bool {
+            switch self {
+            case .rom: true
+            case let .console(game): !game.builds.isEmpty
+            }
+        }
+
+        var isDeletable: Bool {
+            switch self {
+            case .rom: true
+            case let .console(game): !game.builds.isEmpty
+            }
+        }
+
+        static func == (lhs: Entry, rhs: Entry) -> Bool { lhs.id == rhs.id }
+        func hash(into hasher: inout Hasher) { hasher.combine(id) }
+    }
+
+    private var allEntries: [Entry] {
         switchGames.map(Entry.console) + roms.map { rom in
             let path = rom.url.pathComponents.dropFirst(library?.root.pathComponents.count ?? 0).joined(separator: "/")
             return .rom(rom, path)
         }
     }
-    private var favorites: Set<String> { (try? JSONDecoder().decode(Set<String>.self, from: favoriteData)) ?? [] }
-    private var platforms: [(id: String, name: String)] {
-        [("switch", "Nintendo Switch")] + (library?.platforms.map { ($0.id, $0.name) } ?? [])
+
+    private var favorites: Set<String> {
+        (try? JSONDecoder().decode(Set<String>.self, from: favoriteData)) ?? []
+    }
+
+    private var recentIDs: [String] {
+        (try? JSONDecoder().decode([String].self, from: recentData)) ?? []
+    }
+
+    private var allPlatforms: [(id: String, name: String, short: String)] {
+        [("switch", "Nintendo Switch", "Switch")] + (library?.platforms.map {
+            ($0.id, $0.name, shortPlatformName(for: $0.id, fallback: $0.folder))
+        } ?? [])
+    }
+
+    private var visibleFilters: [PhoneFilter] {
+        let base: [PhoneFilter] = [.recent, .favorites]
+        let nonEmpty = allPlatforms.filter { count(for: .platform($0.id)) > 0 }
+        let platformsToShow = (hideEmptyPlatforms && !nonEmpty.isEmpty) ? nonEmpty : allPlatforms
+        return base + platformsToShow.map { .platform($0.id) }
+    }
+
+    private var activeImportPlatform: PhoneLibrary.Format.Platform? {
+        guard case let .platform(id) = activeFilter else { return nil }
+        return library?.platforms.first { $0.id == id }
+    }
+
+    private var visibleEntries: [Entry] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseList: [Entry]
+        switch activeFilter {
+        case .recent:
+            let recentMatches = recentIDs.compactMap { id in allEntries.first { $0.id == id } }
+            baseList = recentMatches
+        case .favorites:
+            baseList = allEntries
+                .filter { favorites.contains($0.id) }
+                .sorted { displayTitle($0).localizedStandardCompare(displayTitle($1)) == .orderedAscending }
+        case let .platform(id):
+            baseList = allEntries
+                .filter { $0.platformID == id }
+                .sorted { displayTitle($0).localizedStandardCompare(displayTitle($1)) == .orderedAscending }
+        }
+        guard !query.isEmpty else { return baseList }
+        return baseList.filter { entry in
+            displayTitle(entry).localizedCaseInsensitiveContains(query)
+                || entry.title.localizedCaseInsensitiveContains(query)
+                || entry.platformTitle.localizedCaseInsensitiveContains(query)
+                || entry.shortLabel.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    private var selectedEntry: Entry? {
+        visibleEntries.first(where: { $0.id == selectedEntryID }) ?? visibleEntries.first
     }
 
     var body: some View {
-        NavigationStack {
-            museum
-                .sheet(isPresented: $showingFavorites) {
-                    NavigationStack {
-                        ScrollView {
-                            let saved = entries.filter { favorites.contains($0.id) }
-                            if saved.isEmpty { ContentUnavailableView("还没有收藏", systemImage: "star") }
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 140))]) {
-                                ForEach(saved) { tile($0) }
-                            }.padding()
-                        }.navigationTitle("收藏")
-                        .toolbar { Button("完成") { showingFavorites = false } }
-                    }
-                }
-                .sheet(isPresented: $showingSaveSync) {
-                    CloudSaveSyncView(saveRoot: {
-                        guard let library else { throw CloudSaveDirectorySync.Failure("游戏库尚未准备好，请稍后重试。") }
-                        try library.createFolders()
-                        return library.root.appendingPathComponent("save")
-                    },
-                                      isPlaying: { gc_s2arm_active() != 0 || dm_shell_active_game_id() != nil || selectedROM != nil })
-                }
-        }
-        .preferredColorScheme(.dark)
-        .task {
-            if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first(where: { $0.activationState == .foregroundActive || $0.activationState == .foregroundInactive }) {
-                scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape))
-            }
-        }
-            .task { await refresh() }
-            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
-                Task { await refresh() }
-            }
-            .onReceive(NotificationCenter.default.publisher(for: Notification.Name("DMShellDidReturnToLibrary"))) { _ in
-                Task { await refresh() }
-            }
-            .fileImporter(isPresented: $importing,
-                          allowedContentTypes: platform == nil ? [switchPackageType, .json, .folder] : platform?.runtime == nil ? [.data] : [.data, .folder],
-                          allowsMultipleSelection: true) { result in
-                Task { await handleImport(result) }
-            }
-            .fullScreenCover(item: $selectedROM) { rom in
-                if let library {
-                    if rom.platform.runtime == "cemu" {
-                        WiiUPlayer(rom: rom, library: library)
-                    } else {
-                        RetroPlayer(rom: rom, library: library)
-                    }
-                }
-            }
-            .alert("Game Center", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
-                Button("好", role: .cancel) { notice = nil }
-            } message: {
-                Text(notice ?? "")
-            }
-    }
-
-    private enum Wing: String, CaseIterable { case recent = "最近", saved = "收藏", all = "全部" }
-    @State private var wing: Wing = .all
-    @AppStorage("museum.recent") private var recentData = Data()
-    private var recent: [String] { (try? JSONDecoder().decode([String].self, from: recentData)) ?? [] }
-    private func remember(_ entry: Entry) {
-        recentData = (try? JSONEncoder().encode(Array(([entry.id] + recent.filter { $0 != entry.id }).prefix(100)))) ?? Data()
-    }
-    private var platformGames: [Entry] { entries.filter { $0.platform == platformID } }
-    private var displayedGames: [Entry] {
-        let games = platformGames
-        switch wing {
-        case .all: return games
-        case .saved: return games.filter { favorites.contains($0.id) }
-        case .recent: return recent.compactMap { key in games.first { $0.id == key } }
-        }
-    }
-
-    private func machineCode(_ id: String) -> String {
-        ["threeDS":"N3DS", "famicom":"FC", "superFamicom":"SFC", "megaDrive":"MD"][id] ?? id.uppercased()
-    }
-
-    private var museum: some View {
-        let machines = platforms
-        let index = machines.firstIndex { $0.id == platformID } ?? 0
-        let games = displayedGames
-        let focus = min(gameIndex, max(0, games.count - 1))
-        let code = machineCode(platformID)
-        let year = ["SWITCH":"2017", "GB":"1989", "GBC":"1998", "GBA":"2001", "NDS":"2004", "N3DS":"2011", "FC":"1983", "SFC":"1990", "MD":"1988", "PSP":"2004", "PS1":"1994", "PS2":"2000", "PS3":"2006", "PSV":"2011", "WII":"2006", "WIIU":"2012", "N64":"1996"][code] ?? ""
-        let maker = ["PSP","PS1","PS2","PS3","PSV"].contains(code) ? "索尼" : code == "MD" ? "世嘉" : "任天堂"
-        return GeometryReader { geometry in
-            let width = geometry.size.width
-            let height = geometry.size.height
-            let floor = height * (inGallery ? 0.65 : 0.71)
-            let hero = min(height * 0.49, width * 0.54)
-            let sizes = games.lazy.map { boxSize($0, height: hero) }
-            let gap = min(24, width * 0.025)
-            ZStack {
-                if inGallery {
-                    if games.indices.contains(focus) {
-                        Text(games[focus].title.uppercased()).font(.system(size: height * 0.085, weight: .black))
-                            .foregroundStyle(.white.opacity(0.12)).lineLimit(1).minimumScaleFactor(0.65)
-                            .frame(width: width * 0.64).position(x: width / 2, y: height * 0.095).allowsHitTesting(false).accessibilityHidden(true)
-                    }
-                    ForEach(max(0, focus - 3)..<min(games.count, focus + 4), id: \.self) { slot in
-                        let distance = slot - focus
-                        let tier = min(3, abs(distance))
-                        let scale = shelfScale(tier)
-                        let boxHeight = sizes[slot].height * scale
-                        let boxWidth = sizes[slot].width * scale
-                        let offset = shelfOffset(from: focus, to: slot, sizes: sizes, gap: gap)
-                        let box = boxFace(games[slot]).frame(width: boxWidth, height: boxHeight)
-                        VStack(spacing: 0) {
-                            box
-                            box.scaleEffect(x: 1, y: -1).opacity(0.16)
-                                .mask(LinearGradient(stops: [.init(color: .white, location: 0), .init(color: .clear, location: 0.36)], startPoint: .top, endPoint: .bottom))
-                        }
-                        .rotation3DEffect(.degrees(distance == 0 ? -3 : distance > 0 ? -10 : 10), axis: (x: 0, y: 1, z: 0))
-                        .opacity([1, 0.85, 0.5, 0][tier])
-                        .position(x: width / 2 + (distance < 0 ? -offset : offset), y: floor)
-                        .allowsHitTesting(false)
-                        if distance != 0 && tier < 3 {
-                            Button { move(distance) } label: { Color.clear.contentShape(Rectangle()) }
-                                .frame(width: boxWidth, height: boxHeight)
-                                .position(x: width / 2 + (distance < 0 ? -offset : offset), y: floor - boxHeight / 2)
-                                .accessibilityLabel("选择" + displayTitle(games[slot]))
-                        }
-                    }
-                    if games.isEmpty {
-                        ContentUnavailableView(wing == .all ? "展台还没有游戏" : "暂无" + wing.rawValue, systemImage: "shippingbox")
-                    } else {
-                        if ["GB", "GBC", "GBA", "N3DS", "NDS"].contains(code) {
-                            MuseumExhibit(code: code + "-cart", entering: false, reducedMotion: reduceMotion)
-                                .id(code).frame(width: hero * 0.54, height: hero * 0.46)
-                                .position(x: width / 2 + hero * 0.45, y: floor - hero * 0.15)
-                                .allowsHitTesting(false)
-                        }
-                        NavigationLink { detail(games[focus]) } label: { Color.clear.contentShape(Rectangle()) }
-                            .frame(width: sizes[focus].width, height: sizes[focus].height)
-                            .position(x: width / 2, y: floor - sizes[focus].height / 2)
-                            .accessibilityLabel(displayTitle(games[focus]))
-                        VStack(alignment: .leading, spacing: height * 0.014) {
-                            Text(String(format: "正在展出  %02d / %02d", focus + 1, games.count))
-                                .font(.footnote.monospaced().bold()).foregroundStyle(Color(red: 0.83, green: 0.69, blue: 0.41))
-                            Text(displayTitle(games[focus])).font(.system(size: max(17, height * 0.049), weight: .bold)).lineLimit(1)
-                            Text(code).font(.footnote.monospaced().bold()).foregroundStyle(.secondary)
-                        }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-                            .padding(.leading, width * 0.042).padding(.bottom, height * 0.04).allowsHitTesting(false)
-                    }
-                } else {
-                    Text(machines[index].name.uppercased()).font(.system(size: min(width * 0.09, height * 0.095), weight: .black))
-                        .lineLimit(1).minimumScaleFactor(0.65).frame(width: width * 0.68)
-                        .foregroundStyle(.white.opacity(0.65)).position(x: width / 2, y: height * 0.13)
-                    ForEach(max(0,index-1)..<min(machines.count,index+2), id: \.self) { slot in
-                        let distance = slot - index
-                        let center = width * (distance == 0 ? (platformGames.isEmpty ? 0.5 : 0.44) : distance < 0 ? 0.025 : 0.975)
-                        let extent = min(width * 0.55, height * 0.77) * (distance == 0 ? 1 : 0.42)
-                        Ellipse().fill(.black.opacity(distance == 0 ? 0.46 : 0.22)).frame(width: extent * 0.78, height: extent * 0.055)
-                            .blur(radius: 5).position(x: center, y: floor).allowsHitTesting(false)
-                        MuseumExhibit(code: machineCode(machines[slot].id), entering: approaching && slot == index, reducedMotion: reduceMotion)
-                            .frame(width: extent, height: extent)
-                            .scaleEffect(approaching && slot == index ? 1.34 : 1)
-                            .opacity(distance == 0 ? 1 : approaching ? 0 : 0.48)
-                            .position(x: center, y: floor - extent * 0.36)
-                            .allowsHitTesting(false)
-                        if distance != 0 {
-                            Button { move(distance) } label: { Text(distance < 0 ? "‹ " + machineCode(machines[slot].id) : machineCode(machines[slot].id) + " ›").font(.subheadline.bold()).padding(.horizontal, 12).frame(minHeight: 44) }
-                                .position(x: distance < 0 ? width * 0.09 : width * 0.91, y: floor + height * 0.07)
-                        }
-                    }
-                    if let first = platformGames.first {
-                        let printSize = boxSize(first, height: hero * 0.57)
-                        boxFace(first).frame(width: printSize.width, height: printSize.height)
-                            .rotation3DEffect(.degrees(-14), axis: (x: 0, y: 1, z: 0))
-                            .position(x: width * 0.735, y: floor - printSize.height * 0.5).allowsHitTesting(false)
-                    }
-                    Button { changeGallery(true) } label: { Color.clear.contentShape(Rectangle()) }
-                        .frame(width: width * 0.62, height: height * 0.58)
-                        .accessibilityLabel("进入" + machines[index].name)
-                    Text(year + "  ·  " + maker).font(.footnote.monospaced().bold()).tracking(2)
-                        .foregroundStyle(.secondary).position(x: width / 2, y: height * 0.92)
-                }
-                VStack {
-                    HStack(spacing: 14) {
-                        if inGallery {
-                            Button { changeGallery(false) } label: { Image(systemName: "chevron.backward").font(.title3.weight(.semibold)).frame(width: 44, height: 44).contentShape(Rectangle()) }.accessibilityLabel("返回大厅")
-                            ForEach(Wing.allCases, id: \.self) { item in
-                                Button { wing = item; gameIndex = 0 } label: {
-                                    Text(item.rawValue).font(.subheadline.weight(item == wing ? .bold : .regular))
-                                        .foregroundStyle(item == wing ? .white : .gray)
-                                        .frame(minHeight: 44).overlay(alignment: .bottom) {
-                                            if item == wing { Capsule().fill(.white).frame(width: 18, height: 2) }
-                                        }
-                                }
-                            }
-                        }
-                        Spacer()
-                        Button { showingSaveSync = true } label: { Image(systemName: "arrow.triangle.2.circlepath.icloud").font(.title3.weight(.semibold)).frame(width: 44, height: 44).contentShape(Rectangle()) }.accessibilityLabel("同步存档")
-                        if inGallery { Button { importing = true } label: { Image(systemName: "square.and.arrow.down").font(.title3.weight(.semibold)).frame(width: 44, height: 44).contentShape(Rectangle()) }.accessibilityLabel("导入游戏").disabled(library == nil || refreshing || importingFiles) }
-                        else { Button { showingFavorites = true } label: { Image(systemName: "star").font(.title3.weight(.semibold)).frame(width: 44, height: 44).contentShape(Rectangle()) }.accessibilityLabel("收藏") }
-                    }.padding(.horizontal, max(16, width * 0.04)).padding(.top, 6)
-                    Spacer()
-                    if !inGallery {
-                        Button { changeGallery(true) } label: {
-                            Label("进入展厅", systemImage: "chevron.forward").labelStyle(.titleAndIcon)
-                                .font(.headline).padding(.horizontal, 16).frame(minHeight: 44)
-                                .background(.white.opacity(0.13), in: Capsule())
-                        }
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                        .padding(.horizontal, max(16, width * 0.04)).padding(.bottom, 6)
-                    }
-                }
-            }.clipped().scaleEffect(inGallery && !hallExpanded ? 0.17 : 1)
-            .background {
-                MuseumWall(code: code, gallery: inGallery, artwork: inGallery && games.indices.contains(focus) ? image(for: games[focus]) : nil)
-                    .ignoresSafeArea()
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle()).simultaneousGesture(DragGesture(minimumDistance: 28).onEnded { drag in
-                if abs(drag.translation.width) > abs(drag.translation.height) { move(drag.translation.width < 0 ? 1 : -1) }
-            })
-        }.background(Color(red: 11/255, green: 10/255, blue: 22/255).ignoresSafeArea())
-            .toolbar(.hidden, for: .navigationBar).tint(.white)
-    }
-
-    private func boxAspect(_ entry: Entry) -> CGFloat {
-        if let art = image(for: entry), art.size.height > 0 { return min(1.8, max(0.55, art.size.width / art.size.height)) }
-        return switch entry.label { case "SWITCH": 0.63; case "NDS", "3DS", "PS1": 1; case "PSP": 0.59; default: 0.82 }
-    }
-
-    private func boxSize(_ entry: Entry, height: CGFloat) -> CGSize {
-        let aspect = boxAspect(entry)
-        let fitted = min(height, height * sqrt(0.88 / aspect))
-        return CGSize(width: fitted * aspect, height: fitted)
-    }
-
-    private func shelfScale(_ distance: Int) -> CGFloat { [1, 0.72, 0.54, 0.42][min(distance, 3)] }
-
-    private func shelfOffset(from focus: Int, to slot: Int, sizes: LazyMapCollection<[Entry], CGSize>, gap: CGFloat) -> CGFloat {
-        guard focus != slot else { return 0 }
-        let direction = slot > focus ? 1 : -1
-        let distance = abs(slot - focus)
-        var offset = sizes[focus].width / 2 + gap * CGFloat(distance)
-        for tier in 1...distance {
-            offset += sizes[focus + direction * tier].width * shelfScale(tier) * (tier == distance ? 0.5 : 1)
-        }
-        return offset
-    }
-
-    private func image(for entry: Entry) -> UIImage? {
-        if let image = metadata.image(for: entry.id, backdrop: true) { return image }
-        return bundledCover(entry)
-    }
-
-    private func bundledCover(_ entry: Entry) -> UIImage? {
-        guard case let .console(game) = entry, let name = game.coverName else { return nil }
-        return UIImage(named: name)
-    }
-    private func displayTitle(_ entry: Entry) -> String { metadata.records[entry.id]?.title ?? entry.title }
-    private func lookupMetadata(_ entry: Entry, force: Bool = false) async {
-        let source: URL?
-        let titleID: String?
-        switch entry {
-        case let .rom(rom, _): source = rom.url; titleID = nil
-        case let .console(game): source = library?.switchRoot.appendingPathComponent(game.id); titleID = game.id
-        }
-        await metadata.lookup(id: entry.id, title: entry.title, platformID: entry.platform, source: source, titleID: titleID, force: force)
-    }
-
-    private func boxFace(_ entry: Entry) -> some View {
         GeometryReader { geometry in
-            ZStack(alignment: .leading) {
-                if let image = metadata.image(for: entry.id) ?? bundledCover(entry) {
-                    Image(uiImage: image).resizable().scaledToFill().frame(width: geometry.size.width, height: geometry.size.height)
-                } else {
-                    LinearGradient(colors: [Color(red: 0.43, green: 0.40, blue: 0.59), Color(red: 0.24, green: 0.22, blue: 0.37)], startPoint: .topTrailing, endPoint: .bottomLeading)
-                    VStack(alignment: .leading) {
-                        Text(entry.label).font(.system(size: geometry.size.height * 0.055, weight: .bold, design: .monospaced))
-                        Spacer()
-                        Text(displayTitle(entry)).font(.system(size: geometry.size.height * 0.093, weight: .bold)).lineLimit(3)
-                    }.padding(geometry.size.width * 0.10)
+            let isLandscape = geometry.size.width > geometry.size.height
+            let gridColumnsCount = isLandscape
+                ? max(4, Int((geometry.size.width - 48) / 118))
+                : (geometry.size.width >= 600 ? 5 : 3)
+
+            ZStack {
+                backdrop(size: geometry.size, isLandscape: isLandscape)
+
+                VStack(spacing: 0) {
+                    topBar(isLandscape: isLandscape)
+
+                    if showingPortraitSearch && !isLandscape {
+                        portraitSearchBar
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+
+                    if isLandscape {
+                        landscapeHero(entry: selectedEntry)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                            .padding(.horizontal, 24)
+                    } else {
+                        portraitHero(entry: selectedEntry)
+                            .padding(.horizontal, 20)
+                            .padding(.top, 10)
+                            .padding(.bottom, 14)
+                    }
+
+                    bottomDock(
+                        isLandscape: isLandscape,
+                        dockHeight: isLandscape ? max(geometry.size.height * 0.60, 210) : nil,
+                        columnsCount: gridColumnsCount
+                    )
                 }
-                Rectangle().fill(.black.opacity(0.65)).frame(width: max(2, geometry.size.width * 0.035))
-            }.clipped()
+            }
+            .onChange(of: selectedEntry?.id) { _, _ in
+                if let entry = selectedEntry {
+                    Task { await lookupMetadata(entry) }
+                }
+            }
+            .onChange(of: visibleEntries.map(\.id)) { _, ids in
+                if !(selectedEntryID.map(ids.contains) ?? false) {
+                    selectedEntryID = ids.first
+                }
+            }
+            .onChange(of: activeFilter) { _, _ in
+                selectedEntryID = visibleEntries.first?.id
+            }
+            .onChange(of: hideEmptyPlatforms) { _, _ in
+                if !visibleFilters.contains(activeFilter) {
+                    activeFilter = .recent
+                }
+            }
+            .onChange(of: gamepad.connectionVersion) { _, _ in
+                bindGamepad(columnsCount: gridColumnsCount)
+            }
+            .onAppear {
+                gamepad.refresh()
+                bindGamepad(columnsCount: gridColumnsCount)
+            }
+        }
+        .background(Color(white: 0.045).ignoresSafeArea())
+        .preferredColorScheme(.dark)
+        .tint(.white)
+        .task { await refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            Task { await refresh() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("DMShellDidReturnToLibrary"))) { _ in
+            Task { await refresh() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidConnect)) { _ in
+            gamepad.refresh()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidDisconnect)) { _ in
+            gamepad.refresh()
+        }
+        .sheet(item: $detailEntry) { entry in
+            detailSheet(for: entry)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationCornerRadius(26)
+                .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(isPresented: $showingSaveSync) {
+            CloudSaveSyncView(
+                saveRoot: {
+                    guard let library else { throw CloudSaveDirectorySync.Failure("游戏库尚未准备好，请稍后重试。") }
+                    try library.createFolders()
+                    return library.root.appendingPathComponent("save")
+                },
+                isPlaying: { gc_s2arm_active() != 0 || dm_shell_active_game_id() != nil || selectedROM != nil }
+            )
+        }
+        .fileImporter(
+            isPresented: $importing,
+            allowedContentTypes: [switchPackageType, .json, .data, .folder],
+            allowsMultipleSelection: true
+        ) { result in
+            Task { await handleImport(result) }
+        }
+        .fullScreenCover(item: $selectedROM) { rom in
+            if let library {
+                if rom.platform.runtime == "cemu" {
+                    WiiUPlayer(rom: rom, library: library)
+                } else {
+                    RetroPlayer(rom: rom, library: library)
+                }
+            }
+        }
+        .confirmationDialog(
+            "从设备删除游戏？",
+            isPresented: Binding(
+                get: { pendingDeleteEntry != nil },
+                set: { if !$0 { pendingDeleteEntry = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("确认删除", role: .destructive) {
+                if let entry = pendingDeleteEntry {
+                    deleteEntry(entry)
+                }
+                pendingDeleteEntry = nil
+            }
+            Button("取消", role: .cancel) {
+                pendingDeleteEntry = nil
+            }
+        } message: {
+            if let entry = pendingDeleteEntry {
+                Text("将删除「\(displayTitle(entry))」的游戏文件或构建包，你的游戏存档会安全保留在 save 目录中。")
+            }
+        }
+        .alert("Game Center", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
+            Button("好", role: .cancel) { notice = nil }
+        } message: {
+            Text(notice ?? "")
         }
     }
 
-    private func changeGallery(_ entering: Bool) {
-        flight?.cancel()
-        if reduceMotion {
-            approaching = false; hallExpanded = true; inGallery = entering; gameIndex = 0; wing = .all
-            return
-        }
-        if entering {
-            withAnimation(.timingCurve(0.55, 0.055, 0.675, 0.19, duration: 1.4)) { approaching = true }
-            flight = Task { @MainActor in
-                do { try await Task.sleep(for: .milliseconds(540)) } catch { return }
-                var initial = Transaction()
-                initial.disablesAnimations = true
-                withTransaction(initial) { hallExpanded = false; inGallery = true; gameIndex = 0; wing = .all }
-                do { try await Task.sleep(for: .milliseconds(20)) } catch { return }
-                withAnimation(.timingCurve(0.215, 0.61, 0.355, 1, duration: 0.84)) { hallExpanded = true }
+    // MARK: - Backdrop
+
+    private func backdrop(size: CGSize, isLandscape: Bool) -> some View {
+        ZStack {
+            Color(white: 0.045)
+            if let entry = selectedEntry, let image = backdropImage(for: entry) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: size.width, height: size.height)
+                    .blur(radius: image.size.width < image.size.height && isLandscape ? 18 : 2)
+                    .scaleEffect(1.06)
+                    .clipped()
+                    .transition(.opacity)
+            } else if let entry = selectedEntry {
+                LinearGradient(colors: placeholderPalette(for: entry), startPoint: .topLeading, endPoint: .bottomTrailing)
+                    .transition(.opacity)
+            } else {
+                LinearGradient(colors: [Color(white: 0.12), Color(white: 0.045)], startPoint: .topLeading, endPoint: .bottomTrailing)
             }
-        } else {
-            withAnimation(.easeOut(duration: 0.3)) { inGallery = false }
-            withAnimation(.timingCurve(0.215, 0.61, 0.355, 1, duration: 1.4)) { approaching = false }
+
+            if isLandscape {
+                LinearGradient(
+                    stops: [
+                        .init(color: .black.opacity(0.78), location: 0),
+                        .init(color: .black.opacity(0.40), location: 0.44),
+                        .init(color: .black.opacity(0.08), location: 0.82)
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            }
+
+            LinearGradient(
+                stops: [
+                    .init(color: .black.opacity(0.55), location: 0),
+                    .init(color: .black.opacity(0.18), location: 0.24),
+                    .init(color: .black.opacity(0.54), location: 0.56),
+                    .init(color: .black.opacity(0.95), location: 1)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
         }
+        .ignoresSafeArea()
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.28), value: selectedEntry?.id)
     }
 
-    private func move(_ delta: Int) {
-        guard inGallery || !approaching else { return }
-        withAnimation(reduceMotion ? nil : .timingCurve(0.215, 0.61, 0.355, 1, duration: 0.52)) {
-            if inGallery {
-                gameIndex = min(max(0, gameIndex + delta), max(0, displayedGames.count - 1))
-            } else if let index = platforms.firstIndex(where: { $0.id == platformID }), platforms.indices.contains(index + delta) {
-                platformID = platforms[index + delta].id
-            }
-        }
-    }
+    // MARK: - Top Bar
 
-    private func tile(_ entry: Entry) -> some View {
-        NavigationLink { detail(entry) } label: {
-            VStack(alignment: .leading, spacing: 8) {
-                cover(entry)
-                Text(displayTitle(entry)).font(.subheadline.weight(.semibold)).lineLimit(2)
+    private func topBar(isLandscape: Bool) -> some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 8) {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color(red: 0.28, green: 0.31, blue: 0.90), Color(red: 0.76, green: 0.23, blue: 0.84), Color(red: 1.0, green: 0.60, blue: 0.51)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: 24, height: 24)
+                    .overlay {
+                        Text("GC")
+                            .font(.system(size: 11, weight: .black, design: .rounded))
+                            .foregroundStyle(.white)
+                    }
+                Text("GAME CENTER")
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .tracking(1.3)
+                    .foregroundStyle(.white.opacity(0.95))
             }
-        }.buttonStyle(.plain).accessibilityLabel(displayTitle(entry) + "，" + entry.label)
-    }
 
-    private func cover(_ entry: Entry) -> some View {
-        let palette: [Color] = [Color(red: 0.16, green: 0.26, blue: 0.35), Color(red: 0.38, green: 0.18, blue: 0.17), Color(red: 0.16, green: 0.30, blue: 0.25), Color(red: 0.30, green: 0.23, blue: 0.38)]
-        let index = entry.title.utf8.reduce(0) { ($0 + Int($1)) % palette.count }
-        return Rectangle().fill(palette[index]).aspectRatio(1, contentMode: .fit)
-            .overlay(alignment: .bottomTrailing) {
-                Image(systemName: "opticaldisc").resizable().scaledToFit().foregroundStyle(.white.opacity(0.09)).offset(x: 36, y: 36)
-            }
-            .overlay {
-                VStack(alignment: .leading) {
-                    Text(entry.label).font(.footnote.monospaced().bold())
-                    Spacer()
-                    Text(displayTitle(entry)).font(.title3.bold()).lineLimit(3)
-                }.foregroundStyle(.white).padding(14).frame(maxWidth: .infinity, alignment: .leading)
-            }.overlay {
-                if let image = metadata.image(for: entry.id) ?? bundledCover(entry) {
-                    GeometryReader { bounds in
-                        Image(uiImage: image).resizable().scaledToFill().frame(width: bounds.size.width, height: bounds.size.height)
+            Spacer(minLength: 8)
+
+            if isLandscape {
+                landscapeSearchPill
+                if let name = gamepad.controllerName {
+                    Label(name, systemImage: "gamecontroller.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .lineLimit(1)
+                        .padding(.horizontal, 10)
+                        .frame(height: 32)
+                        .background(Color.white.opacity(0.12), in: Capsule())
+                        .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+                }
+            } else {
+                topCircleButton(icon: showingPortraitSearch ? "xmark" : "magnifyingglass", label: "搜索") {
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                        showingPortraitSearch.toggle()
+                        if showingPortraitSearch {
+                            searchFocused = true
+                        } else {
+                            searchText = ""
+                            searchFocused = false
+                        }
                     }
                 }
-            }.clipShape(RoundedRectangle(cornerRadius: 10)).accessibilityHidden(true)
+            }
+
+            if isLandscape {
+                Button {
+                    importing = true
+                } label: {
+                    Label(importingFiles ? "导入中…" : "导入", systemImage: "plus")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.92))
+                        .padding(.horizontal, 12)
+                        .frame(height: 32)
+                        .background(Color.white.opacity(0.10), in: Capsule())
+                        .overlay(Capsule().stroke(Color.white.opacity(0.13), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .disabled(library == nil || refreshing || importingFiles)
+            } else {
+                topCircleButton(icon: "plus", label: "导入游戏") {
+                    importing = true
+                }
+                .disabled(library == nil || refreshing || importingFiles)
+            }
+
+            topCircleButton(icon: "arrow.triangle.2.circlepath.icloud", label: "同步存档") {
+                showingSaveSync = true
+            }
+
+            Menu {
+                Toggle("隐藏空平台", isOn: $hideEmptyPlatforms)
+                Button("刷新游戏库", systemImage: "arrow.clockwise") {
+                    Task { await refresh() }
+                }
+                Button("同步存档 (iCloud)", systemImage: "arrow.triangle.2.circlepath.icloud") {
+                    showingSaveSync = true
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .frame(width: 34, height: 34)
+                    .background(Color.white.opacity(0.10), in: Circle())
+                    .overlay(Circle().stroke(Color.white.opacity(0.13), lineWidth: 1))
+            }
+            .accessibilityLabel("更多设置")
+        }
+        .padding(.horizontal, isLandscape ? 24 : 20)
+        .padding(.top, isLandscape ? 8 : 6)
+        .padding(.bottom, 4)
     }
 
-    private func detail(_ entry: Entry) -> some View {
-        GeometryReader { bounds in
-            let wide = bounds.size.width >= 580
-            let layout = wide ? AnyLayout(HStackLayout(alignment: .top, spacing: 32))
-                              : AnyLayout(VStackLayout(alignment: .leading, spacing: 20))
-            ScrollView {
-                layout {
-                    cover(entry)
-                        .frame(width: wide ? min(220, bounds.size.width * 0.29) : min(240, bounds.size.width * 0.60))
-                        .frame(maxWidth: wide ? nil : .infinity)
-                    detailActions(entry)
+    private func topCircleButton(icon: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.92))
+                .frame(width: 34, height: 34)
+                .background(Color.white.opacity(0.10), in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.13), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
+    private var landscapeSearchPill: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(0.55))
+            TextField("搜索游戏…", text: $searchText)
+                .font(.system(size: 12))
+                .foregroundStyle(.white)
+                .focused($searchFocused)
+                .frame(width: 120)
+            if !searchText.isEmpty {
+                Button { searchText = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.55))
                 }
-                .padding(.horizontal, wide ? 32 : 20)
-                .padding(.vertical, 20)
-                .frame(maxWidth: 900, alignment: .leading)
-                .frame(maxWidth: .infinity)
-            }
-        }.navigationTitle("游戏详情").navigationBarTitleDisplayMode(.inline)
-        .task(id: entry.id) { await lookupMetadata(entry) }
-        .toolbar {
-            Button(favorites.contains(entry.id) ? "取消收藏" : "加入收藏", systemImage: favorites.contains(entry.id) ? "star.fill" : "star") {
-                var updated = favorites
-                if !updated.insert(entry.id).inserted { updated.remove(entry.id) }
-                if let data = try? JSONEncoder().encode(updated) { favoriteData = data }
+                .buttonStyle(.plain)
             }
         }
+        .padding(.horizontal, 11)
+        .frame(height: 32)
+        .background(Color.black.opacity(0.32), in: Capsule())
+        .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
     }
 
-    private func detailActions(_ entry: Entry) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(displayTitle(entry)).font(.title.bold()).fixedSize(horizontal: false, vertical: true)
-            switch entry {
-            case let .rom(rom, _):
-                Text(rom.platform.name).foregroundStyle(.secondary)
-                if let note = rom.platform.runtimeNote {
-                    Text(note).font(.callout).foregroundStyle(.secondary)
+    private var portraitSearchBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 13))
+                .foregroundStyle(.white.opacity(0.55))
+            TextField("搜索游戏名或平台…", text: $searchText)
+                .font(.system(size: 14))
+                .foregroundStyle(.white)
+                .focused($searchFocused)
+                .submitLabel(.search)
+            if !searchText.isEmpty {
+                Button { searchText = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.white.opacity(0.55))
                 }
-                Button("开始游戏", systemImage: "play.fill") { remember(entry); selectedROM = rom }.buttonStyle(.borderedProminent).controlSize(.large)
-            case let .console(game):
-                Text(game.status).foregroundStyle(.secondary)
-                ForEach(game.builds, id: \.engine) { build in
-                    Button("运行 " + build.engine.rawValue, systemImage: "play.fill") {
-                        guard let library else { return }
-                        do {
-                            switch build.engine {
-                            case .nxnative: try NXGameLauncher.launch(build, library: library)
-                            case .s2arm: try S2ArmGameLauncher.launch(build, library: library)
-                            }
-                            remember(entry)
-                        } catch { notice = error.localizedDescription }
-                    }.buttonStyle(.borderedProminent).controlSize(.large)
-                }
+                .buttonStyle(.plain)
             }
-            PhoneMetadataSection(metadata: metadata, id: entry.id) {
-                Task { await lookupMetadata(entry, force: true) }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 38)
+        .background(Color.black.opacity(0.42), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.16), lineWidth: 1))
+        .padding(.horizontal, 20)
+        .padding(.top, 6)
+    }
+
+    // MARK: - Hero (Portrait & Landscape)
+
+    private func portraitHero(entry: Entry?) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let entry {
+                HStack(spacing: 8) {
+                    Text(entry.platformTitle.uppercased())
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .tracking(1.2)
+                        .foregroundStyle(.white.opacity(0.92))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3.5)
+                        .background(Color.white.opacity(0.13), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 1))
+
+                    if !entry.isLaunchable {
+                        Text("未导入构建包")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3.5)
+                            .background(Color.orange.opacity(0.16), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                }
+
+                Text(displayTitle(entry))
+                    .font(.system(size: 26, weight: .bold, design: .rounded))
+                    .tracking(-0.4)
+                    .lineLimit(2)
+                    .foregroundStyle(.white)
+
+                if let synopsis = metadata.records[entry.id]?.synopsis, !synopsis.isEmpty {
+                    Text(synopsis)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(0.74))
+                        .lineLimit(2)
+                        .lineSpacing(2)
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        launchOrInspect(entry)
+                    } label: {
+                        Label(entry.isLaunchable ? "开始游玩" : "查看导入说明", systemImage: entry.isLaunchable ? "play.fill" : "info.circle")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(PhoneTheme.inverseText)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 44)
+                            .background(PhoneTheme.action, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        detailEntry = entry
+                    } label: {
+                        Text("详情")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.92))
+                            .padding(.horizontal, 18)
+                            .frame(height: 44)
+                            .background(Color.white.opacity(0.11), in: Capsule())
+                            .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+
+                    favoriteButton(for: entry, size: 44)
+                }
+                .padding(.top, 2)
+            } else {
+                emptyHero(compact: false)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
+
+    private func landscapeHero(entry: Entry?) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            if let entry {
+                HStack(spacing: 8) {
+                    Text(entry.platformTitle.uppercased())
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .tracking(1.2)
+                        .foregroundStyle(.white.opacity(0.92))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.white.opacity(0.13), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    if !entry.isLaunchable {
+                        Text("未导入构建包")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                Text(displayTitle(entry))
+                    .font(.system(size: 25, weight: .bold, design: .rounded))
+                    .tracking(-0.4)
+                    .lineLimit(1)
+                    .foregroundStyle(.white)
+
+                if let synopsis = metadata.records[entry.id]?.synopsis, !synopsis.isEmpty {
+                    Text(synopsis)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.72))
+                        .lineLimit(1)
+                }
+
+                HStack(spacing: 9) {
+                    Button {
+                        launchOrInspect(entry)
+                    } label: {
+                        Label(entry.isLaunchable ? "开始游玩" : "查看详情", systemImage: entry.isLaunchable ? "play.fill" : "info.circle")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(PhoneTheme.inverseText)
+                            .padding(.horizontal, 18)
+                            .frame(height: 36)
+                            .background(PhoneTheme.action, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        detailEntry = entry
+                    } label: {
+                        Text("详情")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.92))
+                            .padding(.horizontal, 15)
+                            .frame(height: 36)
+                            .background(Color.white.opacity(0.11), in: Capsule())
+                            .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+
+                    favoriteButton(for: entry, size: 36)
+                }
+                .padding(.top, 2)
+            } else {
+                emptyHero(compact: true)
+            }
+        }
+        .frame(maxWidth: 480, alignment: .leading)
+    }
+
+    private func emptyHero(compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: compact ? 6 : 10) {
+            Text(filterTitle(activeFilter).uppercased())
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .tracking(1.4)
+                .foregroundStyle(.white.opacity(0.55))
+            Text(!searchText.isEmpty ? "没有找到匹配的游戏" : (activeFilter == .recent ? "还没有游玩记录" : activeFilter == .favorites ? "还没有收藏的游戏" : "这个平台还没有游戏"))
+                .font(.system(size: compact ? 20 : 24, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+            Text(!searchText.isEmpty ? "换个关键词试试，或切换到其他平台。" : "点击右上角「＋」导入 ROM 或 Switch .gcimport 游戏包，或通过「文件」App 放入 GameLibrary 目录。")
+                .font(.system(size: 12))
+                .foregroundStyle(.white.opacity(0.65))
+                .lineLimit(2)
+
+            if !searchText.isEmpty {
+                Button("清除搜索") { searchText = "" }
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .frame(height: 34)
+                    .background(Color.white.opacity(0.12), in: Capsule())
+                    .buttonStyle(.plain)
+            } else if activeFilter != .favorites {
+                Button {
+                    importing = true
+                } label: {
+                    Label("导入游戏", systemImage: "square.and.arrow.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(PhoneTheme.inverseText)
+                        .padding(.horizontal, 16)
+                        .frame(height: 36)
+                        .background(PhoneTheme.action, in: Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func favoriteButton(for entry: Entry, size: CGFloat) -> some View {
+        let isFav = favorites.contains(entry.id)
+        return Button {
+            toggleFavorite(entry)
+        } label: {
+            Image(systemName: isFav ? "heart.fill" : "heart")
+                .font(.system(size: size > 40 ? 15 : 13, weight: .semibold))
+                .foregroundStyle(isFav ? PhoneTheme.favoriteForeground : .white.opacity(0.9))
+                .frame(width: size, height: size)
+                .background(isFav ? PhoneTheme.favoriteBackground : Color.white.opacity(0.10), in: Circle())
+                .overlay(Circle().stroke(isFav ? PhoneTheme.favoriteBorder : Color.white.opacity(0.14), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(isFav ? "取消收藏" : "加入收藏")
+    }
+
+    // MARK: - Bottom Glass Dock (Platform Tabs + Pure Multi-Row Grid)
+
+    private func bottomDock(isLandscape: Bool, dockHeight: CGFloat?, columnsCount: Int) -> some View {
+        let horizontalInset: CGFloat = isLandscape ? 24 : 20
+        let columns = Array(repeating: GridItem(.flexible(), spacing: isLandscape ? 14 : 12, alignment: .top), count: columnsCount)
+
+        return VStack(spacing: 0) {
+            // Sliding Platform Tabs (trailing fade only — leading edge stays 100% crisp)
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(visibleFilters) { filter in
+                            let isSelected = activeFilter == filter
+                            Button {
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                withAnimation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.86)) {
+                                    activeFilter = filter
+                                }
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Text(filterTitle(filter))
+                                        .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                                    Text("\(count(for: filter))")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(isSelected ? Color.black.opacity(0.52) : Color.white.opacity(0.42))
+                                }
+                                .foregroundStyle(isSelected ? PhoneTheme.inverseText : Color.white.opacity(0.76))
+                                .padding(.horizontal, 12)
+                                .frame(height: 34)
+                                .background {
+                                    if isSelected {
+                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                            .fill(PhoneTheme.action)
+                                            .matchedGeometryEffect(id: "phoneFilterPill", in: filterPillNamespace)
+                                    } else {
+                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                            .fill(Color.white.opacity(0.06))
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .id(filter.id)
+                        }
+                    }
+                    .padding(.trailing, 24)
+                    .padding(.vertical, 2)
+                }
+                .mask(trailingFadeMask)
+                .onChange(of: activeFilter) { _, value in
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+                        proxy.scrollTo(value.id, anchor: .center)
+                    }
+                }
+            }
+            .padding(.horizontal, horizontalInset)
+            .padding(.top, isLandscape ? 10 : 12)
+            .padding(.bottom, 6)
+
+            // Multi-row Pure Cover Grid (no redundant header row, no top-left platform badge)
+            if visibleEntries.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "square.stack.3d.up")
+                        .font(.system(size: 22, weight: .light))
+                        .foregroundStyle(.white.opacity(0.36))
+                    Text("导入后的游戏封面会整齐排列在这里")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.48))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical, showsIndicators: false) {
+                        LazyVGrid(columns: columns, spacing: isLandscape ? 14 : 16) {
+                            ForEach(visibleEntries) { entry in
+                                coverTile(entry: entry, isSelected: entry.id == selectedEntry?.id)
+                                    .id(entry.id)
+                            }
+                        }
+                        .padding(.horizontal, horizontalInset)
+                        .padding(.top, 8)
+                        .padding(.bottom, isLandscape ? 16 : 28)
+                    }
+                    .mask(bottomFadeMask)
+                    .onChange(of: selectedEntry?.id) { _, id in
+                        guard let id else { return }
+                        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+                            proxy.scrollTo(id, anchor: .center)
+                        }
+                    }
+                }
+            }
+
+            if isLandscape && gamepad.controllerName != nil {
+                HStack(spacing: 14) {
+                    Text("◀▶▲▼ 浏览")
+                    Text("LB/RB 切换平台")
+                    Text("A 开始游玩")
+                    Text("X 详情")
+                    Text("Y 收藏")
+                    Spacer()
+                }
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(0.62))
+                .padding(.horizontal, horizontalInset)
+                .padding(.bottom, 6)
+            }
+        }
+        .frame(height: dockHeight)
+        .frame(maxHeight: dockHeight == nil ? .infinity : nil)
+        .background {
+            Rectangle()
+                .fill(.regularMaterial.opacity(0.55))
+                .mask(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0),
+                            .init(color: .black.opacity(0.45), location: 0.06),
+                            .init(color: .black, location: 0.20),
+                            .init(color: .black, location: 1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .overlay(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0),
+                            .init(color: .black.opacity(0.24), location: 0.16),
+                            .init(color: .black.opacity(0.55), location: 1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .ignoresSafeArea(edges: .bottom)
+        }
+    }
+
+    private func coverTile(entry: Entry, isSelected: Bool) -> some View {
+        let isFav = favorites.contains(entry.id)
+        return VStack(alignment: .leading, spacing: 6) {
+            ZStack(alignment: .topTrailing) {
+                coverArtView(entry: entry, cornerRadius: 11)
+                    .aspectRatio(0.8, contentMode: .fit)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .strokeBorder(
+                                Color.white.opacity(isSelected ? 0.96 : 0.14),
+                                lineWidth: isSelected ? 2 : 1
+                            )
+                    }
+                    .shadow(color: isSelected ? .black.opacity(0.55) : .clear, radius: 10, y: 4)
+
+                if isFav {
+                    Image(systemName: "heart.fill")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(PhoneTheme.favoriteForeground)
+                        .padding(7)
+                        .shadow(color: .black.opacity(0.55), radius: 3, y: 1)
+                }
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .onTapGesture {
+                if selectedEntry?.id == entry.id {
+                    launchOrInspect(entry)
+                } else {
+                    UISelectionFeedbackGenerator().selectionChanged()
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                        selectedEntryID = entry.id
+                    }
+                }
+            }
+            .contextMenu {
+                if entry.isLaunchable {
+                    Button("开始游玩", systemImage: "play.fill") { launchOrInspect(entry) }
+                }
+                Button("游戏详情", systemImage: "info.circle") { detailEntry = entry }
+                Button(isFav ? "取消收藏" : "加入收藏", systemImage: isFav ? "heart.slash" : "heart") {
+                    toggleFavorite(entry)
+                }
+                Button("刷新游戏资料", systemImage: "arrow.clockwise") {
+                    Task { await lookupMetadata(entry, force: true) }
+                }
+                if entry.isDeletable {
+                    Divider()
+                    Button("从设备删除…", systemImage: "trash", role: .destructive) {
+                        pendingDeleteEntry = entry
+                    }
+                }
+            }
+
+            Text(displayTitle(entry))
+                .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
+                .foregroundStyle(.white.opacity(isSelected ? 1 : 0.72))
+                .lineLimit(1)
+        }
+        .scaleEffect(isSelected && !reduceMotion ? 1.02 : 1)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: isSelected)
+    }
+
+    private func coverArtView(entry: Entry, cornerRadius: CGFloat) -> some View {
+        GeometryReader { bounds in
+            ZStack {
+                if let image = coverImage(for: entry) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: bounds.size.width, height: bounds.size.height)
+                        .clipped()
+                } else {
+                    LinearGradient(colors: placeholderPalette(for: entry), startPoint: .topLeading, endPoint: .bottomTrailing)
+                    Circle()
+                        .fill(.white.opacity(0.14))
+                        .frame(width: bounds.size.width * 0.9, height: bounds.size.width * 0.9)
+                        .blur(radius: 20)
+                        .offset(x: bounds.size.width * 0.35, y: -bounds.size.height * 0.35)
+                    Image(systemName: platformSymbol(for: entry.platformID))
+                        .font(.system(size: max(22, bounds.size.width * 0.28), weight: .light))
+                        .foregroundStyle(.white.opacity(0.84))
+                }
+            }
+            .frame(width: bounds.size.width, height: bounds.size.height)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        }
+    }
+
+    // MARK: - Unified Dark Detail Sheet
+
+    private func detailSheet(for entry: Entry) -> some View {
+        let isFav = favorites.contains(entry.id)
+        return VStack(spacing: 0) {
+            HStack {
+                Text("游戏详情")
+                    .font(.system(size: 15, weight: .semibold))
+                Spacer()
+                Button {
+                    detailEntry = nil
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .frame(width: 30, height: 30)
+                        .background(Color.white.opacity(0.10), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("关闭")
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 14)
+            .padding(.bottom, 12)
+
+            Divider().overlay(PhoneTheme.border)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    HStack(alignment: .top, spacing: 16) {
+                        coverArtView(entry: entry, cornerRadius: 12)
+                            .frame(width: 96, height: 120)
+                            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 1))
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(displayTitle(entry))
+                                .font(.system(size: 20, weight: .bold, design: .rounded))
+                                .fixedSize(horizontal: false, vertical: true)
+                                .lineLimit(3)
+
+                            Text(entry.platformTitle)
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.65))
+
+                            if case let .console(game) = entry {
+                                Text(game.status)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(game.builds.isEmpty ? Color.orange : PhoneTheme.ready)
+                            } else if case let .rom(rom, _) = entry, let note = rom.platform.runtimeNote {
+                                Text(note)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.white.opacity(0.55))
+                            }
+
+                            HStack(spacing: 8) {
+                                Button {
+                                    toggleFavorite(entry)
+                                } label: {
+                                    Label(isFav ? "已收藏" : "收藏", systemImage: isFav ? "heart.fill" : "heart")
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundStyle(isFav ? PhoneTheme.favoriteForeground : .white)
+                                        .padding(.horizontal, 12)
+                                        .frame(height: 34)
+                                        .background(isFav ? PhoneTheme.favoriteBackground : Color.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                                        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(isFav ? PhoneTheme.favoriteBorder : Color.white.opacity(0.13), lineWidth: 1))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.top, 2)
+                        }
+                        Spacer(minLength: 0)
+                    }
+
+                    // Launch Action(s)
+                    switch entry {
+                    case let .rom(rom, _):
+                        Button {
+                            detailEntry = nil
+                            remember(entry)
+                            selectedROM = rom
+                        } label: {
+                            Label("开始游戏", systemImage: "play.fill")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(PhoneTheme.inverseText)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 46)
+                                .background(PhoneTheme.action, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+
+                    case let .console(game):
+                        if game.builds.isEmpty {
+                            HStack(spacing: 10) {
+                                Image(systemName: "desktopcomputer")
+                                    .foregroundStyle(.white.opacity(0.75))
+                                Text("尚未导入此游戏的 iOS 构建包。请在 Mac 端 Game Center 构建 .gcimport 后，点右上角「＋」导入。")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.white.opacity(0.68))
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(14)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(PhoneTheme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(PhoneTheme.border, lineWidth: 1))
+                        } else if game.builds.count == 1, let build = game.builds.first {
+                            Button {
+                                detailEntry = nil
+                                launchSwitch(build, entry: entry)
+                            } label: {
+                                Label("运行游戏 (\(build.engine.rawValue))", systemImage: "play.fill")
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundStyle(PhoneTheme.inverseText)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 46)
+                                    .background(PhoneTheme.action, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("选择运行引擎")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.55))
+                                HStack(spacing: 10) {
+                                    ForEach(Array(game.builds.enumerated()), id: \.element.engine) { idx, build in
+                                        Button {
+                                            detailEntry = nil
+                                            launchSwitch(build, entry: entry)
+                                        } label: {
+                                            Label(build.engine.rawValue, systemImage: "play.fill")
+                                                .font(.system(size: 14, weight: .semibold))
+                                                .foregroundStyle(idx == 0 ? PhoneTheme.inverseText : .white)
+                                                .frame(maxWidth: .infinity)
+                                                .frame(height: 44)
+                                                .background(idx == 0 ? PhoneTheme.action : Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(idx == 0 ? 0 : 0.14), lineWidth: 1))
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    PhoneMetadataSection(metadata: metadata, id: entry.id) {
+                        Task { await lookupMetadata(entry, force: true) }
+                    }
+
+                    if entry.isDeletable {
+                        Button {
+                            detailEntry = nil
+                            pendingDeleteEntry = entry
+                        } label: {
+                            Label("从设备删除游戏…", systemImage: "trash")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(PhoneTheme.destructiveForeground)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 42)
+                                .background(PhoneTheme.destructiveBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(PhoneTheme.destructiveBorder, lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(20)
+            }
+        }
+        .preferredColorScheme(.dark)
+        .task(id: entry.id) { await lookupMetadata(entry) }
+    }
+
+    // MARK: - Helpers & Masks
+
+    private var trailingFadeMask: some View {
+        LinearGradient(
+            stops: [
+                .init(color: .black, location: 0),
+                .init(color: .black, location: 0.92),
+                .init(color: .clear, location: 1)
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+    }
+
+    private var bottomFadeMask: some View {
+        LinearGradient(
+            stops: [
+                .init(color: .black, location: 0),
+                .init(color: .black, location: 0.92),
+                .init(color: .clear, location: 1)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+
+    private func filterTitle(_ filter: PhoneFilter) -> String {
+        switch filter {
+        case .recent: "最近游玩"
+        case .favorites: "收藏"
+        case let .platform(id): allPlatforms.first(where: { $0.id == id })?.short ?? id.uppercased()
+        }
+    }
+
+    private func count(for filter: PhoneFilter) -> Int {
+        switch filter {
+        case .recent:
+            return recentIDs.filter { id in allEntries.contains { $0.id == id } }.count
+        case .favorites:
+            return allEntries.filter { favorites.contains($0.id) }.count
+        case let .platform(id):
+            return allEntries.filter { $0.platformID == id }.count
+        }
+    }
+
+    private func shortPlatformName(for id: String, fallback: String) -> String {
+        switch id {
+        case "threeDS": "3DS"
+        case "famicom": "FC"
+        case "superFamicom": "SFC"
+        case "megaDrive": "MD"
+        case "wiiu": "Wii U"
+        case "psv": "PS Vita"
+        default: fallback.uppercased()
+        }
+    }
+
+    private func platformSymbol(for id: String) -> String {
+        switch id {
+        case "nds", "threeDS": "rectangle.split.2x1.fill"
+        case "switch", "gba", "gb", "gbc", "psp", "psv": "gamecontroller.fill"
+        default: "opticaldisc.fill"
+        }
+    }
+
+    private func placeholderPalette(for entry: Entry) -> [Color] {
+        let key = displayTitle(entry).lowercased()
+        if key.contains("zelda") || key.contains("塞尔达") || key.contains("pokemon") || key.contains("宝可梦") {
+            return [Color(red: 0.16, green: 0.44, blue: 0.36), Color(red: 0.06, green: 0.16, blue: 0.16)]
+        }
+        if key.contains("mario") || key.contains("马力欧") || key.contains("metroid") {
+            return [Color(red: 0.66, green: 0.20, blue: 0.22), Color(red: 0.18, green: 0.08, blue: 0.14)]
+        }
+        let palettes: [[Color]] = [
+            [Color(red: 0.18, green: 0.30, blue: 0.44), Color(red: 0.07, green: 0.11, blue: 0.18)],
+            [Color(red: 0.36, green: 0.22, blue: 0.44), Color(red: 0.11, green: 0.07, blue: 0.16)],
+            [Color(red: 0.42, green: 0.28, blue: 0.18), Color(red: 0.14, green: 0.10, blue: 0.08)],
+            [Color(red: 0.18, green: 0.38, blue: 0.32), Color(red: 0.07, green: 0.14, blue: 0.13)]
+        ]
+        let hash = entry.title.utf8.reduce(0) { ($0 + Int($1)) % palettes.count }
+        return palettes[hash]
+    }
+
+    private func coverImage(for entry: Entry) -> UIImage? {
+        if let cached = metadata.image(for: entry.id, backdrop: false) { return cached }
+        guard case let .console(game) = entry else { return nil }
+        return metadata.bundledImage(named: game.coverName)
+    }
+
+    private func backdropImage(for entry: Entry) -> UIImage? {
+        if let cached = metadata.image(for: entry.id, backdrop: true) { return cached }
+        guard case let .console(game) = entry else { return nil }
+        return metadata.bundledImage(named: game.coverName)
+    }
+
+    private func displayTitle(_ entry: Entry) -> String {
+        metadata.records[entry.id]?.title ?? entry.title
+    }
+
+    private func remember(_ entry: Entry) {
+        let updated = Array(([entry.id] + recentIDs.filter { $0 != entry.id }).prefix(100))
+        recentData = (try? JSONEncoder().encode(updated)) ?? Data()
+    }
+
+    private func toggleFavorite(_ entry: Entry) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        var updated = favorites
+        if !updated.insert(entry.id).inserted { updated.remove(entry.id) }
+        if let data = try? JSONEncoder().encode(updated) { favoriteData = data }
+    }
+
+    private func launchOrInspect(_ entry: Entry) {
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        switch entry {
+        case let .rom(rom, _):
+            remember(entry)
+            selectedROM = rom
+        case let .console(game):
+            if game.builds.count == 1, let build = game.builds.first {
+                launchSwitch(build, entry: entry)
+            } else {
+                detailEntry = entry
+            }
+        }
+    }
+
+    private func launchSwitch(_ build: PhoneLibrary.Format.SwitchBuild, entry: Entry) {
+        guard let library else { return }
+        do {
+            switch build.engine {
+            case .nxnative: try NXGameLauncher.launch(build, library: library)
+            case .s2arm: try S2ArmGameLauncher.launch(build, library: library)
+            }
+            remember(entry)
+        } catch {
+            notice = error.localizedDescription
+        }
+    }
+
+    private func deleteEntry(_ entry: Entry) {
+        guard let library else { return }
+        do {
+            switch entry {
+            case let .rom(rom, _):
+                try library.deleteROM(rom)
+            case let .console(game):
+                try library.deleteSwitchBuilds(for: game)
+            }
+            Task { await refresh() }
+        } catch {
+            notice = "删除失败：" + error.localizedDescription
+        }
+    }
+
+    private func lookupMetadata(_ entry: Entry, force: Bool = false) async {
+        let source: URL?
+        let titleID: String?
+        switch entry {
+        case let .rom(rom, _):
+            source = rom.url
+            titleID = nil
+        case let .console(game):
+            source = library?.switchRoot.appendingPathComponent(game.id)
+            titleID = game.id
+        }
+        await metadata.lookup(id: entry.id, title: entry.title, platformID: entry.platformID, source: source, titleID: titleID, force: force)
+    }
+
+    // MARK: - Gamepad Binding
+
+    private func bindGamepad(columnsCount: Int) {
+        gamepad.isActive = {
+            selectedROM == nil && !showingSaveSync && !importing && pendingDeleteEntry == nil
+        }
+        gamepad.onMoveHorizontal = { delta in
+            guard detailEntry == nil, !visibleEntries.isEmpty else { return }
+            let idx = visibleEntries.firstIndex(where: { $0.id == selectedEntry?.id }) ?? 0
+            selectedEntryID = visibleEntries[(idx + delta + visibleEntries.count) % visibleEntries.count].id
+        }
+        gamepad.onMoveVertical = { delta in
+            guard detailEntry == nil, !visibleEntries.isEmpty else { return }
+            let idx = visibleEntries.firstIndex(where: { $0.id == selectedEntry?.id }) ?? 0
+            let next = idx + delta * columnsCount
+            if visibleEntries.indices.contains(next) {
+                selectedEntryID = visibleEntries[next].id
+            }
+        }
+        gamepad.onShiftFilter = { delta in
+            guard detailEntry == nil, !visibleFilters.isEmpty else { return }
+            let idx = visibleFilters.firstIndex(of: activeFilter) ?? 0
+            withAnimation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.86)) {
+                activeFilter = visibleFilters[(idx + delta + visibleFilters.count) % visibleFilters.count]
+            }
+        }
+        gamepad.onPlay = {
+            if let entry = detailEntry {
+                detailEntry = nil
+                launchOrInspect(entry)
+            } else if let entry = selectedEntry {
+                launchOrInspect(entry)
+            }
+        }
+        gamepad.onDetails = {
+            if detailEntry == nil, let entry = selectedEntry {
+                detailEntry = entry
+            }
+        }
+        gamepad.onFavorite = {
+            if let entry = detailEntry ?? selectedEntry {
+                toggleFavorite(entry)
+            }
+        }
+        gamepad.onBack = {
+            if detailEntry != nil { detailEntry = nil }
+        }
+    }
+
+    // MARK: - Library Refresh & Import
 
     private func refresh() async {
         guard !refreshing, !importingFiles, dm_shell_active_game_id() == nil, gc_s2arm_active() == 0 else { return }
@@ -483,6 +1369,12 @@ private struct LibraryView: View {
                 return (library, library.roms(), library.switchGames(), error)
             }.value
             (library, roms, switchGames) = (data.0, data.1, data.2)
+            // If Recent is empty on first launch but user already has games, default to the first non-empty platform.
+            if activeFilter == .recent && visibleEntries.isEmpty,
+               let firstPlatform = allPlatforms.first(where: { count(for: .platform($0.id)) > 0 }) {
+                activeFilter = .platform(firstPlatform.id)
+            }
+            if selectedEntryID == nil { selectedEntryID = visibleEntries.first?.id }
             if let error = data.3 { notice = error }
         } catch {
             notice = error.localizedDescription
@@ -492,7 +1384,7 @@ private struct LibraryView: View {
     private func handleImport(_ result: Result<[URL], Error>) async {
         guard let library, !refreshing, !importingFiles else { return }
         importingFiles = true
-        let target = platform
+        let target = activeImportPlatform
         let errors = await Task.detached(priority: .userInitiated) {
             do {
                 return try result.get().compactMap { url -> String? in
@@ -513,3 +1405,97 @@ private struct LibraryView: View {
     }
 }
 
+@MainActor
+private final class PhoneGamepadNavigator: ObservableObject {
+    @Published private(set) var controllerName: String?
+    @Published private(set) var connectionVersion = 0
+
+    var isActive: () -> Bool = { true }
+    var onMoveHorizontal: ((Int) -> Void)?
+    var onMoveVertical: ((Int) -> Void)?
+    var onShiftFilter: ((Int) -> Void)?
+    var onPlay: (() -> Void)?
+    var onDetails: (() -> Void)?
+    var onFavorite: (() -> Void)?
+    var onBack: (() -> Void)?
+
+    private weak var boundController: GCController?
+    private var lastStickX = 0
+    private var lastStickY = 0
+
+    func refresh() {
+        let controller = GCController.controllers().first(where: { $0.extendedGamepad != nil })
+        controllerName = controller?.vendorName ?? (controller == nil ? nil : "手柄已连接")
+        guard controller !== boundController else { return }
+        if let old = boundController?.extendedGamepad {
+            old.dpad.left.pressedChangedHandler = nil
+            old.dpad.right.pressedChangedHandler = nil
+            old.dpad.up.pressedChangedHandler = nil
+            old.dpad.down.pressedChangedHandler = nil
+            old.leftThumbstick.valueChangedHandler = nil
+            old.buttonA.pressedChangedHandler = nil
+            old.buttonB.pressedChangedHandler = nil
+            old.buttonX.pressedChangedHandler = nil
+            old.buttonY.pressedChangedHandler = nil
+            old.leftShoulder.pressedChangedHandler = nil
+            old.rightShoulder.pressedChangedHandler = nil
+        }
+        boundController = controller
+        connectionVersion += 1
+        guard let pad = controller?.extendedGamepad else { return }
+
+        pad.dpad.left.pressedChangedHandler = { [weak self] _, _, pressed in
+            if pressed { Task { @MainActor in self?.dispatch { self?.onMoveHorizontal?(-1) } } }
+        }
+        pad.dpad.right.pressedChangedHandler = { [weak self] _, _, pressed in
+            if pressed { Task { @MainActor in self?.dispatch { self?.onMoveHorizontal?(1) } } }
+        }
+        pad.dpad.up.pressedChangedHandler = { [weak self] _, _, pressed in
+            if pressed { Task { @MainActor in self?.dispatch { self?.onMoveVertical?(-1) } } }
+        }
+        pad.dpad.down.pressedChangedHandler = { [weak self] _, _, pressed in
+            if pressed { Task { @MainActor in self?.dispatch { self?.onMoveVertical?(1) } } }
+        }
+        pad.leftThumbstick.valueChangedHandler = { [weak self] _, x, y in
+            Task { @MainActor in
+                guard let self, self.isActive() else { return }
+                self.handleAxis(x, state: &self.lastStickX, action: self.onMoveHorizontal)
+                self.handleAxis(-y, state: &self.lastStickY, action: self.onMoveVertical)
+            }
+        }
+        pad.buttonA.pressedChangedHandler = { [weak self] _, _, pressed in
+            if pressed { Task { @MainActor in self?.dispatch { self?.onPlay?() } } }
+        }
+        pad.buttonB.pressedChangedHandler = { [weak self] _, _, pressed in
+            if pressed { Task { @MainActor in self?.dispatch { self?.onBack?() } } }
+        }
+        pad.buttonX.pressedChangedHandler = { [weak self] _, _, pressed in
+            if pressed { Task { @MainActor in self?.dispatch { self?.onDetails?() } } }
+        }
+        pad.buttonY.pressedChangedHandler = { [weak self] _, _, pressed in
+            if pressed { Task { @MainActor in self?.dispatch { self?.onFavorite?() } } }
+        }
+        pad.leftShoulder.pressedChangedHandler = { [weak self] _, _, pressed in
+            if pressed { Task { @MainActor in self?.dispatch { self?.onShiftFilter?(-1) } } }
+        }
+        pad.rightShoulder.pressedChangedHandler = { [weak self] _, _, pressed in
+            if pressed { Task { @MainActor in self?.dispatch { self?.onShiftFilter?(1) } } }
+        }
+    }
+
+    private func dispatch(_ action: () -> Void) {
+        guard isActive() else { return }
+        action()
+    }
+
+    private func handleAxis(_ value: Float, state: inout Int, action: ((Int) -> Void)?) {
+        let next = value > 0.6 ? 1 : (value < -0.6 ? -1 : 0)
+        if next == 0 {
+            if abs(value) < 0.25 { state = 0 }
+            return
+        }
+        guard next != state else { return }
+        state = next
+        action?(next)
+    }
+}
