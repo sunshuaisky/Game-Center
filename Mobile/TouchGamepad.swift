@@ -1,0 +1,530 @@
+import SwiftUI
+import UIKit
+
+/// Direct CALayer frame host for software-rendered Libretro cores.
+/// Updating `layer.contents` directly avoids triggering SwiftUI body diffs at 60fps
+/// and keeps touch controls responsive even when emulation frame times fluctuate.
+final class RetroScreenUIView: UIView {
+    var onPointer: ((CGFloat, CGFloat, Bool) -> Void)?
+    private var activeTouch: UITouch?
+    private var frameSize: CGSize = .zero
+    private let imageLayer = CALayer()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .black
+        isMultipleTouchEnabled = false
+        imageLayer.contentsGravity = .resizeAspect
+        imageLayer.magnificationFilter = .nearest
+        imageLayer.minificationFilter = .linear
+        imageLayer.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
+        layer.addSublayer(imageLayer)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        imageLayer.frame = bounds
+    }
+
+    func update(image: CGImage) {
+        frameSize = CGSize(width: image.width, height: image.height)
+        imageLayer.contents = image
+    }
+
+    private func report(_ touch: UITouch, pressed: Bool) {
+        guard pressed, frameSize.width > 0, frameSize.height > 0,
+              bounds.width > 0, bounds.height > 0 else {
+            onPointer?(0, 0, false)
+            return
+        }
+        let point = touch.location(in: self)
+        let scale = min(bounds.width / frameSize.width, bounds.height / frameSize.height)
+        let renderedWidth = frameSize.width * scale
+        let renderedHeight = frameSize.height * scale
+        let x = (point.x - (bounds.width - renderedWidth) / 2) / max(1, renderedWidth)
+        let y = (point.y - (bounds.height - renderedHeight) / 2) / max(1, renderedHeight)
+        onPointer?(x, y, (0...1).contains(x) && (0...1).contains(y))
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard activeTouch == nil, let touch = touches.first else { return }
+        activeTouch = touch
+        report(touch, pressed: true)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let activeTouch, touches.contains(activeTouch) else { return }
+        report(activeTouch, pressed: true)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let activeTouch, touches.contains(activeTouch) else { return }
+        self.activeTouch = nil
+        report(activeTouch, pressed: false)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let activeTouch, touches.contains(activeTouch) else { return }
+        self.activeTouch = nil
+        report(activeTouch, pressed: false)
+    }
+}
+
+struct RetroScreenView: UIViewRepresentable {
+    let view: RetroScreenUIView
+    func makeUIView(context: Context) -> RetroScreenUIView { view }
+    func updateUIView(_ uiView: RetroScreenUIView, context: Context) {}
+}
+
+// MARK: - Single Multi-Touch Virtual Button
+
+final class PadButtonUIView: UIView {
+    private let label = UILabel()
+    private var activeTouches = Set<UITouch>()
+    private var isPressedState = false
+    var onChange: ((Bool) -> Void)?
+    var isCircular = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isMultipleTouchEnabled = true
+        isExclusiveTouch = false
+        backgroundColor = UIColor.white.withAlphaComponent(0.14)
+        layer.borderColor = UIColor.white.withAlphaComponent(0.22).cgColor
+        layer.borderWidth = 1
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 15, weight: .semibold)
+        label.textAlignment = .center
+        label.adjustsFontSizeToFitWidth = true
+        label.minimumScaleFactor = 0.7
+        label.isUserInteractionEnabled = false
+        addSubview(label)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(title: String, circular: Bool, onChange: @escaping (Bool) -> Void) {
+        label.text = title
+        isCircular = circular
+        self.onChange = onChange
+        accessibilityLabel = title
+        accessibilityTraits = .button
+        isAccessibilityElement = true
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        label.frame = bounds.insetBy(dx: 4, dy: 2)
+        layer.cornerRadius = isCircular ? min(bounds.width, bounds.height) / 2 : min(16, bounds.height / 2)
+    }
+
+    private func setPressed(_ pressed: Bool) {
+        guard isPressedState != pressed else { return }
+        isPressedState = pressed
+        backgroundColor = UIColor.white.withAlphaComponent(pressed ? 0.36 : 0.14)
+        transform = pressed ? CGAffineTransform(scaleX: 0.94, y: 0.94) : .identity
+        onChange?(pressed)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        activeTouches.formUnion(touches)
+        setPressed(!activeTouches.isEmpty)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        activeTouches.subtract(touches)
+        setPressed(!activeTouches.isEmpty)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        activeTouches.subtract(touches)
+        setPressed(!activeTouches.isEmpty)
+    }
+}
+
+struct TouchPadButton: UIViewRepresentable {
+    let title: String
+    var circular: Bool = false
+    let onChange: (Bool) -> Void
+
+    func makeUIView(context: Context) -> PadButtonUIView {
+        let view = PadButtonUIView()
+        view.configure(title: title, circular: circular, onChange: onChange)
+        return view
+    }
+
+    func updateUIView(_ uiView: PadButtonUIView, context: Context) {
+        uiView.configure(title: title, circular: circular, onChange: onChange)
+    }
+}
+
+// MARK: - 8-Way Sliding Multi-Touch D-Pad
+
+final class TouchDPadUIView: UIView {
+    struct State: Equatable {
+        var up = false, down = false, left = false, right = false
+    }
+
+    var onChange: ((State) -> Void)?
+    private var activeTouches = Set<UITouch>()
+    private var current = State()
+    private let upCell = UILabel(), downCell = UILabel(), leftCell = UILabel(), rightCell = UILabel()
+    private let centerCap = UIView()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isMultipleTouchEnabled = true
+        isExclusiveTouch = false
+        backgroundColor = .clear
+        for (cell, text) in [(upCell, "↑"), (downCell, "↓"), (leftCell, "←"), (rightCell, "→")] {
+            cell.text = text
+            cell.textColor = .white
+            cell.font = .systemFont(ofSize: 18, weight: .bold)
+            cell.textAlignment = .center
+            cell.backgroundColor = UIColor.white.withAlphaComponent(0.14)
+            cell.layer.cornerRadius = 10
+            cell.layer.masksToBounds = true
+            cell.layer.borderColor = UIColor.white.withAlphaComponent(0.20).cgColor
+            cell.layer.borderWidth = 1
+            cell.isUserInteractionEnabled = false
+            addSubview(cell)
+        }
+        centerCap.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+        centerCap.layer.cornerRadius = 8
+        centerCap.isUserInteractionEnabled = false
+        addSubview(centerCap)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let side = min(bounds.width, bounds.height)
+        let cell = side / 3
+        let ox = (bounds.width - side) / 2
+        let oy = (bounds.height - side) / 2
+        upCell.frame = CGRect(x: ox + cell, y: oy, width: cell, height: cell).insetBy(dx: 2, dy: 2)
+        downCell.frame = CGRect(x: ox + cell, y: oy + cell * 2, width: cell, height: cell).insetBy(dx: 2, dy: 2)
+        leftCell.frame = CGRect(x: ox, y: oy + cell, width: cell, height: cell).insetBy(dx: 2, dy: 2)
+        rightCell.frame = CGRect(x: ox + cell * 2, y: oy + cell, width: cell, height: cell).insetBy(dx: 2, dy: 2)
+        centerCap.frame = CGRect(x: ox + cell, y: oy + cell, width: cell, height: cell).insetBy(dx: 5, dy: 5)
+    }
+
+    private func recompute() {
+        var next = State()
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let deadzone = min(bounds.width, bounds.height) * 0.12
+        for touch in activeTouches {
+            let p = touch.location(in: self)
+            let dx = p.x - center.x
+            let dy = p.y - center.y
+            let dist = hypot(dx, dy)
+            guard dist >= deadzone else { continue }
+            let angle = atan2(dy, dx) * 180 / .pi // -180..180, 0=right, 90=down, -90=up
+            if angle >= -67.5 && angle <= 67.5 { next.right = true }
+            if angle >= 112.5 || angle <= -112.5 { next.left = true }
+            if angle >= 22.5 && angle <= 157.5 { next.down = true }
+            if angle <= -22.5 && angle >= -157.5 { next.up = true }
+        }
+        if next != current {
+            current = next
+            updateHighlights()
+            onChange?(next)
+        }
+    }
+
+    private func updateHighlights() {
+        upCell.backgroundColor = UIColor.white.withAlphaComponent(current.up ? 0.38 : 0.14)
+        downCell.backgroundColor = UIColor.white.withAlphaComponent(current.down ? 0.38 : 0.14)
+        leftCell.backgroundColor = UIColor.white.withAlphaComponent(current.left ? 0.38 : 0.14)
+        rightCell.backgroundColor = UIColor.white.withAlphaComponent(current.right ? 0.38 : 0.14)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        activeTouches.formUnion(touches)
+        recompute()
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        recompute()
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        activeTouches.subtract(touches)
+        recompute()
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        activeTouches.subtract(touches)
+        recompute()
+    }
+}
+
+struct TouchDPad: UIViewRepresentable {
+    let onChange: (TouchDPadUIView.State) -> Void
+    func makeUIView(context: Context) -> TouchDPadUIView {
+        let view = TouchDPadUIView()
+        view.onChange = onChange
+        return view
+    }
+    func updateUIView(_ uiView: TouchDPadUIView, context: Context) {
+        uiView.onChange = onChange
+    }
+}
+
+// MARK: - Multi-Touch Diamond Action Pad (Supports Rolling Thumb & Simultaneous Multi-Button)
+
+final class TouchDiamondPadUIView: UIView {
+    struct Labels: Equatable {
+        let top: String?
+        let left: String?
+        let right: String?
+        let bottom: String?
+    }
+
+    struct State: Equatable {
+        var top = false, left = false, right = false, bottom = false
+    }
+
+    var onChange: ((State) -> Void)?
+    private var labels = Labels(top: "X", left: "Y", right: "A", bottom: "B")
+    private var activeTouches = Set<UITouch>()
+    private var current = State()
+    private let topView = UILabel(), leftView = UILabel(), rightView = UILabel(), bottomView = UILabel()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isMultipleTouchEnabled = true
+        isExclusiveTouch = false
+        backgroundColor = .clear
+        for cell in [topView, leftView, rightView, bottomView] {
+            cell.textColor = .white
+            cell.font = .systemFont(ofSize: 18, weight: .bold)
+            cell.textAlignment = .center
+            cell.backgroundColor = UIColor.white.withAlphaComponent(0.16)
+            cell.layer.borderColor = UIColor.white.withAlphaComponent(0.24).cgColor
+            cell.layer.borderWidth = 1
+            cell.layer.masksToBounds = true
+            cell.isUserInteractionEnabled = false
+            addSubview(cell)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(labels: Labels, onChange: @escaping (State) -> Void) {
+        self.onChange = onChange
+        guard self.labels != labels else { return }
+        self.labels = labels
+        topView.text = labels.top; topView.isHidden = labels.top == nil
+        leftView.text = labels.left; leftView.isHidden = labels.left == nil
+        rightView.text = labels.right; rightView.isHidden = labels.right == nil
+        bottomView.text = labels.bottom; bottomView.isHidden = labels.bottom == nil
+        setNeedsLayout()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let side = min(bounds.width, bounds.height)
+        let ox = (bounds.width - side) / 2
+        let oy = (bounds.height - side) / 2
+        let twoButtonOnly = labels.top == nil && labels.left == nil && labels.right != nil && labels.bottom != nil
+        if twoButtonOnly {
+            let d = side * 0.44
+            bottomView.frame = CGRect(x: ox + side * 0.06, y: oy + side * 0.46, width: d, height: d)
+            rightView.frame = CGRect(x: ox + side * 0.50, y: oy + side * 0.14, width: d, height: d)
+            topView.frame = .zero
+            leftView.frame = .zero
+        } else {
+            let d = side * 0.36
+            let midX = ox + (side - d) / 2
+            let midY = oy + (side - d) / 2
+            topView.frame = CGRect(x: midX, y: oy + 2, width: d, height: d)
+            bottomView.frame = CGRect(x: midX, y: oy + side - d - 2, width: d, height: d)
+            leftView.frame = CGRect(x: ox + 2, y: midY, width: d, height: d)
+            rightView.frame = CGRect(x: ox + side - d - 2, y: midY, width: d, height: d)
+        }
+        for cell in [topView, leftView, rightView, bottomView] {
+            cell.layer.cornerRadius = cell.bounds.width / 2
+        }
+    }
+
+    private func recompute() {
+        var next = State()
+        let targets: [(UILabel, WritableKeyPath<State, Bool>)] = [
+            (topView, \.top), (leftView, \.left), (rightView, \.right), (bottomView, \.bottom)
+        ].filter { !$0.0.isHidden && $0.0.bounds.width > 1 }
+
+        for touch in activeTouches {
+            let p = touch.location(in: self)
+            let hitRadius = max(28, (targets.first?.0.bounds.width ?? 44) * 0.66)
+            var matchedAny = false
+            for (view, keyPath) in targets {
+                let d = hypot(p.x - view.center.x, p.y - view.center.y)
+                if d <= hitRadius {
+                    next[keyPath: keyPath] = true
+                    matchedAny = true
+                }
+            }
+            if !matchedAny, let nearest = targets.min(by: {
+                hypot(p.x - $0.0.center.x, p.y - $0.0.center.y) < hypot(p.x - $1.0.center.x, p.y - $1.0.center.y)
+            }) {
+                let d = hypot(p.x - nearest.0.center.x, p.y - nearest.0.center.y)
+                if d <= hitRadius * 1.45 {
+                    next[keyPath: nearest.1] = true
+                }
+            }
+        }
+        if next != current {
+            current = next
+            updateHighlights()
+            onChange?(next)
+        }
+    }
+
+    private func updateHighlights() {
+        topView.backgroundColor = UIColor.white.withAlphaComponent(current.top ? 0.40 : 0.16)
+        leftView.backgroundColor = UIColor.white.withAlphaComponent(current.left ? 0.40 : 0.16)
+        rightView.backgroundColor = UIColor.white.withAlphaComponent(current.right ? 0.40 : 0.16)
+        bottomView.backgroundColor = UIColor.white.withAlphaComponent(current.bottom ? 0.40 : 0.16)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        activeTouches.formUnion(touches)
+        recompute()
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        recompute()
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        activeTouches.subtract(touches)
+        recompute()
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        activeTouches.subtract(touches)
+        recompute()
+    }
+}
+
+struct TouchDiamondPad: UIViewRepresentable {
+    let labels: TouchDiamondPadUIView.Labels
+    let onChange: (TouchDiamondPadUIView.State) -> Void
+
+    func makeUIView(context: Context) -> TouchDiamondPadUIView {
+        let view = TouchDiamondPadUIView()
+        view.configure(labels: labels, onChange: onChange)
+        return view
+    }
+
+    func updateUIView(_ uiView: TouchDiamondPadUIView, context: Context) {
+        uiView.configure(labels: labels, onChange: onChange)
+    }
+}
+
+// MARK: - Multi-Touch Analog Stick
+
+final class TouchAnalogStickUIView: UIView {
+    var invertY = false
+    var onChange: ((Float, Float) -> Void)?
+    private var activeTouch: UITouch?
+    private let baseView = UIView()
+    private let knobView = UIView()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isMultipleTouchEnabled = true
+        isExclusiveTouch = false
+        backgroundColor = .clear
+        baseView.backgroundColor = UIColor.white.withAlphaComponent(0.12)
+        baseView.layer.borderColor = UIColor.white.withAlphaComponent(0.22).cgColor
+        baseView.layer.borderWidth = 1
+        baseView.isUserInteractionEnabled = false
+        addSubview(baseView)
+
+        knobView.backgroundColor = UIColor.white.withAlphaComponent(0.36)
+        knobView.isUserInteractionEnabled = false
+        addSubview(knobView)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let side = min(bounds.width, bounds.height)
+        baseView.frame = CGRect(x: (bounds.width - side) / 2, y: (bounds.height - side) / 2, width: side, height: side)
+        baseView.layer.cornerRadius = side / 2
+        let knob = side * 0.38
+        knobView.bounds = CGRect(x: 0, y: 0, width: knob, height: knob)
+        knobView.layer.cornerRadius = knob / 2
+        if activeTouch == nil {
+            knobView.center = CGPoint(x: bounds.midX, y: bounds.midY)
+        }
+    }
+
+    private func updateStick(for touch: UITouch?) {
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        guard let touch else {
+            knobView.center = center
+            onChange?(0, 0)
+            return
+        }
+        let maxRadius = max(16, min(bounds.width, bounds.height) * 0.36)
+        let point = touch.location(in: self)
+        var dx = point.x - center.x
+        var dy = point.y - center.y
+        let dist = hypot(dx, dy)
+        if dist > maxRadius {
+            dx = dx / dist * maxRadius
+            dy = dy / dist * maxRadius
+        }
+        knobView.center = CGPoint(x: center.x + dx, y: center.y + dy)
+        let nx = Float(dx / maxRadius)
+        let ny = Float((invertY ? -dy : dy) / maxRadius)
+        onChange?(nx, ny)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard activeTouch == nil, let touch = touches.first else { return }
+        activeTouch = touch
+        updateStick(for: touch)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let activeTouch, touches.contains(activeTouch) else { return }
+        updateStick(for: activeTouch)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let activeTouch, touches.contains(activeTouch) else { return }
+        self.activeTouch = nil
+        updateStick(for: nil)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let activeTouch, touches.contains(activeTouch) else { return }
+        self.activeTouch = nil
+        updateStick(for: nil)
+    }
+}
+
+struct TouchAnalogStick: UIViewRepresentable {
+    var invertY: Bool = false
+    let onChange: (Float, Float) -> Void
+
+    func makeUIView(context: Context) -> TouchAnalogStickUIView {
+        let view = TouchAnalogStickUIView()
+        view.invertY = invertY
+        view.onChange = onChange
+        return view
+    }
+
+    func updateUIView(_ uiView: TouchAnalogStickUIView, context: Context) {
+        uiView.invertY = invertY
+        uiView.onChange = onChange
+    }
+}

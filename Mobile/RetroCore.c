@@ -1,0 +1,348 @@
+#include "RetroCore.h"
+#include <dlfcn.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* The libretro ABI uses process-wide callbacks. The app presents one core at a time. */
+struct GameInfo { const char *path; const void *data; size_t size; const char *meta; };
+struct SystemInfo { const char *name, *version, *extensions; bool full_path, block_extract; };
+struct Geometry { unsigned width, height, max_width, max_height; float aspect; };
+struct Timing { double fps, sample_rate; };
+struct AVInfo { struct Geometry geometry; struct Timing timing; };
+struct Variable { const char *key, *value; };
+struct GCRetro {
+    void *handle, *rom;
+    char *rom_path, *system, *save, *battery;
+    struct Timing timing;
+    uint32_t *pixels;
+    int width, height, format;
+    uint64_t sequence;
+    uint16_t buttons;
+    int16_t axes[4], pointer_x, pointer_y;
+    bool pointer_pressed;
+    int16_t audio[32768];
+    size_t audio_frames;
+    bool initialized, loaded, hardware_requested;
+    void (*run)(void), (*unload)(void), (*deinit)(void);
+    size_t (*memory_size)(unsigned);
+    void *(*memory_data)(unsigned);
+    struct { char *key, *value; } options[512];
+    unsigned option_count;
+};
+
+static GCRetro *active;
+static char error[512];
+
+static void core_log(int level, const char *format, ...) {
+    if (level < 3) return;
+    va_list args;
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+}
+
+struct CoreOptionValue { const char *value, *label; };
+struct CoreOptionDefV1 { const char *key, *desc, *info; struct CoreOptionValue values[128]; const char *default_value; };
+struct CoreOptionsIntlV1 { struct CoreOptionDefV1 *us, *local; };
+struct CoreOptionDefV2 { const char *key, *desc, *desc_cat, *info, *info_cat, *cat_key; struct CoreOptionValue values[128]; const char *default_value; };
+struct CoreOptionsV2 { void *categories; struct CoreOptionDefV2 *definitions; };
+struct CoreOptionsIntlV2 { struct CoreOptionsV2 *us, *local; };
+
+static void store_option(const char *key, const char *value) {
+    if (!active || !key || !value) return;
+    for (unsigned i = 0; i < active->option_count; ++i) {
+        if (!strcmp(active->options[i].key, key)) {
+            char *copy = strdup(value);
+            if (copy) { free(active->options[i].value); active->options[i].value = copy; }
+            return;
+        }
+    }
+    if (active->option_count >= 512) return;
+    char *k = strdup(key), *v = strdup(value);
+    if (k && v) {
+        active->options[active->option_count].key = k;
+        active->options[active->option_count].value = v;
+        ++active->option_count;
+    } else {
+        free(k); free(v);
+    }
+}
+
+static bool environment(unsigned command, void *arg) {
+    if (!active) return false;
+    switch (command) {
+        case 27: ((struct { void (*log)(int, const char *, ...); } *)arg)->log = core_log; return true;
+        case 3: *(bool *)arg = true; return true;  /* Can duplicate video frames. */
+        case 9: *(const char **)arg = active->system; return true;
+        case 30: *(const char **)arg = active->system; return true; /* GET_CORE_ASSETS_DIRECTORY */
+        case 10:
+            if (*(const int *)arg < 0 || *(const int *)arg > 2) return false;
+            active->format = *(const int *)arg;
+            return true;
+        case 11: return true; /* SET_INPUT_DESCRIPTORS */
+        case 14: case (14 | 0x10000):  /* SET_HW_RENDER */
+            active->hardware_requested = true;
+            return false;
+        case 15: {
+            struct Variable *variable = arg;
+            // Ordinary iOS signing provides no JIT entitlement. Match the CPU
+            // and renderer to this host's software-framebuffer implementation.
+            static const struct Variable software_options[] = {
+                {"desmume_cpu_mode", "interpreter"},
+                {"desmume_pointer_type", "touch"},
+                {"dolphin_cpu_core", "5"},
+                {"dolphin_renderer", "Software"},
+                {"dolphin_main_cpu_thread", "disabled"},
+                {"pcsx2_renderer", "software"},
+                {"pcsx2_bios", "auto"},
+                {"pcsx2_fast_boot", "enabled"},
+                {"pcsx2_cpu_recompiler", "disabled"},
+                {"pcsx2_rec_ee", "disabled"},
+                {"pcsx2_rec_iop", "disabled"},
+                {"pcsx2_rec_vu0", "disabled"},
+                {"pcsx2_rec_vu1", "disabled"},
+                {"citra_use_cpu_jit", "disabled"},
+                {"citra_use_shader_jit", "disabled"},
+                {"citra_use_hw_shader", "disabled"},
+                {"citra_graphics_api", "Software"},
+                {"ppsspp_cpu_core", "Interpreter"},
+                {"ppsspp_software_rendering", "enabled"},
+                {"ppsspp_backend", "Software"},
+                {"swanstation_CPU_ExecutionMode", "Interpreter"},
+                {"swanstation_GPU_Renderer", "Software"},
+                {"swanstation_BIOS_PathNTSCJ", "scph5500.bin"},
+                {"swanstation_BIOS_PathNTSCU", "scph5501.bin"},
+                {"swanstation_BIOS_PathPAL", "scph5502.bin"},
+            };
+            for (size_t i = 0; i < sizeof(software_options) / sizeof(software_options[0]); ++i) {
+                if (!strcmp(variable->key, software_options[i].key)) {
+                    variable->value = software_options[i].value;
+                    return true;
+                }
+            }
+            variable->value = NULL;
+            for (unsigned i = 0; i < active->option_count; ++i) {
+                if (!strcmp(active->options[i].key, variable->key)) {
+                    variable->value = active->options[i].value;
+                    return true;
+                }
+            }
+            return variable->value != NULL;
+        }
+        case 16: {
+            for (const struct Variable *item = arg; item && item->key && active->option_count < 512; ++item) {
+                const char *separator = item->value ? strstr(item->value, "; ") : NULL;
+                if (!separator) continue;
+                const char *start = separator + 2;
+                char *val = strndup(start, strcspn(start, "|"));
+                if (val) { store_option(item->key, val); free(val); }
+            }
+            return true;
+        }
+        case 53: case 54: {
+            const struct CoreOptionDefV1 *defs = command == 54
+                ? (arg ? ((const struct CoreOptionsIntlV1 *)arg)->us : NULL)
+                : (const struct CoreOptionDefV1 *)arg;
+            for (size_t i = 0; defs && defs[i].key; ++i) {
+                const char *val = defs[i].default_value ? defs[i].default_value : defs[i].values[0].value;
+                store_option(defs[i].key, val);
+            }
+            return true;
+        }
+        case 67: case 68: {
+            const struct CoreOptionsV2 *opts = command == 68
+                ? (arg ? ((const struct CoreOptionsIntlV2 *)arg)->us : NULL)
+                : (const struct CoreOptionsV2 *)arg;
+            const struct CoreOptionDefV2 *defs = opts ? opts->definitions : NULL;
+            for (size_t i = 0; defs && defs[i].key; ++i) {
+                const char *val = defs[i].default_value ? defs[i].default_value : defs[i].values[0].value;
+                store_option(defs[i].key, val);
+            }
+            return true;
+        }
+        case 17: *(bool *)arg = false; return true;
+        case 31: *(const char **)arg = active->save; return true;
+        case 32: active->timing = ((const struct AVInfo *)arg)->timing; return true;
+        case 37: return true; /* SET_GEOMETRY */
+        case 39: *(unsigned *)arg = 12; return true;  /* GET_LANGUAGE: simplified Chinese */
+        case 47: *(unsigned *)arg = 1; return true;   /* GET_INPUT_MAX_USERS */
+        case 52: *(unsigned *)arg = 2; return true;   /* GET_CORE_OPTIONS_VERSION */
+        case 55: return true; /* SET_CORE_OPTIONS_DISPLAY */
+        case 59: *(unsigned *)arg = 0; return true;   /* GET_MESSAGE_INTERFACE_VERSION */
+        case 51: case (51 | 0x10000): return true;    /* GET_INPUT_BITMASKS */
+        default: return false;
+    }
+}
+
+static void video(const void *data, unsigned w, unsigned h, size_t pitch) {
+    if (!active || !data || data == (const void *)-1 || !w || !h || w > 4096 || h > 4096
+        || pitch < w * (active->format == 1 ? 4 : 2)) return;
+    if (w != (unsigned)active->width || h != (unsigned)active->height) {
+        void *buffer = realloc(active->pixels, (size_t)w * h * sizeof(uint32_t));
+        if (!buffer) return;
+        active->pixels = buffer;
+        active->width = w;
+        active->height = h;
+    }
+    for (unsigned y = 0; y < h; y++) {
+        const uint8_t *line = (const uint8_t *)data + y * pitch;
+        uint32_t *out = active->pixels + y * w;
+        if (active->format == 1) {
+            memcpy(out, line, 4 * w);
+            continue;
+        }
+        const uint16_t *src = (const uint16_t *)line;
+        for (unsigned x = 0; x < w; x++) {
+            unsigned p = src[x], r, g, b = (p & 31) * 255 / 31;
+            if (active->format == 2) { r = (p >> 11) * 255 / 31; g = ((p >> 5) & 63) * 255 / 63; }
+            else { r = ((p >> 10) & 31) * 255 / 31; g = ((p >> 5) & 31) * 255 / 31; }
+            out[x] = (r << 16) | (g << 8) | b;
+        }
+    }
+    ++active->sequence;
+}
+
+static size_t audio(const int16_t *data, size_t frames) {
+    if (!active || !data) return 0;
+    const size_t capacity = sizeof(active->audio) / (2 * sizeof(int16_t));
+    size_t count = capacity - active->audio_frames;
+    if (count > frames) count = frames;
+    memcpy(active->audio + active->audio_frames * 2, data, count * 2 * sizeof(int16_t));
+    active->audio_frames += count;
+    return frames;
+}
+static void sample(int16_t l, int16_t r) { const int16_t pair[] = {l, r}; audio(pair, 1); }
+static void input_poll(void) {}
+static int16_t input(unsigned port, unsigned device, unsigned index, unsigned id) {
+    if (!active || port) return 0;
+    unsigned base = device & 0xFF;
+    if (base == 5 && index < 2 && id < 2) return active->axes[index * 2 + id];
+    if (base == 6 && index == 0) {
+        if (id == 0) return active->pointer_x;
+        if (id == 1) return active->pointer_y;
+        if (id == 2) return active->pointer_pressed;
+    }
+    if (base != 1 || index) return 0;
+    if (id == 256) return (int16_t)active->buttons;
+    return id < 16 && ((active->buttons >> id) & 1);
+}
+
+const char *gc_retro_error(void) { return error; }
+
+GCRetro *gc_retro_open(const char *core, const char *rom, const char *system, const char *save) {
+    if (active) { snprintf(error, sizeof(error), "已有游戏正在运行"); return NULL; }
+    GCRetro *s = calloc(1, sizeof(*s));
+    if (!s) { snprintf(error, sizeof(error), "内存不足"); return NULL; }
+    snprintf(error, sizeof(error), "无法读取 ROM 或存档目录");
+    active = s;
+    s->rom_path = strdup(rom); s->system = strdup(system); s->save = strdup(save);
+    if (!s->rom_path || !s->system || !s->save || asprintf(&s->battery, "%s/battery.srm", save) < 0) goto fail;
+    s->handle = dlopen(core, RTLD_NOW | RTLD_LOCAL);
+    if (!s->handle) { snprintf(error, sizeof(error), "%s", dlerror()); goto fail; }
+
+    /* Validate the complete set of entry points before running untrusted ROM data. */
+    const char *symbols[] = {
+        "retro_init", "retro_deinit", "retro_run", "retro_get_system_info", "retro_get_system_av_info",
+        "retro_set_environment", "retro_set_video_refresh", "retro_set_audio_sample", "retro_set_audio_sample_batch",
+        "retro_set_input_poll", "retro_set_input_state", "retro_load_game", "retro_unload_game",
+        "retro_get_memory_data", "retro_get_memory_size", "retro_api_version", "retro_set_controller_port_device"
+    };
+    void *fn[sizeof(symbols) / sizeof(symbols[0])];
+    for (size_t i = 0; i < sizeof(fn) / sizeof(fn[0]); ++i) {
+        fn[i] = dlsym(s->handle, symbols[i]);
+        if (!fn[i]) { snprintf(error, sizeof(error), "核心缺少 %s", symbols[i]); goto fail; }
+    }
+    if (((unsigned (*)(void))fn[15])() != 1) { snprintf(error, sizeof(error), "核心 ABI 不兼容"); goto fail; }
+    s->deinit = fn[1]; s->run = fn[2]; s->unload = fn[12]; s->memory_data = fn[13]; s->memory_size = fn[14];
+    ((void (*)(bool (*)(unsigned, void *)))fn[5])(environment);
+    ((void (*)(void (*)(const void *, unsigned, unsigned, size_t)))fn[6])(video);
+    ((void (*)(void (*)(int16_t, int16_t)))fn[7])(sample);
+    ((void (*)(size_t (*)(const int16_t *, size_t)))fn[8])(audio);
+    ((void (*)(void (*)(void)))fn[9])(input_poll);
+    ((void (*)(int16_t (*)(unsigned, unsigned, unsigned, unsigned)))fn[10])(input);
+    ((void (*)(void))fn[0])();
+    s->initialized = true;
+    struct SystemInfo info = {0};
+    ((void (*)(struct SystemInfo *))fn[3])(&info);
+    struct GameInfo game = {.path = s->rom_path};
+    if (!info.full_path) {
+        FILE *file = fopen(rom, "rb");
+        if (!file) goto fail;
+        if (fseeko(file, 0, SEEK_END)) { fclose(file); goto fail; }
+        off_t length = ftello(file);
+        rewind(file);
+        if (length <= 0 || length > 512LL * 1024 * 1024) { fclose(file); goto fail; }
+        s->rom = malloc((size_t)length);
+        size_t read = s->rom ? fread(s->rom, 1, (size_t)length, file) : 0;
+        fclose(file);
+        if (read != (size_t)length) goto fail;
+        game.data = s->rom; game.size = read;
+    }
+    s->loaded = ((bool (*)(const struct GameInfo *))fn[11])(&game);
+    if (!s->loaded) {
+        snprintf(error, sizeof(error), "%s", s->hardware_requested
+            ? "该核心需要 Game Center 尚未接入的硬件渲染接口"
+            : "核心无法读取游戏，请检查 ROM 格式和 BIOS");
+        goto fail;
+    }
+    ((void (*)(unsigned, unsigned))fn[16])(0, strstr(core, "dolphin_libretro") ? 0x301 : 1);
+    struct AVInfo av = {0};
+    ((void (*)(struct AVInfo *))fn[4])(&av);
+    s->timing = av.timing;
+    void *memory = s->memory_data(0);
+    size_t size = s->memory_size(0);
+    FILE *file = memory && size ? fopen(s->battery, "rb") : NULL;
+    if (file) { fread(memory, 1, size, file); fclose(file); }
+    return s;
+fail:
+    if (s->battery) s->battery[0] = 0;
+    gc_retro_close(s);
+    return NULL;
+}
+
+double gc_retro_fps(GCRetro *s) { return s->timing.fps; }
+double gc_retro_sample_rate(GCRetro *s) { return s->timing.sample_rate; }
+void gc_retro_set_analog(GCRetro *s, int16_t lx, int16_t ly, int16_t rx, int16_t ry) {
+    s->axes[0] = lx; s->axes[1] = ly; s->axes[2] = rx; s->axes[3] = ry;
+}
+void gc_retro_set_pointer(GCRetro *s, int16_t x, int16_t y, bool pressed) {
+    s->pointer_x = x; s->pointer_y = y; s->pointer_pressed = pressed;
+}
+void gc_retro_run(GCRetro *s, uint16_t buttons) { s->buttons = buttons; s->run(); }
+const void *gc_retro_frame(GCRetro *s, int *w, int *h, uint64_t *sequence) {
+    *w = s->width; *h = s->height; *sequence = s->sequence; return s->pixels;
+}
+size_t gc_retro_audio(GCRetro *s, int16_t *output, size_t frames) {
+    if (frames > s->audio_frames) frames = s->audio_frames;
+    memcpy(output, s->audio, frames * 2 * sizeof(int16_t));
+    s->audio_frames -= frames;
+    memmove(s->audio, s->audio + frames * 2, s->audio_frames * 2 * sizeof(int16_t));
+    return frames;
+}
+void gc_retro_save(GCRetro *s) {
+    if (!s->loaded || !s->battery || !s->battery[0]) return;
+    size_t size = s->memory_size(0);
+    const void *memory = s->memory_data(0);
+    if (!size || !memory) return;
+    char *temporary;
+    if (asprintf(&temporary, "%s.tmp", s->battery) < 0) return;
+    FILE *file = fopen(temporary, "wb");
+    if (file) {
+        bool written = fwrite(memory, 1, size, file) == size;
+        if (!fclose(file) && written) rename(temporary, s->battery);
+        remove(temporary);
+    }
+    free(temporary);
+}
+void gc_retro_close(GCRetro *s) {
+    if (!s) return;
+    if (s->loaded) { gc_retro_save(s); s->unload(); }
+    if (s->initialized) s->deinit();
+    if (s->handle) dlclose(s->handle);
+    for (unsigned i = 0; i < s->option_count; ++i) { free(s->options[i].key); free(s->options[i].value); }
+    free(s->rom); free(s->rom_path); free(s->system); free(s->save); free(s->battery); free(s->pixels);
+    free(s); active = NULL;
+}

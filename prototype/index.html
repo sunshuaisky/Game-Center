@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#f5f2ed" />
+  <title>Game Center · 游戏库</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="window" aria-label="Game Center 游戏库原型">
+    <header class="titlebar">
+      <div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div>
+      <div class="window-title">游戏库</div>
+      <button class="icon-button title-action" id="importButton" aria-label="导入游戏" title="导入游戏">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14"/></svg>
+      </button>
+    </header>
+
+    <div class="app-body">
+      <aside class="sidebar">
+        <div class="side-group">
+          <p class="side-label">资料库</p>
+          <button class="nav-item active" data-filter="all"><span class="nav-icon grid-icon">▦</span><span>全部游戏</span><span class="count" id="allCount">13</span></button>
+          <button class="nav-item" data-filter="recent"><span class="nav-icon">◷</span><span>最近游玩</span></button>
+          <button class="nav-item" data-filter="favorites"><span class="nav-icon">♡</span><span>收藏</span></button>
+        </div>
+        <div class="side-group platform-group">
+          <p class="side-label">平台</p>
+          <button class="nav-item" data-filter="gba"><span class="platform-dot gba-dot"></span><span>Game Boy Advance</span><span class="count">4</span></button>
+          <button class="nav-item" data-filter="nds"><span class="platform-dot nds-dot"></span><span>Nintendo DS</span><span class="count">3</span></button>
+          <button class="nav-item" data-filter="mac"><span class="platform-dot mac-dot"></span><span>macOS</span><span class="count">6</span></button>
+        </div>
+        <div class="sidebar-bottom">
+          <div class="storage-icon">⌁</div>
+          <div><strong>你的游戏，集中在此</strong><p>导入游戏文件，整理个人收藏。</p></div>
+        </div>
+      </aside>
+
+      <section class="content">
+        <div class="toolbar">
+          <div class="breadcrumb"><span>资料库</span><span class="crumb-sep">/</span><strong id="currentSection">全部游戏</strong></div>
+          <div class="toolbar-actions">
+            <label class="search-box">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.5"/><path d="m16 16 4 4"/></svg>
+              <input id="searchInput" type="search" placeholder="搜索游戏" aria-label="搜索游戏" />
+              <kbd>⌘ F</kbd>
+            </label>
+            <span class="toolbar-divider"></span>
+            <button class="icon-button appearance-toggle" id="appearanceToggle" title="切换暗黑模式" aria-label="切换暗黑模式" aria-pressed="false"><span aria-hidden="true">◐</span></button>
+            <button class="icon-button view-toggle" id="viewToggle" title="切换视图" aria-label="切换视图"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg></button>
+          </div>
+        </div>
+
+        <div class="library-scroll">
+          <section class="welcome-row">
+            <div><p class="eyebrow">你的游戏时间</p><h1 id="greeting">再玩一局？</h1><p class="subhead">从最近玩过的游戏继续，或浏览你的收藏。</p></div>
+            <button class="primary-button" id="addGameButton"><span>＋</span> 添加游戏</button>
+          </section>
+
+          <section class="feature" id="feature">
+            <div class="feature-art art-hollowknight" aria-hidden="true">
+              <div class="art-orbit"></div><div class="knight-mark"><span></span></div><div class="art-glow"></div>
+              <span class="art-caption">HOLLOW KNIGHT</span>
+            </div>
+            <div class="feature-info">
+              <div class="feature-topline"><span class="pill mac-pill"><i></i> macOS</span><span class="last-played">上次游玩 · 昨天</span></div>
+              <h2>Hollow Knight</h2>
+              <p>在宁静而幽深的圣巢，继续你的探索旅程。</p>
+              <div class="feature-actions"><button class="play-button" id="playFeatured"><span class="play-triangle">▶</span>继续游戏</button><button class="text-button" id="featureDetails">游戏详情 <span>↗</span></button></div>
+            </div>
+            <button class="feature-favorite" aria-label="收藏 Hollow Knight" title="收藏">♡</button>
+          </section>
+
+          <section class="games-section">
+            <div class="section-heading"><div><h2 id="listHeading">所有游戏</h2><span id="resultCount">13 款游戏</span></div><button class="sort-button" id="sortButton">最近添加 <span>⌄</span></button></div>
+            <div class="game-grid" id="gameGrid"></div>
+            <div class="empty-state" id="emptyState" hidden><div class="empty-mark">⌕</div><h3>没有找到游戏</h3><p>试试其他关键词，或切换平台分类。</p><button class="text-button" id="clearSearch">清除搜索</button></div>
+          </section>
+          <footer class="library-footer"><span>游戏文件保存在你的 Mac 上</span><button id="manageLibrary">管理游戏资料夹 <span>↗</span></button></footer>
+        </div>
+      </section>
+    </div>
+    <input id="fileInput" type="file" accept=".gba,.nds,.app,application/x-macos-app" multiple hidden />
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <dialog class="detail-dialog" id="detailDialog">
+      <button class="dialog-close" id="closeDialog" aria-label="关闭">×</button>
+      <div class="dialog-art art-hollowknight"><div class="art-orbit"></div><div class="knight-mark"><span></span></div><div class="art-glow"></div></div>
+      <div class="dialog-content"><span class="pill mac-pill"><i></i> macOS</span><h2 id="detailTitle">Hollow Knight</h2><p>这是一张界面稿中的示例游戏卡片。导入你的游戏后，这里会显示游戏信息和启动方式。</p><button class="play-button" id="dialogPlay">继续游戏</button></div>
+    </dialog>
+  </main>
+  <script src="./app.js"></script>
+</body>
+</html>
