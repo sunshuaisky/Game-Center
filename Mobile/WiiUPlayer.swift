@@ -389,103 +389,210 @@ struct WiiUPlayer: View {
     @StateObject private var session = WiiUSession()
     @State private var importingKeys = false
     @State private var keysNotice: String?
+    @State private var showingPauseMenu = false
+    @State private var hasController = !GCController.controllers().isEmpty
+    @State private var showVirtualPad = GCController.controllers().isEmpty
+    @AppStorage("phone.player.padOpacity") private var padOpacity = 0.86
+    @AppStorage(TouchPadHaptics.defaultsKey) private var hapticsEnabled = true
     let rom: PhoneLibrary.ROM
     let library: PhoneLibrary
 
     var body: some View {
-        VStack(spacing: 10) {
-            HStack {
-                Button("返回", systemImage: "xmark") { session.close { dismiss() } }
-                    .foregroundStyle(.white)
-                    .disabled(session.stopping)
-                Spacer()
-                Text(rom.title).foregroundStyle(.white).lineLimit(1)
-                Spacer()
-                Button("导入 keys.txt") { importingKeys = true }
-                    .foregroundStyle(.white)
-                    .disabled(session.stopping)
-                Toggle("GamePad", isOn: Binding(get: { session.gamePad }, set: session.displayGamePad))
-                    .toggleStyle(.button)
-            }
-            if let error = session.error {
-                ContentUnavailableView {
-                    Label("无法启动", systemImage: "exclamationmark.circle")
-                } description: {
-                    Text(error)
-                } actions: {
-                    Button("导入 keys.txt") { importingKeys = true }
+        GeometryReader { size in
+            let wide = size.size.width > size.size.height
+            ZStack {
+                Color.black.ignoresSafeArea()
+
+                if let error = session.error {
+                    VStack(spacing: 16) {
+                        ContentUnavailableView {
+                            Label("无法启动", systemImage: "exclamationmark.circle")
+                        } description: {
+                            Text(error)
+                        } actions: {
+                            Button("导入 keys.txt") { importingKeys = true }
+                                .buttonStyle(.bordered)
+                        }
+                        .foregroundStyle(.white)
+                        Button("返回游戏库") { session.close { dismiss() } }
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color(white: 0.06))
+                            .padding(.horizontal, 22)
+                            .frame(height: 42)
+                            .background(Color(white: 0.94), in: Capsule())
+                            .buttonStyle(.plain)
+                    }
+                    .padding(24)
+                } else if wide {
+                    ZStack {
+                        wiiUSurfaceView
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .ignoresSafeArea(edges: showVirtualPad ? [] : .all)
+
+                        if showVirtualPad {
+                            HStack {
+                                leftWiiUControls
+                                Spacer()
+                                rightWiiUControls
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 12)
+                            .opacity(padOpacity)
+                            .transition(.opacity)
+                        }
+                    }
+                    .overlay(alignment: .top) {
+                        PlayerFloatingPill(title: rom.title, hasController: hasController) {
+                            openPauseMenu()
+                        }
+                        .padding(.top, 10)
+                    }
+                } else {
+                    VStack(spacing: 0) {
+                        HStack {
+                            Spacer()
+                            PlayerFloatingPill(title: rom.title, hasController: hasController) {
+                                openPauseMenu()
+                            }
+                            Spacer()
+                        }
+                        .padding(.top, 6)
+                        .padding(.bottom, 8)
+
+                        wiiUSurfaceView
+                            .padding(.horizontal, 10)
+                            .padding(.bottom, 10)
+
+                        if showVirtualPad {
+                            VStack(spacing: 12) {
+                                HStack {
+                                    HStack(spacing: 6) { padButton("L", 5); padButton("ZL", 7) }
+                                    Spacer()
+                                    HStack(spacing: 6) { padButton("ZR", 8); padButton("R", 6) }
+                                }
+                                HStack {
+                                    TouchDPad { state in
+                                        session.setTouchButton(11, pressed: state.up)
+                                        session.setTouchButton(12, pressed: state.down)
+                                        session.setTouchButton(13, pressed: state.left)
+                                        session.setTouchButton(14, pressed: state.right)
+                                    }
+                                    .frame(width: 124, height: 124)
+                                    Spacer()
+                                    TouchDiamondPad(labels: .init(top: "X", left: "Y", right: "A", bottom: "B")) { state in
+                                        session.setTouchButton(3, pressed: state.top)
+                                        session.setTouchButton(4, pressed: state.left)
+                                        session.setTouchButton(1, pressed: state.right)
+                                        session.setTouchButton(2, pressed: state.bottom)
+                                    }
+                                    .frame(width: 124, height: 124)
+                                }
+                                HStack {
+                                    TouchAnalogStick(invertY: true) { x, y in
+                                        session.setTouchStick(0, x: x, y: y)
+                                    }
+                                    .frame(width: 74, height: 74)
+                                    Spacer()
+                                    HStack(spacing: 12) { padButton("−", 10); padButton("+", 9) }
+                                    Spacer()
+                                    TouchAnalogStick(invertY: true) { x, y in
+                                        session.setTouchStick(1, x: x, y: y)
+                                    }
+                                    .frame(width: 74, height: 74)
+                                }
+                            }
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 14)
+                            .background(Color.white.opacity(0.03))
+                            .overlay(alignment: .top) {
+                                Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+                            }
+                            .opacity(padOpacity)
+                            .transition(.opacity)
+                        } else {
+                            VStack(spacing: 6) {
+                                Image(systemName: "gamecontroller.fill")
+                                    .font(.system(size: 20))
+                                    .foregroundStyle(.white.opacity(0.45))
+                                Text(hasController ? "已连接实体手柄 · 虚拟按键已自动隐藏" : "虚拟按键已隐藏")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.6))
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 36)
+                        }
+                    }
                 }
-                .foregroundStyle(.white)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                HStack(spacing: 12) {
+
+                if session.starting || session.stopping {
                     VStack(spacing: 10) {
-                        HStack(spacing: 6) {
-                            padButton("L", 5)
-                            padButton("ZL", 7)
-                        }
-                        TouchDPad { state in
-                            session.setTouchButton(11, pressed: state.up)
-                            session.setTouchButton(12, pressed: state.down)
-                            session.setTouchButton(13, pressed: state.left)
-                            session.setTouchButton(14, pressed: state.right)
-                        }
-                        .frame(width: 126, height: 126)
-                        TouchAnalogStick(invertY: true) { x, y in
-                            session.setTouchStick(0, x: x, y: y)
-                        }
-                        .frame(width: 78, height: 78)
-                        padButton("−", 10)
+                        ProgressView().controlSize(.large).tint(.white)
+                        Text(session.stopping ? "正在保存并退出…" : "正在载入 Wii U 游戏…")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.9))
                     }
-                    if let core = session.core {
-                        WiiUSurface(core: core)
-                            .aspectRatio(16 / 9, contentMode: .fit)
-                            .gesture(DragGesture(minimumDistance: 0).onChanged { value in
-                                let size = core.view.bounds.size
-                                guard session.gamePad, size.width > 0, size.height > 0 else { return }
-                                let scale = max(1.0, Double(core.view.contentScaleFactor))
-                                let x = min(size.width, max(0, value.location.x)) * scale
-                                let y = min(size.height, max(0, value.location.y)) * scale
-                                core.touch(x, y, true)
-                            }.onEnded { _ in core.touch(0, 0, false) })
-                    } else {
-                        Color.black.aspectRatio(16 / 9, contentMode: .fit)
-                    }
-                    VStack(spacing: 10) {
-                        HStack(spacing: 6) {
-                            padButton("ZR", 8)
-                            padButton("R", 6)
-                        }
-                        TouchDiamondPad(labels: .init(top: "X", left: "Y", right: "A", bottom: "B")) { state in
-                            session.setTouchButton(3, pressed: state.top)
-                            session.setTouchButton(4, pressed: state.left)
-                            session.setTouchButton(1, pressed: state.right)
-                            session.setTouchButton(2, pressed: state.bottom)
-                        }
-                        .frame(width: 126, height: 126)
-                        TouchAnalogStick(invertY: true) { x, y in
-                            session.setTouchStick(1, x: x, y: y)
-                        }
-                        .frame(width: 78, height: 78)
-                        padButton("+", 9)
-                    }
+                    .padding(22)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 1))
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay {
-                    if session.starting || session.stopping {
-                        ProgressView(session.stopping ? "正在退出" : "正在载入 Wii U 游戏")
+
+                if showingPauseMenu && !session.starting {
+                    PlayerPauseOverlay(
+                        title: rom.title,
+                        subtitle: "Wii U · Cemu",
+                        hasController: hasController,
+                        showVirtualPad: $showVirtualPad,
+                        padOpacity: $padOpacity,
+                        hapticsEnabled: $hapticsEnabled,
+                        isExiting: session.stopping,
+                        onResume: { closePauseMenu() },
+                        onExit: {
+                            showingPauseMenu = false
+                            session.close { dismiss() }
+                        }
+                    ) {
+                        Divider().overlay(Color.white.opacity(0.08))
+                        Toggle("显示 GamePad 副屏", isOn: Binding(get: { session.gamePad }, set: session.displayGamePad))
+                            .font(.system(size: 13, weight: .medium))
                             .tint(.white)
-                            .foregroundStyle(.white)
+                        Button {
+                            importingKeys = true
+                        } label: {
+                            HStack {
+                                Label("导入 Wii U keys.txt…", systemImage: "key")
+                                    .font(.system(size: 12, weight: .medium))
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.45))
+                            }
+                            .foregroundStyle(.white.opacity(0.88))
+                            .padding(.vertical, 4)
+                        }
+                        .buttonStyle(.plain)
                     }
+                    .transition(.opacity)
                 }
             }
+            .animation(.easeOut(duration: 0.18), value: showVirtualPad)
+            .animation(.easeOut(duration: 0.16), value: showingPauseMenu)
         }
-        .padding(12)
-        .background(Color.black.ignoresSafeArea())
-        .task { session.start(rom: rom, library: library) }
+        .statusBarHidden(true)
+        .task {
+            syncControllerState()
+            session.start(rom: rom, library: library)
+        }
         .interactiveDismissDisabled()
+        .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidConnect)) { _ in
+            syncControllerState()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidDisconnect)) { _ in
+            syncControllerState()
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in session.setPaused(true) }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in session.setPaused(false) }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            if !showingPauseMenu { session.setPaused(false) }
+        }
         .onDisappear { session.close {} }
         .fileImporter(isPresented: $importingKeys, allowedContentTypes: [.plainText, .data]) { result in
             do {
@@ -508,10 +615,93 @@ struct WiiUPlayer: View {
         }
     }
 
+    @ViewBuilder
+    private var wiiUSurfaceView: some View {
+        if let core = session.core {
+            WiiUSurface(core: core)
+                .aspectRatio(16 / 9, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+                    let size = core.view.bounds.size
+                    guard session.gamePad, size.width > 0, size.height > 0 else { return }
+                    let scale = max(1.0, Double(core.view.contentScaleFactor))
+                    let x = min(size.width, max(0, value.location.x)) * scale
+                    let y = min(size.height, max(0, value.location.y)) * scale
+                    core.touch(x, y, true)
+                }.onEnded { _ in core.touch(0, 0, false) })
+        } else {
+            Color.black.aspectRatio(16 / 9, contentMode: .fit)
+        }
+    }
+
+    private var leftWiiUControls: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 6) {
+                padButton("L", 5)
+                padButton("ZL", 7)
+            }
+            Spacer(minLength: 0)
+            TouchDPad { state in
+                session.setTouchButton(11, pressed: state.up)
+                session.setTouchButton(12, pressed: state.down)
+                session.setTouchButton(13, pressed: state.left)
+                session.setTouchButton(14, pressed: state.right)
+            }
+            .frame(width: 118, height: 118)
+            TouchAnalogStick(invertY: true) { x, y in
+                session.setTouchStick(0, x: x, y: y)
+            }
+            .frame(width: 72, height: 72)
+            Spacer(minLength: 0)
+            padButton("−", 10)
+        }
+    }
+
+    private var rightWiiUControls: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 6) {
+                padButton("ZR", 8)
+                padButton("R", 6)
+            }
+            Spacer(minLength: 0)
+            TouchDiamondPad(labels: .init(top: "X", left: "Y", right: "A", bottom: "B")) { state in
+                session.setTouchButton(3, pressed: state.top)
+                session.setTouchButton(4, pressed: state.left)
+                session.setTouchButton(1, pressed: state.right)
+                session.setTouchButton(2, pressed: state.bottom)
+            }
+            .frame(width: 118, height: 118)
+            TouchAnalogStick(invertY: true) { x, y in
+                session.setTouchStick(1, x: x, y: y)
+            }
+            .frame(width: 72, height: 72)
+            Spacer(minLength: 0)
+            padButton("+", 9)
+        }
+    }
+
+    private func openPauseMenu() {
+        session.setPaused(true)
+        showingPauseMenu = true
+    }
+
+    private func closePauseMenu() {
+        showingPauseMenu = false
+        session.setPaused(false)
+    }
+
+    private func syncControllerState() {
+        let connected = !GCController.controllers().isEmpty
+        if connected != hasController {
+            hasController = connected
+            showVirtualPad = !connected
+        }
+    }
+
     private func padButton(_ title: String, _ id: Int32) -> some View {
         TouchPadButton(title: title) { pressed in
             session.setTouchButton(id, pressed: pressed)
         }
-        .frame(width: 58, height: 36)
+        .frame(width: 56, height: 34)
     }
 }

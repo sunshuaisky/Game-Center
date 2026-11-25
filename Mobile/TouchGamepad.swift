@@ -123,6 +123,7 @@ final class PadButtonUIView: UIView {
     private func setPressed(_ pressed: Bool) {
         guard isPressedState != pressed else { return }
         isPressedState = pressed
+        if pressed { TouchPadHaptics.tap() }
         backgroundColor = UIColor.white.withAlphaComponent(pressed ? 0.36 : 0.14)
         transform = pressed ? CGAffineTransform(scaleX: 0.94, y: 0.94) : .identity
         onChange?(pressed)
@@ -229,6 +230,9 @@ final class TouchDPadUIView: UIView {
             if angle <= -22.5 && angle >= -157.5 { next.up = true }
         }
         if next != current {
+            let pressedAnyNew = (next.up && !current.up) || (next.down && !current.down)
+                || (next.left && !current.left) || (next.right && !current.right)
+            if pressedAnyNew { TouchPadHaptics.tap() }
             current = next
             updateHighlights()
             onChange?(next)
@@ -378,6 +382,9 @@ final class TouchDiamondPadUIView: UIView {
             }
         }
         if next != current {
+            let pressedAnyNew = (next.top && !current.top) || (next.left && !current.left)
+                || (next.right && !current.right) || (next.bottom && !current.bottom)
+            if pressedAnyNew { TouchPadHaptics.tap() }
             current = next
             updateHighlights()
             onChange?(next)
@@ -526,5 +533,191 @@ struct TouchAnalogStick: UIViewRepresentable {
     func updateUIView(_ uiView: TouchAnalogStickUIView, context: Context) {
         uiView.invertY = invertY
         uiView.onChange = onChange
+    }
+}
+
+// MARK: - Shared Haptics & Player HUD Components
+
+@MainActor
+enum TouchPadHaptics {
+    static let defaultsKey = "phone.player.haptics"
+    private static let generator = UIImpactFeedbackGenerator(style: .light)
+
+    static var isEnabled: Bool {
+        if UserDefaults.standard.object(forKey: defaultsKey) == nil { return true }
+        return UserDefaults.standard.bool(forKey: defaultsKey)
+    }
+
+    static func tap() {
+        guard isEnabled else { return }
+        generator.impactOccurred(intensity: 0.65)
+    }
+}
+
+struct PlayerFloatingPill: View {
+    let title: String
+    let hasController: Bool
+    let onPause: () -> Void
+
+    var body: some View {
+        Button(action: onPause) {
+            HStack(spacing: 7) {
+                Image(systemName: "pause.fill")
+                    .font(.system(size: 10, weight: .bold))
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                if hasController {
+                    Text("·")
+                        .foregroundStyle(.white.opacity(0.45))
+                    Image(systemName: "gamecontroller.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color(red: 0.28, green: 0.84, blue: 0.50))
+                }
+            }
+            .foregroundStyle(.white.opacity(0.92))
+            .padding(.horizontal, 14)
+            .frame(height: 30)
+            .background(.ultraThinMaterial, in: Capsule())
+            .background(Color.black.opacity(0.42), in: Capsule())
+            .overlay(Capsule().stroke(Color.white.opacity(0.16), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("暂停与菜单")
+    }
+}
+
+struct PlayerPauseOverlay<ExtraContent: View>: View {
+    let title: String
+    let subtitle: String
+    let hasController: Bool
+    @Binding var showVirtualPad: Bool
+    @Binding var padOpacity: Double
+    @Binding var hapticsEnabled: Bool
+    let isExiting: Bool
+    let onResume: () -> Void
+    let onExit: () -> Void
+    @ViewBuilder let extraContent: () -> ExtraContent
+
+    init(
+        title: String,
+        subtitle: String = "进度已自动保存",
+        hasController: Bool,
+        showVirtualPad: Binding<Bool>,
+        padOpacity: Binding<Double>,
+        hapticsEnabled: Binding<Bool>,
+        isExiting: Bool = false,
+        onResume: @escaping () -> Void,
+        onExit: @escaping () -> Void,
+        @ViewBuilder extraContent: @escaping () -> ExtraContent = { EmptyView() }
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.hasController = hasController
+        self._showVirtualPad = showVirtualPad
+        self._padOpacity = padOpacity
+        self._hapticsEnabled = hapticsEnabled
+        self.isExiting = isExiting
+        self.onResume = onResume
+        self.onExit = onExit
+        self.extraContent = extraContent
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.62)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    if !isExiting { onResume() }
+                }
+
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(title)
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                        Text(hasController ? "\(subtitle) · 已连接实体手柄" : subtitle)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white.opacity(0.55))
+                    }
+                    Spacer()
+                    Button(action: onResume) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.8))
+                            .frame(width: 30, height: 30)
+                            .background(Color.white.opacity(0.10), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isExiting)
+                }
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Toggle("显示虚拟按键", isOn: $showVirtualPad)
+                        .font(.system(size: 13, weight: .medium))
+                        .tint(.white)
+
+                    if showVirtualPad {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("按键透明度")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.white.opacity(0.68))
+                                Spacer()
+                                Text("\(Int(padOpacity * 100))%")
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundStyle(.white.opacity(0.8))
+                            }
+                            Slider(value: $padOpacity, in: 0.25...1.0)
+                                .tint(.white)
+                        }
+                    }
+
+                    Toggle("按键震动反馈", isOn: $hapticsEnabled)
+                        .font(.system(size: 13, weight: .medium))
+                        .tint(.white)
+
+                    extraContent()
+                }
+                .padding(14)
+                .background(Color.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.white.opacity(0.09), lineWidth: 1))
+
+                VStack(spacing: 9) {
+                    Button(action: onResume) {
+                        Text("继续游戏")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color(white: 0.06))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 44)
+                            .background(Color(white: 0.94), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isExiting)
+
+                    Button(action: onExit) {
+                        Text(isExiting ? "正在保存并退出…" : "保存并退出游戏")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color(red: 1.0, green: 0.52, blue: 0.56))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 42)
+                            .background(Color.red.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.red.opacity(0.28), lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isExiting)
+                }
+            }
+            .padding(20)
+            .frame(maxWidth: 350)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .background(Color(white: 0.09).opacity(0.75), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 1))
+            .shadow(color: .black.opacity(0.6), radius: 30, y: 12)
+            .padding(20)
+        }
+        .preferredColorScheme(.dark)
     }
 }
