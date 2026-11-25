@@ -208,19 +208,25 @@ struct AppleSigningSettings: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            HStack(spacing: 14) {
+            HStack(alignment: .top, spacing: 14) {
                 Image(systemName: "person.badge.key.fill")
-                    .font(.system(size: 24, weight: .medium))
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(.tint)
-                    .frame(width: 48, height: 48)
-                    .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 13))
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .frame(width: 44, height: 44)
+                    .background(GameCenterColors.surfaceElevated, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(GameCenterColors.border, lineWidth: 1))
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Apple ID 与 iOS 签名").font(.system(size: 21, weight: .semibold))
+                    Text("Apple ID 与 iOS 签名").font(.system(size: 18, weight: .semibold))
                     Text("签署基础 IPA、S2Arm 和 NXNative 游戏包")
-                        .font(.callout).foregroundStyle(.secondary)
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
                 }
+                Spacer(minLength: 8)
+                SheetCloseButton {
+                    login.cancel()
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
             }
 
             VStack(alignment: .leading, spacing: 0) {
@@ -234,7 +240,7 @@ struct AppleSigningSettings: View {
                         }
                     }
                     .padding(14)
-                    Divider()
+                    Divider().opacity(0.4)
                     Toggle("使用此账号签名", isOn: $enabled)
                         .toggleStyle(.switch).disabled(login.busy).padding(14)
                 } else if login.needsCode {
@@ -251,7 +257,7 @@ struct AppleSigningSettings: View {
                             .textContentType(.username).focused($focus, equals: .email)
                             .onSubmit { focus = .password }
                     }
-                    Divider().padding(.leading, 42)
+                    Divider().opacity(0.4).padding(.leading, 42)
                     fieldRow("密码", icon: "lock") {
                         SecureField("Apple ID 密码", text: $password)
                             .textContentType(.password).focused($focus, equals: .password)
@@ -260,26 +266,27 @@ struct AppleSigningSettings: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.background.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
-            .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(.primary.opacity(0.12)) }
+            .background(GameCenterColors.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(GameCenterColors.border) }
 
             if !login.message.isEmpty {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     if login.busy && !login.needsCode { ProgressView().controlSize(.mini) }
                     Text(login.message).textSelection(.enabled)
                 }
-                .font(.callout)
+                .font(.system(size: 12))
             } else if login.current == nil {
                 Label("登录会话和签名密钥保存在这台 Mac 上。", systemImage: "lock.fill")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
             }
 
-            Divider()
+            Divider().opacity(0.4)
             HStack(spacing: 10) {
                 if let account = login.current {
                     Button("退出账号", role: .destructive) {
                         login.start(email: account.email, password: "", logout: true)
                     }
+                    .buttonStyle(TactileActionButtonStyle(appearance: .destructive, minHeight: 36, fontSize: 12))
                     .disabled(login.busy)
                     Spacer()
                 }
@@ -287,24 +294,33 @@ struct AppleSigningSettings: View {
                     login.cancel()
                     dismiss()
                 }
-                .keyboardShortcut(.cancelAction)
+                .buttonStyle(TactileActionButtonStyle(appearance: login.current == nil ? .secondary : .primary, minHeight: 36, fontSize: 12))
                 if login.current == nil {
                     Spacer()
                     if login.needsCode {
                         Button("验证并继续") { login.verify(code); code = "" }
+                            .buttonStyle(TactileActionButtonStyle(appearance: .primary, minHeight: 36, fontSize: 12))
                             .disabled(code.range(of: "^[0-9]{6}$", options: .regularExpression) == nil)
-                            .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                            .keyboardShortcut(.defaultAction)
                     } else {
                         Button("登录并启用签名", action: signIn)
+                            .buttonStyle(TactileActionButtonStyle(appearance: .primary, minHeight: 36, fontSize: 12))
                             .disabled(!canSignIn)
-                            .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                            .keyboardShortcut(.defaultAction)
                     }
                 }
             }
-            .controlSize(.large)
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: 450)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .preferredColorScheme(.dark)
+        .overlay {
+            OutsideClickDismissMonitor {
+                if !login.busy { dismiss() }
+            }
+            .allowsHitTesting(false)
+        }
         .onAppear { if login.current == nil { focus = .email } }
         .onChange(of: login.needsCode) { if login.needsCode { focus = .code } }
         .onDisappear { login.cancel(); password = ""; code = "" }

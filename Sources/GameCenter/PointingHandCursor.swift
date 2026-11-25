@@ -9,10 +9,13 @@ extension View {
 
 struct PlainHandButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .opacity(isEnabled ? 1 : 0.45)
+            .opacity(isEnabled ? (configuration.isPressed ? 0.78 : 1) : 0.45)
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.975 : 1)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: configuration.isPressed)
             .pointingHandCursor()
     }
 }

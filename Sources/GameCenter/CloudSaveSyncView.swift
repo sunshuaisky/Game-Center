@@ -35,13 +35,16 @@ struct CloudSaveSyncView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("同步存档").font(.headline)
+                Text("同步存档").font(.system(size: 15, weight: .semibold))
                 Spacer()
                 Button { dismiss() } label: {
-                    Image(systemName: "xmark").font(.system(size: 12, weight: .semibold))
-                        .frame(width: 36, height: 36).background(.white.opacity(0.07), in: Circle()).frame(width: 44, height: 44)
-                }.buttonStyle(SyncActionStyle()).accessibilityLabel("关闭")
-            }.padding(24)
+                    Image(systemName: "xmark").font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .frame(width: 28, height: 28).background(.white.opacity(0.08), in: Circle())
+                        .frame(width: 36, height: 36)
+                }.buttonStyle(SyncActionStyle()).keyboardShortcut(.cancelAction).accessibilityLabel("关闭")
+            }.padding(.horizontal, 22).padding(.vertical, 14)
+            Divider().opacity(0.25)
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     HStack(alignment: .top, spacing: 16) {
@@ -246,8 +249,11 @@ private struct SyncActionStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .contentShape(Rectangle())
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1)
+            .opacity(configuration.isPressed ? 0.84 : 1)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: configuration.isPressed)
             #if os(macOS)
-            .onHover { hovering in if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
+            .pointingHandCursor()
             #endif
     }
 }

@@ -18,8 +18,8 @@ struct SwitchCheatManagerView: View {
     @State private var errorMessage: String?
     @State private var controllerSelection = 0
 
-    private var modalWidth: CGFloat { min(590, max(420, availableSize.width - 32)) }
-    private var modalHeight: CGFloat { min(520, max(360, availableSize.height - 32)) }
+    private var modalWidth: CGFloat { min(590, max(440, availableSize.width - 32)) }
+    private var modalHeight: CGFloat { min(540, max(380, availableSize.height - 32)) }
 
     private var buildGroups: [CheatBuildGroup] {
         let grouped = Dictionary(grouping: catalog?.items ?? [], by: \.buildID)
@@ -34,24 +34,25 @@ struct SwitchCheatManagerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .center, spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text("金手指")
-                        .font(.system(size: 18, weight: .semibold))
+                        .font(.system(size: 16, weight: .semibold))
                     Text(title)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 Spacer()
                 Button("打开文件夹…", systemImage: "folder", action: { SwitchCheatService.openFolder(directory) })
-                    .buttonStyle(CheatActionButtonStyle(isControllerFocused: controllerSelection == 0))
+                    .buttonStyle(TactileActionButtonStyle(appearance: .secondary, cornerRadius: 8, minHeight: 32, horizontalPadding: 11, fontSize: 12, isControllerFocused: controllerSelection == 0))
+                SheetCloseButton { dismiss() }
+                    .keyboardShortcut(.cancelAction)
             }
-            .padding(.horizontal, 22)
-            .padding(.top, 20)
-            .padding(.bottom, 14)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 15)
 
-            Divider().overlay(.white.opacity(0.06))
+            Divider().overlay(GameCenterColors.border)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
@@ -60,18 +61,20 @@ struct SwitchCheatManagerView: View {
                             .font(.system(size: 13))
                             .foregroundStyle(.secondary)
                         Text("文件按游戏 ID 和 Build ID 匹配。运行时只会读取版本完全匹配的金手指；新文件默认关闭。开关在下次启动或引擎重新加载后生效。")
-                            .font(.system(size: 11))
+                            .font(.system(size: 12))
                             .foregroundStyle(.secondary)
+                            .lineSpacing(3)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    .padding(.horizontal, 13)
+                    .padding(.horizontal, 14)
                     .padding(.vertical, 11)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
+                    .background(GameCenterColors.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(GameCenterColors.border, lineWidth: 1))
 
                     if let errorMessage {
                         Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                            .font(.system(size: 11))
+                            .font(.system(size: 12))
                             .foregroundStyle(.orange)
                             .fixedSize(horizontal: false, vertical: true)
                     } else if buildGroups.isEmpty {
@@ -83,33 +86,33 @@ struct SwitchCheatManagerView: View {
                             VStack(alignment: .leading, spacing: 0) {
                                 HStack(spacing: 8) {
                                     Image(systemName: "number")
-                                        .font(.system(size: 10, weight: .semibold))
+                                        .font(.system(size: 11, weight: .semibold))
                                         .foregroundStyle(.secondary)
                                     Text(buildID)
-                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
                                     Text("· \(items.filter { !$0.isMaster }.count) 条")
-                                        .font(.system(size: 10))
+                                        .font(.system(size: 11))
                                         .foregroundStyle(.secondary)
                                 }
-                                .padding(.horizontal, 13)
+                                .padding(.horizontal, 14)
                                 .padding(.vertical, 10)
 
                                 ForEach(items) { item in
                                     HStack(spacing: 11) {
                                         if item.isMaster {
                                             Image(systemName: "lock.fill")
-                                                .font(.system(size: 10))
+                                                .font(.system(size: 11))
                                                 .foregroundStyle(.secondary)
                                                 .frame(width: 16)
                                             Text(item.name)
-                                                .font(.system(size: 12, weight: .medium))
+                                                .font(.system(size: 13, weight: .medium))
                                             Spacer()
                                             Text("随启用条目运行")
-                                                .font(.system(size: 10))
+                                                .font(.system(size: 11))
                                                 .foregroundStyle(.secondary)
                                         } else {
                                             Text(item.name)
-                                                .font(.system(size: 12, weight: .medium))
+                                                .font(.system(size: 13, weight: .medium))
                                                 .lineLimit(1)
                                             Spacer(minLength: 8)
                                             Toggle("", isOn: Binding(
@@ -118,30 +121,30 @@ struct SwitchCheatManagerView: View {
                                             ))
                                             .labelsHidden()
                                             .toggleStyle(.switch)
-                                            .controlSize(.mini)
+                                            .controlSize(.small)
                                         }
                                     }
-                                    .padding(.horizontal, 13)
-                                    .frame(height: 40)
+                                    .padding(.horizontal, 14)
+                                    .frame(height: 42)
                                     .background {
                                         if !item.isMaster,
                                            toggleItems.firstIndex(where: { $0.id == item.id }).map({ controllerSelection == $0 + 1 }) == true {
-                                            RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.16))
+                                            RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.white.opacity(0.16))
                                         }
                                     }
                                     if item.id != items.last?.id {
-                                        Divider().overlay(.white.opacity(0.045)).padding(.leading, 40)
+                                        Divider().overlay(.white.opacity(0.05)).padding(.leading, 40)
                                     }
                                 }
                             }
-                            .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
-                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.07), lineWidth: 1))
+                            .background(GameCenterColors.surface, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(GameCenterColors.border, lineWidth: 1))
                         }
                     }
 
                     if let catalog, !catalog.unsupportedFiles.isEmpty {
                         Text("未识别的文件：\(catalog.unsupportedFiles.joined(separator: "、"))。请使用 16 位 Build ID 命名的 Atmosphère .txt 文件。")
-                            .font(.system(size: 10))
+                            .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -151,18 +154,19 @@ struct SwitchCheatManagerView: View {
 
             HStack {
                 Text("\(directory.path)")
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer()
                 Button("完成") { dismiss() }
-                    .buttonStyle(CheatActionButtonStyle(appearance: .primary, isControllerFocused: controllerSelection == controllerActionCount - 1))
+                    .buttonStyle(TactileActionButtonStyle(appearance: .primary, cornerRadius: 9, minHeight: 34, horizontalPadding: 16, fontSize: 12, isControllerFocused: controllerSelection == controllerActionCount - 1))
                     .keyboardShortcut(.defaultAction)
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 13)
-            .overlay(alignment: .top) { Divider().overlay(.white.opacity(0.06)) }
+            .background(Color.black.opacity(0.24))
+            .overlay(alignment: .top) { Divider().overlay(GameCenterColors.border) }
         }
         .frame(width: modalWidth, height: modalHeight)
         .background(Color(nsColor: .windowBackgroundColor))
@@ -186,21 +190,21 @@ struct SwitchCheatManagerView: View {
     private var emptyState: some View {
         VStack(spacing: 10) {
             Image(systemName: "curlybraces")
-                .font(.system(size: 24, weight: .light))
+                .font(.system(size: 26, weight: .light))
                 .foregroundStyle(.secondary)
             Text("还没有金手指文件")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
             Text("将 Atmosphère 格式的 .txt 放入上方文件夹，文件名使用 16 位 Build ID。")
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 360)
             Button("打开金手指文件夹…", systemImage: "folder", action: { SwitchCheatService.openFolder(directory) })
-                .buttonStyle(CheatActionButtonStyle())
-                .padding(.top, 3)
+                .buttonStyle(TactileActionButtonStyle(appearance: .secondary, cornerRadius: 9, minHeight: 34, horizontalPadding: 14, fontSize: 12))
+                .padding(.top, 4)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 30)
+        .padding(.vertical, 32)
     }
 
     private func refresh() {
@@ -230,23 +234,5 @@ struct SwitchCheatManagerView: View {
             let item = toggleItems[controllerSelection - 1]
             update(item, enabled: !item.isEnabled)
         }
-    }
-}
-
-private struct CheatActionButtonStyle: ButtonStyle {
-    enum Appearance { case secondary, primary }
-    var appearance: Appearance = .secondary
-    var isControllerFocused = false
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 11, weight: .medium))
-            .foregroundStyle(appearance == .primary ? Color.black : Color.primary)
-            .padding(.horizontal, 12)
-            .frame(height: 34)
-            .background(appearance == .primary ? GameCenterColors.action : Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(appearance == .primary ? 0.18 : 0.12), lineWidth: 1))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white, lineWidth: isControllerFocused ? 2 : 0))
-            .pointingHandCursor()
     }
 }

@@ -297,7 +297,7 @@ struct SwitchBuildView: View {
         return dlcURLs.count > 2 ? "\(names) 等 \(dlcURLs.count) 个文件" : names
     }
 
-    private var actionColor: Color { BuildPalette.cream }
+    private var actionColor: Color { GameCenterColors.action }
     private var buildCanStart: Bool {
         guard sourceURL != nil, !targets.isEmpty, !session.isBuilding else { return false }
         if targets.contains(.iOS), method == .s2arm, s2ArmOptimizeDevice,
@@ -307,18 +307,65 @@ struct SwitchBuildView: View {
         return true
     }
 
+    private var footerHintText: String {
+        if showingProgress && session.isBuilding {
+            return "返回游戏库后，构建会在后台继续，顶栏与游戏卡片会实时显示进度"
+        }
+        if !showingProgress && !buildCanStart {
+            if sourceURL == nil { return "请先选择游戏本体文件或原始游戏文件夹" }
+            if !isSwitch2 && keysURL == nil { return "请先选择主机密钥 prod.keys" }
+            if targets.isEmpty { return "请至少选择一个目标平台" }
+            if targets.contains(.iOS), method == .s2arm, s2ArmOptimizeDevice, selectedDevice == nil {
+                return "请在 iOS 构建选项中选择目标机型"
+            }
+            if isCheckingDependencies { return "正在检测构建环境依赖…" }
+            if installingDependencyID != nil { return "正在安装构建依赖，完成后即可开始出包" }
+            if dependencies.contains(where: { !$0.isReady }) { return "请先安装上方缺少的设备依赖后开始出包" }
+        }
+        return "大游戏首次出包可能需要几十分钟，请接通电源并保持 Mac 唤醒"
+    }
+
+    private var extrasSummaryBadge: String {
+        let updateLabel = updateURL == nil ? "无更新" : "1 个更新"
+        let dlcLabel = dlcURLs.isEmpty ? "无 DLC" : "\(dlcURLs.count) 个 DLC"
+        return "\(updateLabel) · \(dlcLabel)"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: showingProgress ? 34 : 22) {
-                    HStack(spacing: 24) {
+                VStack(alignment: .leading, spacing: showingProgress ? 26 : 24) {
+                    HStack(spacing: 20) {
                         GameArtwork(game: game, compact: true)
-                            .frame(width: 236, height: 236 / 1.8)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                        VStack(alignment: .leading, spacing: 8) {
+                            .frame(width: 164, height: 92)
+                            .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(.white.opacity(0.12), lineWidth: 1))
+                        VStack(alignment: .leading, spacing: 6) {
+                            if showingProgress {
+                                HStack(spacing: 7) {
+                                    Circle().fill(statusColor).frame(width: 8, height: 8)
+                                    Text(session.isBuilding ? (session.isStopping ? "正在停止" : "构建中") : session.progress.stage)
+                                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(statusColor)
+                                    if session.isBuilding {
+                                        Text("· 第 \((session.targets.firstIndex(of: session.target) ?? 0) + 1) / \(session.targets.count) 个平台：\(session.target.title)")
+                                            .font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                                    }
+                                }
+                            } else {
+                                Text("NINTENDO SWITCH · 构建配置")
+                                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                                    .tracking(1.1)
+                                    .foregroundStyle(.secondary)
+                            }
                             Text(game.displayTitle)
-                                .font(.system(size: 36, weight: .heavy)).tracking(-1)
-                            Text(sourceDescription).font(.caption).foregroundStyle(.secondary)
+                                .font(.system(size: 26, weight: .bold, design: .rounded))
+                                .tracking(-0.5)
+                                .lineLimit(2)
+                            Text(sourceDescription)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
                         }
                     }
                     if showingProgress {
@@ -328,12 +375,12 @@ struct SwitchBuildView: View {
                     }
 
                 }
-                .padding(.horizontal, 48)
-                .padding(.top, 22)
-                .padding(.bottom, 40)
+                .padding(.horizontal, 44)
+                .padding(.top, 24)
+                .padding(.bottom, 36)
             }
 
-            Divider().opacity(0.3)
+            Divider().overlay(GameCenterColors.border)
             footer
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -409,15 +456,25 @@ struct SwitchBuildView: View {
                     }
                     if !isSwitch2 {
                         Text("密钥只在本机读取，不会上传，也不会放进生成的应用。")
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.leading, 35).padding(.bottom, 12)
+                            .padding(.leading, 36).padding(.bottom, 12)
                     }
                     rowDivider
                     Button { withAnimation(.easeInOut(duration: 0.18)) { showExtras.toggle() } } label: {
-                        HStack(spacing: 7) {
-                            Text("更新和 DLC（可选）").font(.system(size: 12, weight: .medium))
-                            Image(systemName: "chevron.down").font(.system(size: 10, weight: .semibold))
+                        HStack(spacing: 8) {
+                            Text("更新和 DLC（可选）").font(.system(size: 13, weight: .medium))
+                            if supportsSeparateExtras {
+                                Text(extrasSummaryBadge)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 2)
+                                    .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.down").font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
                                 .rotationEffect(.degrees(showExtras ? 180 : 0))
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -436,33 +493,34 @@ struct SwitchBuildView: View {
                             }
                         } else {
                             Text("当前选择的游戏文件夹或 NUP 已包含游戏内容；请把更新放入 updates、DLC 放入 dlc 子文件夹。")
-                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                                .font(.system(size: 12)).foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true).padding(14)
                         }
                     }
                     rowDivider
                     fileRow(title: "保存到", value: defaultSwitchDirectory.path, button: nil, action: {})
                 }
-                .background(panelFill, in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.08), lineWidth: 1))
+                .background(panelFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(GameCenterColors.border, lineWidth: 1))
             }
 
             VStack(alignment: .leading, spacing: 10) {
                 sectionHeading("目标平台", subtitle: "可同时勾选，按 macOS、iOS 的顺序构建")
                 targetSettings
                 if targets.isEmpty {
-                    Text("至少选择一个目标平台").font(.system(size: 11)).foregroundStyle(.orange)
+                    Text("至少选择一个目标平台").font(.system(size: 12)).foregroundStyle(.orange)
                 }
                 if targets.contains(.iOS) {
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: "iphone").foregroundStyle(actionColor)
                         Text("把 .gcimport 放到手机 Game Center 的 GameLibrary/switch，或在 Switch 游戏库中点「导入」。基础 IPA 可在主窗口顶栏生成。")
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         Spacer(minLength: 0)
                     }
                     .padding(12)
-                    .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 10))
+                    .background(GameCenterColors.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(GameCenterColors.border, lineWidth: 1))
                 }
             }
 
@@ -555,7 +613,8 @@ struct SwitchBuildView: View {
             HStack(spacing: 8) {
                 Text("设备依赖").font(.system(size: 13, weight: .semibold))
                 Text(isCheckingDependencies ? "正在检测…" : "\(dependencies.filter(\.isReady).count)/\(dependencies.count) 已就绪")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(!isCheckingDependencies && !dependencies.isEmpty && dependencies.allSatisfy(\.isReady) ? BuildPalette.ready : .secondary)
                 Spacer()
                 Button("重新检测") { refreshDependencies() }
                     .buttonStyle(BuildActionStyle(prominent: false))
@@ -563,48 +622,48 @@ struct SwitchBuildView: View {
             }
             VStack(spacing: 0) {
                 if isCheckingDependencies && dependencies.isEmpty {
-                    HStack(spacing: 10) { ProgressView().controlSize(.small); Text("正在检测 \(method.title) 所需依赖…").font(.system(size: 11)).foregroundStyle(.secondary); Spacer() }
+                    HStack(spacing: 10) { ProgressView().controlSize(.small); Text("正在检测 \(method.title) 所需依赖…").font(.system(size: 12)).foregroundStyle(.secondary); Spacer() }
                         .padding(.horizontal, 16).padding(.vertical, 13)
                 } else {
                     ForEach(Array(dependencies.enumerated()), id: \.element.id) { index, dependency in
                         HStack(spacing: 10) {
-                            Circle().fill(dependency.isReady ? Color.green : Color.orange).frame(width: 7, height: 7)
+                            Circle().fill(dependency.isReady ? BuildPalette.ready : BuildPalette.building).frame(width: 7, height: 7)
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(dependencyTitle(dependency.id)).font(.system(size: 11, weight: .medium))
+                                Text(dependencyTitle(dependency.id)).font(.system(size: 13, weight: .medium))
                                 Text(dependency.id == "engine" ? (engineUpdateMessages[method.rawValue] ?? dependency.detail) : dependency.detail)
-                                    .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
+                                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
                                 if installingDependencyID == dependency.id && installingDependencyMethod == method,
                                    ["python", "python-packages"].contains(dependency.id),
                                    let dependencyInstallMessage {
-                                    Text(dependencyInstallMessage).font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
+                                    Text(dependencyInstallMessage).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                                 }
                             }
                             Spacer(minLength: 8)
                             if installingDependencyID == dependency.id && installingDependencyMethod == method {
-                                HStack(spacing: 6) { ProgressView().controlSize(.small); Text("处理中…").font(.system(size: 10)) }
-                                    .foregroundStyle(.secondary).frame(width: 90, height: 30)
+                                HStack(spacing: 6) { ProgressView().controlSize(.small); Text("处理中…").font(.system(size: 11)) }
+                                    .foregroundStyle(.secondary).frame(width: 90, height: 32)
                             } else {
                                 Button(dependencyButtonTitle(dependency)) {
                                     install(dependency)
                                 }
-                                .buttonStyle(BuildActionStyle(prominent: false))
-                    .disabled((dependency.isReady && dependency.id != "engine") || installingDependencyID != nil)
+                                .buttonStyle(BuildActionStyle(primary: !dependency.isReady, prominent: false))
+                                .disabled((dependency.isReady && dependency.id != "engine") || installingDependencyID != nil)
                             }
                         }
-                        .padding(.horizontal, 15).padding(.vertical, 10)
-                        if index < dependencies.count - 1 { rowDivider.padding(.leading, 32) }
+                        .padding(.horizontal, 16).padding(.vertical, 11)
+                        if index < dependencies.count - 1 { rowDivider.padding(.leading, 33) }
                     }
                 }
             }
-            .background(panelFill, in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.07), lineWidth: 1))
+            .background(panelFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(GameCenterColors.border, lineWidth: 1))
             if let dependencyInstallMessage {
-                Text(dependencyInstallMessage).font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(dependencyInstallMessage).font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let runningMethod = installingDependencyMethod, installingDependencyID == "engine", runningMethod != method {
                 Text("正在继续更新 \(runningMethod.title)；切换构建方式不会中断更新。")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
             }
         }
     }
@@ -799,58 +858,51 @@ struct SwitchBuildView: View {
     private var progressContent: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(spacing: 0) {
-                HStack(spacing: 8) {
-                    Circle().fill(statusColor).frame(width: 9, height: 9)
-                    Text(session.isBuilding ? (session.isStopping ? "正在停止" : "出包中") : session.progress.stage)
-                        .font(.buildFace(14, .bold)).foregroundStyle(statusColor)
-                    if session.isBuilding {
-                        Text("· 第 \((session.targets.firstIndex(of: session.target) ?? 0) + 1) / \(session.targets.count) 个平台：\(session.target.title)")
-                            .font(.buildFace(13, .medium)).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                }
-                .padding(.bottom, 26)
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text("\(Int((session.overallFraction ?? 0) * 100))%")
-                        .font(.buildFace(58, .heavy)).tracking(-2).monospacedDigit().contentTransition(.numericText())
-                    Text("整体进度").font(.buildFace(14, .semibold)).foregroundStyle(.secondary)
+                        .font(.system(size: 48, weight: .bold, design: .rounded)).tracking(-1.5).monospacedDigit().contentTransition(.numericText())
+                    Text("整体进度").font(.system(size: 13, weight: .semibold)).foregroundStyle(.secondary)
                     Spacer()
-                }
-                LauncherProgressBar(value: session.overallFraction ?? 0, height: 10, tint: actionColor)
-                    .padding(.vertical, 14)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("总用时").font(.buildFace(13, .semibold)).foregroundStyle(.secondary)
-                    TimelineView(.periodic(from: session.startedAt, by: 1)) { context in
-                        Text(elapsed(session.startedAt, until: session.finishedAt ?? context.date))
-                            .font(.buildFace(30, .bold)).tracking(-0.6).monospacedDigit()
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text("总用时").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                        TimelineView(.periodic(from: session.startedAt, by: 1)) { context in
+                            Text(elapsed(session.startedAt, until: session.finishedAt ?? context.date))
+                                .font(.system(size: 18, weight: .semibold, design: .monospaced)).monospacedDigit()
+                        }
                     }
-                }.frame(maxWidth: .infinity, alignment: .leading).padding(.bottom, 26)
+                }
+                LauncherProgressBar(value: session.overallFraction ?? 0, height: 8, tint: actionColor)
+                    .padding(.top, 12)
+                    .padding(.bottom, 22)
                 ForEach(session.progressPhases) { phase in
                     phaseRow(phase, last: phase.id == session.progressPhases.last?.id)
                 }
             }
+            .padding(20)
+            .background(panelFill, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(GameCenterColors.border, lineWidth: 1))
             if let error = session.errorMessage {
                 HStack(alignment: .top, spacing: 10) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    Text(error).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Text(error).font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
                 }
-                .padding(14).background(panelFill, in: RoundedRectangle(cornerRadius: 10))
+                .padding(14)
+                .background(panelFill, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(GameCenterColors.border, lineWidth: 1))
             }
             ForEach(session.targets.filter { session.results[$0] != nil }) { builtTarget in
                 HStack(spacing: 10) {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(BuildPalette.ready)
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("\(builtTarget.title) 已生成").font(.system(size: 12, weight: .semibold))
-                        Text(session.results[builtTarget]?.path ?? "").font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        Text("\(builtTarget.title) 已生成").font(.system(size: 13, weight: .semibold))
+                        Text(session.results[builtTarget]?.path ?? "").font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                     }
                     Spacer(minLength: 0)
                 }
-                .padding(14).background(panelFill, in: RoundedRectangle(cornerRadius: 10))
-            }
-            if session.results.isEmpty && session.errorMessage == nil {
-                Text("返回游戏库后，可从游戏卡片查看进度。")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                .padding(14)
+                .background(panelFill, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(GameCenterColors.border, lineWidth: 1))
             }
 
             VStack(alignment: .leading, spacing: 0) {
@@ -858,29 +910,32 @@ struct SwitchBuildView: View {
                     withAnimation(.easeInOut(duration: 0.18)) { showBuildSettings.toggle() }
                 } label: {
                     HStack(spacing: 7) {
-                        Text("设置").font(.system(size: 12, weight: .medium))
+                        Text("本次构建参数").font(.system(size: 12, weight: .medium))
+                        Spacer()
                         Image(systemName: "chevron.down").font(.system(size: 10, weight: .semibold))
                             .rotationEffect(.degrees(showBuildSettings ? 180 : 0)).foregroundStyle(.secondary)
-                        Spacer()
                     }
-                    .contentShape(Rectangle()).padding(.vertical, 8)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(PlainHandButtonStyle())
                 if showBuildSettings {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("引擎：\(session.method.title)")
-                    Text("目标：\(session.targets.map(\.title).joined(separator: " + "))")
-                    Text("游戏：\(sourceDescription)")
-                    if let keysURL { Text("密钥：\(keysURL.lastPathComponent)") }
-                    Text("输出：\(defaultSwitchDirectory.path)")
-                    Text("存档：\(defaultSwitchDirectory.appendingPathComponent("save", isDirectory: true).path)")
-                }
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .padding(.top, 8)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("引擎：\(session.method.title)")
+                        Text("目标：\(session.targets.map(\.title).joined(separator: " + "))")
+                        Text("游戏：\(sourceDescription)")
+                        if let keysURL { Text("密钥：\(keysURL.lastPathComponent)") }
+                        Text("输出：\(defaultSwitchDirectory.path)")
+                        Text("存档：\(defaultSwitchDirectory.appendingPathComponent("save", isDirectory: true).path)")
+                    }
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 10)
                 }
             }
-            .padding(.horizontal, 4)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(panelFill, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(GameCenterColors.border, lineWidth: 1))
 
             buildLogDisclosure
         }
@@ -923,52 +978,65 @@ struct SwitchBuildView: View {
     }
 
     private var footer: some View {
-        HStack(alignment: .center, spacing: 16) {
-            Text("大游戏首次出包可能需要几十分钟，请接通电源并保持 Mac 唤醒")
-                .font(.buildFace(13)).foregroundStyle(.secondary)
-            Spacer(minLength: 6)
-            Button(session.isBuilding ? "回到游戏库，后台继续" : showingProgress ? "返回游戏库" : "取消", action: onBack)
-                .buttonStyle(BuildActionStyle()).keyboardShortcut(.cancelAction)
+        HStack(alignment: .center, spacing: 14) {
+            Text(footerHintText)
+                .font(.system(size: 12))
+                .foregroundStyle(!showingProgress && !buildCanStart ? BuildPalette.building : .secondary)
+                .lineLimit(2)
+            Spacer(minLength: 8)
             if showingProgress && session.isBuilding {
-                Button(session.isStopping ? "正在停止…" : "取消", systemImage: "stop.fill", role: .destructive) {
+                Button(session.isStopping ? "正在停止…" : "停止构建", systemImage: "stop.fill", role: .destructive) {
                     stopBuild()
                 }
-                .buttonStyle(BuildActionStyle(primary: true, focused: controllerNavigation.event != nil && controllerActionSelection == 0))
+                .buttonStyle(BuildActionStyle(destructive: true, focused: controllerNavigation.event != nil && controllerActionSelection == 0))
                 .disabled(session.isStopping)
+
+                Button("回到游戏库，后台继续", action: onBack)
+                    .buttonStyle(BuildActionStyle(primary: true))
+                    .keyboardShortcut(.cancelAction)
             } else if showingProgress, session.resultURL != nil {
+                Button("返回游戏库", action: onBack)
+                    .buttonStyle(BuildActionStyle())
+                    .keyboardShortcut(.cancelAction)
+
                 Button("在 Finder 中显示", systemImage: "folder") {
                     NSWorkspace.shared.activateFileViewerSelecting(session.targets.compactMap { session.results[$0] })
                 }
                 .buttonStyle(BuildActionStyle(focused: controllerNavigation.event != nil && controllerActionSelection == 0))
                 if let macURL = session.results[.macOS] {
-                Button("启动游戏", systemImage: "play.fill") {
-                    NSWorkspace.shared.open(macURL)
-                    onBack()
-                }
-                .buttonStyle(BuildActionStyle(primary: true, focused: controllerNavigation.event != nil && controllerActionSelection == 1))
+                    Button("启动游戏", systemImage: "play.fill") {
+                        NSWorkspace.shared.open(macURL)
+                        onBack()
+                    }
+                    .buttonStyle(BuildActionStyle(primary: true, focused: controllerNavigation.event != nil && controllerActionSelection == 1))
                 }
             } else {
+                Button(showingProgress ? "返回游戏库" : "取消", action: onBack)
+                    .buttonStyle(BuildActionStyle())
+                    .keyboardShortcut(.cancelAction)
+
                 Button(session.errorMessage == nil ? "开始出包" : "重新构建", systemImage: session.errorMessage == nil ? "shippingbox.fill" : "arrow.clockwise") {
                     startBuild()
                 }
-                    .buttonStyle(BuildActionStyle(primary: true, focused: controllerNavigation.event != nil && controllerActionSelection == 0))
-                    .disabled(!buildCanStart)
+                .buttonStyle(BuildActionStyle(primary: true, focused: controllerNavigation.event != nil && controllerActionSelection == 0))
+                .disabled(!buildCanStart)
             }
         }
-        .padding(.horizontal, 48)
-        .padding(.vertical, 16)
+        .padding(.horizontal, 44)
+        .padding(.vertical, 15)
+        .background(Color.black.opacity(0.24))
     }
 
     private var rowDivider: some View {
         Rectangle().fill(.white.opacity(0.06)).frame(height: 1)
     }
 
-    private var panelFill: Color { Color(red: 0.10, green: 0.10, blue: 0.11).opacity(0.75) }
+    private var panelFill: Color { GameCenterColors.surface }
 
     private func sectionHeading(_ title: String, subtitle: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 3) {
             Text(title).font(.system(size: 13, weight: .semibold))
-            Text(subtitle).font(.system(size: 10)).foregroundStyle(.secondary)
+            Text(subtitle).font(.system(size: 12)).foregroundStyle(.secondary)
         }
     }
 
@@ -982,13 +1050,13 @@ struct SwitchBuildView: View {
     ) -> some View {
         HStack(spacing: 12) {
             Circle()
-                .fill(fileRowStatus(title) ? Color.green : Color.secondary.opacity(0.6))
+                .fill(fileRowStatus(title) ? BuildPalette.ready : Color.secondary.opacity(0.6))
                 .frame(width: 7, height: 7)
                 .opacity(title == "保存到" ? 0 : 1)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.system(size: 12, weight: .medium))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.system(size: 13, weight: .medium))
                 Text(value)
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -996,7 +1064,7 @@ struct SwitchBuildView: View {
             Spacer(minLength: 8)
             if showsClear, let clear {
                 Button("清除", action: clear)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11, weight: .medium))
                     .buttonStyle(PlainHandButtonStyle())
                     .foregroundStyle(.secondary)
             }
