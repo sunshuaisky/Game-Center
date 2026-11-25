@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct GameDetailView: View {
@@ -13,12 +14,36 @@ struct GameDetailView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var controllerSelection = 2
+    @State private var isFavoriteHovered = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private var modalWidth: CGFloat { min(560, max(420, availableSize.width - 32)) }
-    private var modalHeight: CGFloat { min(680, max(400, availableSize.height - 32)) }
+    private var modalWidth: CGFloat { min(560, max(440, availableSize.width - 32)) }
+    private var modalHeight: CGFloat { min(660, max(420, availableSize.height - 32)) }
+
+    private var resolvedSourceURL: URL? {
+        guard let raw = game.metadataSourceURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let url = URL(string: raw),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme) else { return nil }
+        return url
+    }
 
     var body: some View {
         VStack(spacing: 0) {
+            HStack {
+                Text("游戏详情")
+                    .font(.system(size: 14, weight: .semibold))
+                Spacer()
+                SheetCloseButton { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 13)
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(GameCenterColors.border).frame(height: 1)
+            }
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     hero
@@ -48,48 +73,81 @@ struct GameDetailView: View {
     }
 
     private var hero: some View {
-        HStack(alignment: .center, spacing: 18) {
-            GameArtwork(game: game)
+        HStack(alignment: .top, spacing: 18) {
+            GameArtwork(game: game, showPlatformBadge: false)
                 .frame(width: 132, height: 174)
                 .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 11).stroke(.white.opacity(0.1), lineWidth: 1))
+                .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(.white.opacity(0.12), lineWidth: 1))
 
-            VStack(alignment: .leading, spacing: 11) {
+            VStack(alignment: .leading, spacing: 10) {
                 Text(game.displayTitle)
                     .font(.system(size: 22, weight: .semibold, design: .rounded))
                     .fixedSize(horizontal: false, vertical: true)
                     .lineLimit(3)
 
-                Label(game.platform.title, systemImage: game.platform.symbol)
-                    .font(.system(size: 11, weight: .medium))
+                HStack(spacing: 8) {
+                    Label(game.platform.title, systemImage: game.platform.symbol)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.86))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(GameCenterColors.surfaceElevated, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(statusColor)
+                            .frame(width: 6, height: 6)
+                        Text(statusTitle)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Text(AppLanguage.localized(game.lastPlayedAt.map {
+                    AppLanguage.format("上次游玩 %@", $0.formatted(date: .abbreviated, time: .shortened))
+                } ?? "尚未游玩"))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
 
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(statusColor)
-                        .frame(width: 6, height: 6)
-                    Text(statusTitle)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.secondary)
-                }
+                Spacer(minLength: 4)
 
-                Spacer(minLength: 0)
+                HStack(spacing: 8) {
+                    Button(action: onFavorite) {
+                        Label(game.isFavorite ? "已收藏" : "收藏", systemImage: game.isFavorite ? "heart.fill" : "heart")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(game.isFavorite ? GameCenterColors.favoriteForeground : Color.primary)
+                            .padding(.horizontal, 13)
+                            .frame(height: 36)
+                            .background(
+                                game.isFavorite
+                                    ? (isFavoriteHovered ? GameCenterColors.favoriteBackgroundHover : GameCenterColors.favoriteBackground)
+                                    : (isFavoriteHovered ? GameCenterColors.surfaceHover : GameCenterColors.surfaceElevated),
+                                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                    .stroke(game.isFavorite ? GameCenterColors.favoriteBorder : Color.white.opacity(0.12), lineWidth: 1)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                    .stroke(.white, lineWidth: controllerSelection == 0 ? 2 : 0)
+                            )
+                    }
+                    .buttonStyle(CursorButtonStyle())
+                    .onHover { isFavoriteHovered = $0 }
+                    .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: isFavoriteHovered)
+                    .help(AppLanguage.localized(game.isFavorite ? "取消收藏" : "加入收藏"))
 
-                Button(action: onFavorite) {
-                    Label(game.isFavorite ? "已收藏" : "收藏", systemImage: game.isFavorite ? "heart.fill" : "heart")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(game.isFavorite ? Color(red: 1, green: 0.5, blue: 0.57) : Color.primary)
-                        .padding(.horizontal, 13)
-                        .frame(height: 36)
-                        .background(game.isFavorite ? Color.red.opacity(0.15) : Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(game.isFavorite ? Color.red.opacity(0.34) : Color.white.opacity(0.12), lineWidth: 1))
+                    if let fileURL = try? game.resolvedURL(), FileManager.default.fileExists(atPath: fileURL.path) {
+                        Button("在访达中显示", systemImage: "folder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                        }
+                        .buttonStyle(TactileActionButtonStyle(appearance: .secondary, cornerRadius: 9, minHeight: 36, horizontalPadding: 12, fontSize: 12))
+                    }
                 }
-                .buttonStyle(CursorButtonStyle())
-                .overlay(Circle().stroke(.white, lineWidth: controllerSelection == 0 ? 2 : 0))
-                .help(AppLanguage.localized(game.isFavorite ? "取消收藏" : "加入收藏"))
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: 174)
+            .frame(minHeight: 174)
         }
     }
 
@@ -102,55 +160,80 @@ struct GameDetailView: View {
                     HStack(spacing: 6) {
                         if game.metadataStatus == "searching" { ProgressView().controlSize(.small) }
                         Text(game.metadataStatus == "searching" ? "正在查找…" : "查找游戏信息")
-                    }.font(.system(size: 11)).padding(.horizontal, 10).padding(.vertical, 8)
-                        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
-                }.buttonStyle(CursorButtonStyle()).disabled(game.metadataStatus == "searching")
+                    }
+                }
+                .buttonStyle(TactileActionButtonStyle(appearance: .secondary, cornerRadius: 8, minHeight: 30, horizontalPadding: 11, fontSize: 11))
+                .disabled(game.metadataStatus == "searching")
             }
 
-            Group {
-                if let synopsis = game.synopsis, !synopsis.isEmpty {
-                    Text(synopsis)
-                        .foregroundStyle(.primary.opacity(0.88))
-                } else {
-                    Text(AppLanguage.localized(game.metadataStatus == "searching"
-                         ? "正在联网查找游戏简介和封面…"
-                         : "暂时没有匹配到简介。可为游戏手动选择封面。"))
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 12) {
+                Group {
+                    if let synopsis = game.synopsis, !synopsis.isEmpty {
+                        Text(synopsis)
+                            .foregroundStyle(.primary.opacity(0.88))
+                    } else {
+                        Text(AppLanguage.localized(game.metadataStatus == "searching"
+                             ? "正在联网查找游戏简介和封面…"
+                             : "暂时没有匹配到简介。可为游戏手动选择封面。"))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .font(.system(size: 13))
+                .lineSpacing(4)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                if let sourceURL = resolvedSourceURL {
+                    Divider().overlay(.white.opacity(0.08))
+                    HStack {
+                        Text(AppLanguage.localized("简介来源"))
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Link(destination: sourceURL) {
+                            HStack(spacing: 4) {
+                                Text(sourceURL.host ?? sourceURL.absoluteString)
+                                    .lineLimit(1)
+                                Image(systemName: "arrow.up.right")
+                                    .font(.system(size: 10, weight: .semibold))
+                            }
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.82))
+                        }
+                        .pointingHandCursor()
+                    }
                 }
             }
-            .font(.system(size: 12))
-            .lineSpacing(4)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(14)
-            .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.07), lineWidth: 1))
+            .background(GameCenterColors.surface, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(GameCenterColors.border, lineWidth: 1))
         }
     }
 
     private var footer: some View {
-        HStack(spacing: 9) {
+        HStack(spacing: 10) {
             Button("从资料库移除", role: .destructive, action: onRemove)
-                .buttonStyle(DetailButtonStyle(appearance: .destructive, isControllerFocused: controllerSelection == 3))
+                .buttonStyle(TactileActionButtonStyle(appearance: .destructive, isControllerFocused: controllerSelection == 3))
 
-            Spacer(minLength: 2)
+            Spacer(minLength: 4)
 
             Button("更换封面…", systemImage: "photo", action: onChooseArtwork)
-                .buttonStyle(DetailButtonStyle(isControllerFocused: controllerSelection == 1))
+                .buttonStyle(TactileActionButtonStyle(appearance: .secondary, isControllerFocused: controllerSelection == 1))
+
             if game.platform == .switchConsole && !game.isDirectlyLaunchable {
                 Button("构建游戏", systemImage: "hammer", action: onBuild)
-                    .buttonStyle(DetailButtonStyle(isControllerFocused: controllerSelection == 2))
+                    .buttonStyle(TactileActionButtonStyle(appearance: .primary, isControllerFocused: controllerSelection == 2))
             }
             if game.isDirectlyLaunchable {
                 Button("启动游戏", systemImage: "play.fill", action: onLaunch)
-                    .buttonStyle(DetailButtonStyle(appearance: .primary, isControllerFocused: controllerSelection == 2))
+                    .buttonStyle(TactileActionButtonStyle(appearance: .primary, isControllerFocused: controllerSelection == 2))
                     .keyboardShortcut(.defaultAction)
             }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
         .background(Color.black.opacity(0.24))
-        .overlay(alignment: .top) { Rectangle().fill(.white.opacity(0.07)).frame(height: 1) }
+        .overlay(alignment: .top) { Rectangle().fill(GameCenterColors.border).frame(height: 1) }
     }
 
     private func activateControllerSelection() {
@@ -176,51 +259,9 @@ struct GameDetailView: View {
     private var statusColor: Color {
         switch game.metadataStatus {
         case "searching": .orange
-        case "found": .green
-        case "error": .red
+        case "found": BuildPalette.ready
+        case "error": GameCenterColors.destructiveForeground
         default: .secondary
-        }
-    }
-}
-
-private struct DetailButtonStyle: ButtonStyle {
-    enum Appearance { case secondary, primary, destructive }
-    var appearance: Appearance = .secondary
-    var isControllerFocused = false
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 11, weight: .medium))
-            .foregroundStyle(foregroundColor)
-            .padding(.horizontal, 11)
-            .frame(minHeight: 36)
-            .background(backgroundColor, in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(borderColor, lineWidth: 1))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white, lineWidth: isControllerFocused ? 2 : 0))
-            .pointingHandCursor()
-    }
-
-    private var foregroundColor: Color {
-        switch appearance {
-        case .primary: .black
-        case .destructive: Color(red: 1, green: 0.46, blue: 0.5)
-        case .secondary: .primary
-        }
-    }
-
-    private var backgroundColor: Color {
-        switch appearance {
-        case .primary: GameCenterColors.action
-        case .destructive: Color.red.opacity(0.12)
-        case .secondary: Color.white.opacity(0.07)
-        }
-    }
-
-    private var borderColor: Color {
-        switch appearance {
-        case .primary: Color.white.opacity(0.18)
-        case .destructive: Color.red.opacity(0.25)
-        case .secondary: Color.white.opacity(0.12)
         }
     }
 }

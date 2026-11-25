@@ -1,63 +1,79 @@
 // Progress bar, sweep and pulse adapted from NX2Apple (see NX2Apple-LICENSE.txt).
 import SwiftUI
-import CoreText
 
 enum BuildPalette {
-    static let cream = Color(red: 1, green: 0.94, blue: 0.84)
-    static let building = Color(red: 1, green: 0.78, blue: 0.24)
-    static let ready = Color(red: 0.25, green: 0.84, blue: 0.47)
+    static let cream = GameCenterColors.action
+    static let building = Color(red: 1, green: 0.78, blue: 0.28)
+    static let ready = Color(red: 0.28, green: 0.84, blue: 0.50)
 }
 
 extension Font {
-    private static let buildDescriptor: CTFontDescriptor? = {
-        let bundled = Bundle.main.url(forResource: "GameCenter_GameCenter", withExtension: "bundle").flatMap(Bundle.init(url:))
-        guard let url = (bundled ?? Bundle.module).url(forResource: "Manrope", withExtension: "ttf"),
-              let data = try? Data(contentsOf: url) else { return nil }
-        return CTFontManagerCreateFontDescriptorFromData(data as CFData)
-    }()
-
     static func buildFace(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
-        guard let buildDescriptor else { return .system(size: size, weight: weight) }
-        let axis: CGFloat = switch weight {
-        case .heavy, .black: 800
-        case .bold: 700
-        case .semibold: 600
-        case .medium: 500
-        default: 400
-        }
-        let descriptor = CTFontDescriptorCreateCopyWithAttributes(buildDescriptor,
-            [kCTFontVariationAttribute: [0x77676874: axis]] as CFDictionary)
-        return Font(CTFontCreateWithFontDescriptor(descriptor, size, nil))
+        .system(size: size, weight: weight)
     }
 }
 
 struct BuildActionStyle: ButtonStyle {
     var primary = false
+    var destructive = false
     var prominent = true
     var focused = false
     @Environment(\.isEnabled) private var enabled
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hovered = false
 
     func makeBody(configuration: Configuration) -> some View {
         let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
-        configuration.label.font(.buildFace(prominent ? 16 : 13, .semibold))
-            .lineLimit(1).padding(.horizontal, 16)
-            .frame(minWidth: 80, minHeight: prominent ? 48 : 36)
-            .foregroundStyle(primary ? Color(white: 0.055) : Color.white.opacity(0.92))
-            .background(primary ? BuildPalette.cream.opacity(hovered ? 0.93 : 1)
-                        : Color.white.opacity(hovered ? 0.11 : 0.065), in: shape)
-            .overlay(shape.strokeBorder(focused ? Color.white : .white.opacity(primary ? 0 : 0.10), lineWidth: focused ? 2 : 1))
-            .contentShape(shape).opacity(enabled ? 1 : 0.45).onHover { hovered = $0 }
+        configuration.label
+            .font(.system(size: prominent ? 13 : 12, weight: primary || destructive ? .semibold : .medium))
+            .lineLimit(1)
+            .padding(.horizontal, prominent ? 16 : 12)
+            .frame(minWidth: prominent ? 84 : 70, minHeight: prominent ? 38 : 32)
+            .foregroundStyle(foregroundColor)
+            .background(backgroundColor(pressed: configuration.isPressed), in: shape)
+            .overlay(shape.strokeBorder(borderColor, lineWidth: focused ? 2 : 1))
+            .contentShape(shape)
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1)
+            .opacity(enabled ? 1 : 0.42)
+            .onHover { hovered = $0 }
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: hovered)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: configuration.isPressed)
+            .pointingHandCursor()
+    }
+
+    private var foregroundColor: Color {
+        if primary { return Color(white: 0.06) }
+        if destructive { return GameCenterColors.destructiveForeground }
+        return Color.white.opacity(0.92)
+    }
+
+    private func backgroundColor(pressed: Bool) -> Color {
+        if primary {
+            return pressed ? Color(white: 0.82) : (hovered ? GameCenterColors.actionHover : GameCenterColors.action)
+        }
+        if destructive {
+            return pressed ? Color.red.opacity(0.26) : (hovered ? GameCenterColors.destructiveBackgroundHover : GameCenterColors.destructiveBackground)
+        }
+        return pressed ? Color.white.opacity(0.18) : Color.white.opacity(hovered ? 0.14 : 0.08)
+    }
+
+    private var borderColor: Color {
+        if focused { return .white }
+        if primary { return .white.opacity(0.18) }
+        if destructive { return GameCenterColors.destructiveBorder }
+        return .white.opacity(hovered ? 0.18 : 0.11)
     }
 }
 
 struct LauncherProgressBar: View {
     var value: Double?
     var height: CGFloat = 8
-    var tint: Color = BuildPalette.building
+    var tint: Color = GameCenterColors.action
 
-    init(value: Double?, height: CGFloat = 8, tint: Color = BuildPalette.building) {
-        self.value = value; self.height = height; self.tint = tint
+    init(value: Double?, height: CGFloat = 8, tint: Color = GameCenterColors.action) {
+        self.value = value
+        self.height = height
+        self.tint = tint
     }
 
     var body: some View {
@@ -69,10 +85,9 @@ struct LauncherProgressBar: View {
                         .animation(.easeOut(duration: 0.3), value: value)
                 }
             } else {
-                Capsule().fill(tint.opacity(0.16))   // an amber-tinted track under soft stripes
+                Capsule().fill(tint.opacity(0.16))
                 TimelineView(.animation) { context in
                     Canvas { canvas, size in
-                        // One stripe and one gap per period; the pattern moves one period every 1.2 s, linearly
                         let period = height * 3, stripe = height * 1.5
                         let t = context.date.timeIntervalSinceReferenceDate
                         let phase = CGFloat(t.truncatingRemainder(dividingBy: 1.2) / 1.2) * period
@@ -100,28 +115,41 @@ struct LauncherProgressBar: View {
 
 struct ProgressSweep: View {
     @State private var moving = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
         GeometryReader { g in
-            LinearGradient(colors: [.clear, Color.white.opacity(0.55), .clear], startPoint: .leading, endPoint: .trailing)
-                .frame(width: max(40, g.size.width * 0.35))
-                .offset(x: moving ? g.size.width : -max(40, g.size.width * 0.35))
+            if !reduceMotion {
+                LinearGradient(colors: [.clear, Color.white.opacity(0.55), .clear], startPoint: .leading, endPoint: .trailing)
+                    .frame(width: max(40, g.size.width * 0.35))
+                    .offset(x: moving ? g.size.width : -max(40, g.size.width * 0.35))
+            }
         }
         .clipped()
         .allowsHitTesting(false)
-        .onAppear { withAnimation(.linear(duration: 1.7).repeatForever(autoreverses: false)) { moving = true } }
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.linear(duration: 1.7).repeatForever(autoreverses: false)) { moving = true }
+        }
     }
 }
 
 /// 当前步骤前面呼吸的小圆点。
 struct PulseDot: View {
     @State private var on = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
         ZStack {
-            Circle().fill(BuildPalette.cream.opacity(on ? 0 : 0.35)).frame(width: on ? 26 : 12, height: on ? 26 : 12)
-            Circle().fill(BuildPalette.cream).frame(width: 10, height: 10)
+            if !reduceMotion {
+                Circle().fill(GameCenterColors.action.opacity(on ? 0 : 0.38)).frame(width: on ? 24 : 11, height: on ? 24 : 11)
+            }
+            Circle().fill(GameCenterColors.action).frame(width: 9, height: 9)
         }
-        .frame(width: 26, height: 26)
-        .onAppear { withAnimation(.easeOut(duration: 1.4).repeatForever(autoreverses: false)) { on = true } }
+        .frame(width: 24, height: 24)
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.easeOut(duration: 1.4).repeatForever(autoreverses: false)) { on = true }
+        }
     }
 }
-
