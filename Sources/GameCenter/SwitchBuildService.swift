@@ -1242,11 +1242,13 @@ enum SwitchBuildService {
               let hostID = gameInfo["hostMac"] as? String else {
             throw SwitchBuildError.commandFailed("S2Arm 没有生成可运行的 Mac 宿主，无法封装独立应用。")
         }
-        let hostApp = library.appendingPathComponent("hosts/mac/\(hostID)/S2ArmGame.app", isDirectory: true)
-        guard fm.fileExists(atPath: hostApp.path),
-              fm.fileExists(atPath: runtimeURL.appendingPathComponent("manifest.json").path) else {
-            throw SwitchBuildError.commandFailed("运行镜像或 Mac 宿主缺失，不能封装独立应用。")
+        guard let hostRelativePath = s2ArmMacHostRelativePath(in: library, hostID: hostID, fileManager: fm) else {
+            throw SwitchBuildError.commandFailed("Mac 宿主缺失（\(hostID)），不能封装独立应用。")
         }
+        guard fm.fileExists(atPath: runtimeURL.appendingPathComponent("manifest.json").path) else {
+            throw SwitchBuildError.commandFailed("运行镜像缺失（manifest.json），不能封装独立应用。")
+        }
+        let hostApp = library.appendingPathComponent(hostRelativePath, isDirectory: true)
         let markerURL = library.appendingPathComponent(".s2arm-library.json")
         guard let markerData = try? Data(contentsOf: markerURL),
               let libraryMarker = try? JSONSerialization.jsonObject(with: markerData) as? [String: Any],
@@ -1290,7 +1292,8 @@ enum SwitchBuildService {
             }
         }
         let embeddedLocation = embeddedLibrary.appendingPathComponent(".s2arm-location.json")
-        let locationData = try JSONSerialization.data(withJSONObject: ["schema": 1, "id": resolvedLibraryID, "version": 4], options: [.sortedKeys])
+        let layoutVersion = s2ArmLayoutVersion(in: library, hostRelativePath: hostRelativePath)
+        let locationData = try JSONSerialization.data(withJSONObject: ["schema": 1, "id": resolvedLibraryID, "version": layoutVersion], options: [.sortedKeys])
         try locationData.write(to: embeddedLocation, options: .atomic)
         let catalogURL = library.appendingPathComponent("catalog.json")
         if let catalogData = try? Data(contentsOf: catalogURL),
@@ -1328,7 +1331,7 @@ enum SwitchBuildService {
             progress(.init(stage: "封装独立应用", detail: "游戏运行文件 · \(copiedText) / \(totalText) · \(path)", fraction: 0.20 + 0.75 * Double(copied) / Double(max(total, 1)), log: []))
         }
         try makeS2ArmRuntimePortable(in: bundledGameDirectory)
-        let hostDestination = embeddedLibrary.appendingPathComponent("hosts/mac/\(hostID)/S2ArmGame.app", isDirectory: true)
+        let hostDestination = embeddedLibrary.appendingPathComponent(hostRelativePath, isDirectory: true)
         try copyTree(from: hostApp, to: hostDestination) { _, _, _ in }
         let versionURL = embeddedLibrary.appendingPathComponent("standalone-version")
         try Data((version + "\n").utf8).write(to: versionURL, options: .atomic)
@@ -1369,6 +1372,33 @@ enum SwitchBuildService {
         try publishBuiltApplication(from: stage, to: url, backupDirectory: stagingRoot.appendingPathComponent("previous", isDirectory: true))
         progress(.init(stage: "封装独立应用", detail: "独立应用已准备完成", fraction: 1, log: []))
         return url
+    }
+
+    static func s2ArmMacHostRelativePath(
+        in library: URL,
+        hostID: String,
+        fileManager: FileManager = .default
+    ) -> String? {
+        guard !hostID.isEmpty else { return nil }
+        // S2Arm layout v5+ stores Mac hosts under hosts/mac.noindex to prevent
+        // Spotlight/Launchpad indexing; older libraries use hosts/mac.
+        let candidates = [
+            "hosts/mac.noindex/\(hostID)/S2ArmGame.app",
+            "hosts/mac/\(hostID)/S2ArmGame.app"
+        ]
+        return candidates.first {
+            fileManager.fileExists(atPath: library.appendingPathComponent($0, isDirectory: true).path)
+        }
+    }
+
+    static func s2ArmLayoutVersion(in library: URL, hostRelativePath: String) -> Int {
+        let layoutURL = library.appendingPathComponent(".s2arm-layout.json")
+        if let data = try? Data(contentsOf: layoutURL),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let version = object["version"] as? Int {
+            return version
+        }
+        return hostRelativePath.hasPrefix("hosts/mac.noindex/") ? 5 : 4
     }
 
     private static func makeS2ArmRuntimePortable(in gameDirectory: URL) throws {
