@@ -29,7 +29,7 @@ struct GCRetro {
     bool pointer_pressed;
     int16_t audio[GC_RETRO_AUDIO_FRAMES * 2];
     size_t audio_read, audio_write;
-    bool initialized, loaded, hardware_requested;
+    bool initialized, loaded, hardware_requested, shutdown_requested;
     void (*run)(void), (*unload)(void), (*deinit)(void);
     size_t (*memory_size)(unsigned);
     void *(*memory_data)(unsigned);
@@ -96,6 +96,9 @@ static bool environment(unsigned command, void *arg) {
             active->format = *(const int *)arg;
             return true;
         case 11: return true; /* SET_INPUT_DESCRIPTORS */
+        case 13: /* RETRO_ENVIRONMENT_SHUTDOWN */
+            active->shutdown_requested = true;
+            return true;
         case 14: case (14 | 0x10000):  /* SET_HW_RENDER */
             active->hardware_requested = true;
             return false;
@@ -118,9 +121,21 @@ static bool environment(unsigned command, void *arg) {
                 {"pcsx2_rec_vu0", "disabled"},
                 {"pcsx2_rec_vu1", "disabled"},
                 {"citra_use_cpu_jit", "disabled"},
+                {"citra_use_fastinterp", "enabled"},
+                {"citra_is_new_3ds", "Old 3DS"},
+                {"citra_cpu_clock_percentage", "75"},
+                {"citra_audio_emulation", "hle"},
                 {"citra_use_shader_jit", "disabled"},
                 {"citra_use_hw_shader", "disabled"},
+                {"citra_shaders_accurate_mul", "disabled"},
+                {"citra_use_disk_shader_cache", "disabled"},
                 {"citra_graphics_api", "Software"},
+                {"citra_resolution_factor", "1"},
+                {"citra_texture_filter", "none"},
+                {"citra_texture_sampling", "NearestNeighbor"},
+                {"citra_render_3d", "off"},
+                {"citra_factor_3d", "0"},
+                {"citra_enable_motion", "disabled"},
                 {"ppsspp_cpu_core", "Interpreter"},
                 {"ppsspp_software_rendering", "enabled"},
                 {"ppsspp_backend", "Software"},
@@ -281,6 +296,8 @@ static int16_t input(unsigned port, unsigned device, unsigned index, unsigned id
 }
 
 const char *gc_retro_error(void) { return error; }
+const char *gc_retro_last_log_error(void) { return last_log_error; }
+bool gc_retro_shutdown_requested(GCRetro *s) { return s ? s->shutdown_requested : false; }
 
 GCRetro *gc_retro_open(const char *core, const char *rom, const char *system, const char *save) {
     if (active) { snprintf(error, sizeof(error), "已有游戏正在运行"); return NULL; }

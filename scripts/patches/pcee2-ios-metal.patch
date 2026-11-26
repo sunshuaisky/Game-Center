@@ -15,11 +15,66 @@ index 36df25e..189485a 100644
  endif()
  
  # CMake defaults the suffix for modules to .so on macOS but wx tells us that the
+diff --git a/common/Darwin/DarwinMisc.cpp b/common/Darwin/DarwinMisc.cpp
+index 39c587b..eb5a40f 100644
+--- a/common/Darwin/DarwinMisc.cpp
++++ b/common/Darwin/DarwinMisc.cpp
+@@ -430,11 +430,10 @@ void HostSys::EndCodeWrite()
+ #endif // ARCH_ARM64
+ 
+ // Mach exception ports are the better handler - they catch a fault before the
+-// signal machinery does - but tvOS marks the whole set unavailable:
+-// mach_msg_overwrite, task_get/set_exception_ports and thread_set_exception_ports
+-// are all API_UNAVAILABLE(tvos). There it takes the sigaction path below, which
+-// is the same one every non-Darwin platform uses.
+-#if !TARGET_OS_TV
++// signal machinery does - but tvOS marks the whole set unavailable and on iOS
++// replacing task-wide EXC_MASK_BAD_ACCESS ports interferes with host/app crash
++// handling. Use sigaction on embedded Darwin platforms.
++#if TARGET_OS_OSX
+ #define USE_MACH_EXCEPTION_PORTS
+ #endif
+ 
+@@ -714,9 +713,8 @@ bool PageFaultHandler::Install(Error* error)
+ 	}
+ #endif
+ 
+-	// Allow us to ignore faults when running under lldb. Not on tvOS, where
+-	// the call is unavailable - and where nothing is running under lldb.
+-#if !TARGET_OS_TV
++	// Allow us to ignore faults when running under lldb on macOS only.
++#if TARGET_OS_OSX
+ 	task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, MACH_PORT_NULL, EXCEPTION_DEFAULT, 0);
+ #endif
+ 
 diff --git a/common/Linux/LnxHostSys.cpp b/common/Linux/LnxHostSys.cpp
-index 056e50c..b55f72a 100644
+index 056e50c..6bd67ba 100644
 --- a/common/Linux/LnxHostSys.cpp
 +++ b/common/Linux/LnxHostSys.cpp
-@@ -113,20 +113,52 @@ void* HostSys::CreateSharedMemory(const char* name, size_t size)
+@@ -15,6 +15,7 @@
+ #include <mutex>
+ #include <sys/mman.h>
+ #ifdef __APPLE__
++#include <TargetConditionals.h>
+ #include <libkern/OSCacheControl.h>
+ #endif
+ #include <unistd.h>
+@@ -63,7 +64,13 @@ void HostSys::MemProtect(void* baseaddr, size_t size, const PageProtectionMode&
+ 
+ 	const u32 lnxmode = LinuxProt(mode);
+ 
+-	const int result = mprotect(baseaddr, size, lnxmode);
++	int result = mprotect(baseaddr, size, lnxmode);
++#if defined(__APPLE__)
++	// Stock iOS without JIT entitlement rejects PROT_EXEC on writable anonymous pages.
++	// ARM64 pcee2 runs interpreters only, so code memory does not execute JIT code.
++	if (result != 0 && (lnxmode & PROT_EXEC))
++		result = mprotect(baseaddr, size, lnxmode & ~PROT_EXEC);
++#endif
+ 	if (result != 0)
+ 		pxFail("mprotect() failed");
+ }
+@@ -113,20 +120,52 @@ void* HostSys::CreateSharedMemory(const char* name, size_t size)
  
  	return reinterpret_cast<void*>(static_cast<intptr_t>(fd));
  #else
@@ -77,6 +132,38 @@ index 056e50c..b55f72a 100644
  		return nullptr;
  	}
  
+@@ -215,11 +254,15 @@ std::unique_ptr<SharedMemoryMappingArea> SharedMemoryMappingArea::Create(size_t
+ 	pxAssertRel(Common::IsAlignedPow2(size, __pagesize), "Size is page aligned");
+ 
+ 	uint flags = MAP_ANONYMOUS | MAP_PRIVATE;
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !TARGET_OS_IPHONE
+ 	if (jit)
+ 		flags |= MAP_JIT;
+ #endif
+ 	void* alloc = mmap(nullptr, size, PROT_NONE, flags, -1, 0);
++#if defined(__APPLE__) && !TARGET_OS_IPHONE
++	if (alloc == MAP_FAILED && (flags & MAP_JIT))
++		alloc = mmap(nullptr, size, PROT_NONE, flags & ~MAP_JIT, -1, 0);
++#endif
+ 	if (alloc == MAP_FAILED)
+ 		return nullptr;
+ 
+@@ -244,7 +287,13 @@ u8* SharedMemoryMappingArea::Map(void* file_handle, size_t file_offset, void* ma
+ 		// macOS doesn't seem to allow MAP_JIT with MAP_FIXED
+ 		// So we do the MAP_JIT in the allocation, and just mprotect here
+ 		// Note that this will only work the first time for a given region
+-		if (mprotect(map_base, map_size, lnxmode) < 0)
++		int prot_res = mprotect(map_base, map_size, lnxmode);
++#if defined(__APPLE__)
++		// On stock iOS (no JIT entitlement), PROT_EXEC on anonymous RW memory fails with EACCES.
++		if (prot_res < 0 && (lnxmode & PROT_EXEC))
++			prot_res = mprotect(map_base, map_size, lnxmode & ~PROT_EXEC);
++#endif
++		if (prot_res < 0)
+ 			return nullptr;
+ 	}
+ 
 diff --git a/pcee2-libretro/CMakeLists.txt b/pcee2-libretro/CMakeLists.txt
 index 6c89130..de35269 100644
 --- a/pcee2-libretro/CMakeLists.txt
@@ -117,10 +204,18 @@ index 6c89130..de35269 100644
  	)
  	add_custom_target(pcee2_libretro_metallib DEPENDS ${core_metallib})
 diff --git a/pcee2-libretro/Libretro.cpp b/pcee2-libretro/Libretro.cpp
-index f641199..24a25ef 100644
+index f641199..86f6bc6 100644
 --- a/pcee2-libretro/Libretro.cpp
 +++ b/pcee2-libretro/Libretro.cpp
-@@ -517,6 +517,8 @@ RenderAPI LibretroGetRenderAPI()
+@@ -118,6 +118,7 @@ namespace LibretroHost
+ 	// COM init, ...). Games are booted in a request loop.
+ 	static std::thread s_cpu_thread;
+ 	static std::atomic_bool s_running{false};
++	static std::atomic_bool s_boot_failed{false};
+ 	static VMBootParameters s_boot_params;
+ 	// the content is a Namco System 246/256 game (.acgame)
+ 	static bool s_arcade_content = false;
+@@ -517,6 +518,8 @@ RenderAPI LibretroGetRenderAPI()
  	return RenderAPI::Vulkan;
  #elif defined(ENABLE_OPENGL)
  	return RenderAPI::OpenGL;
@@ -129,7 +224,7 @@ index f641199..24a25ef 100644
  #else
  	return RenderAPI::None;
  #endif
-@@ -1015,6 +1017,9 @@ void LibretroHost::ReadCoreOptions(bool startup)
+@@ -1015,6 +1018,9 @@ void LibretroHost::ReadCoreOptions(bool startup)
  #elif defined(ENABLE_OPENGL)
  	const char* renderer = get_option("pcsx2_renderer", "opengl");
  	GSRendererType renderer_type = GSRendererType::OGL;
@@ -139,7 +234,22 @@ index f641199..24a25ef 100644
  #else
  	const char* renderer = get_option("pcsx2_renderer", "software");
  	GSRendererType renderer_type = GSRendererType::SW;
-@@ -2394,6 +2399,8 @@ bool retro_load_game(const struct retro_game_info* game)
+@@ -1479,9 +1485,14 @@ void LibretroHost::CPUThreadMain()
+ 			}
+ 			else
+ 			{
++				s_boot_failed.store(true, std::memory_order_release);
+ 				Console.Error("VMManager::Initialize() failed.");
+ 			}
+ 		}
++		else
++		{
++			s_boot_failed.store(true, std::memory_order_release);
++		}
+ 
+ 		s_running.store(false, std::memory_order_release);
+ 
+@@ -2394,6 +2405,8 @@ bool retro_load_game(const struct retro_game_info* game)
  		const char* const fallback_renderer = "vulkan";
  #elif defined(ENABLE_OPENGL)
  		const char* const fallback_renderer = "opengl";
@@ -148,6 +258,28 @@ index f641199..24a25ef 100644
  #else
  		const char* const fallback_renderer = "software";
  #endif
+@@ -2630,6 +2643,7 @@ bool retro_load_game(const struct retro_game_info* game)
+ 	if (s_environ_cb && s_environ_cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &can_dupe) && !can_dupe)
+ 		Console.Warning("PCSX2: Frontend reports RETRO_ENVIRONMENT_GET_CAN_DUPE = false; explicit frame duplication may not work.");
+ 
++	s_boot_failed.store(false, std::memory_order_release);
+ 	s_running.store(true, std::memory_order_release);
+ 	{
+ 		std::unique_lock lock(s_session_mutex);
+@@ -3519,7 +3533,12 @@ void retro_run(void)
+ 
+ 	if (!s_running.load(std::memory_order_acquire))
+ 	{
+-		// VM is gone (failed boot or shutdown); present black
++		if (s_boot_failed.load(std::memory_order_acquire) && s_environ_cb)
++		{
++			s_environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, nullptr);
++			return;
++		}
++		// VM is gone (shutdown); present black
+ 		static std::vector<u32> black(DEFAULT_WIDTH * DEFAULT_HEIGHT, 0);
+ 		if (s_video_cb)
+ 			s_video_cb(black.data(), DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_WIDTH * sizeof(u32));
 diff --git a/pcsx2/CMakeLists.txt b/pcsx2/CMakeLists.txt
 index de55c46..4201aec 100644
 --- a/pcsx2/CMakeLists.txt

@@ -338,8 +338,6 @@ private final class RetroDisplayLinkProxy: NSObject {
 
 @MainActor
 private final class RetroSession: NSObject, ObservableObject {
-    private static let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
-
     @Published var hasFrame = false
     @Published var error: String?
     let screenView = RetroScreenUIView()
@@ -350,6 +348,8 @@ private final class RetroSession: NSObject, ObservableObject {
     private var axes: [Int16] = [0, 0, 0, 0]
     private var pointer: (Int16, Int16, Bool) = (0, 0, false)
     private var mirrorStickToDPad = false
+    private var maxFramesPerTick = 2
+    private var platformID = ""
 
     private var opened = false
     private var starting = false
@@ -372,7 +372,10 @@ private final class RetroSession: NSObject, ObservableObject {
             return
         }
         starting = true
+        platformID = rom.platform.id
         mirrorStickToDPad = ["gb", "gbc", "gba", "nds", "famicom", "superFamicom", "megaDrive"].contains(rom.platform.id)
+        // Heavy 3D cores run at most 1 emulated frame per vsync to avoid the multi-frame catch-up spiral of death.
+        maxFramesPerTick = ["threeDS", "ps2", "wii", "psp"].contains(rom.platform.id) ? 1 : 2
         GCController.startWirelessControllerDiscovery(completionHandler: nil)
         screenView.onPointer = { [weak self] x, y, pressed in
             self?.setPointer(x: x, y: y, pressed: pressed)
@@ -434,7 +437,8 @@ private final class RetroSession: NSObject, ObservableObject {
                     self.frameRate = fps
                     let proxy = RetroDisplayLinkProxy(target: self)
                     let link = CADisplayLink(target: proxy, selector: #selector(RetroDisplayLinkProxy.tick(_:)))
-                    link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+                    let preferred = Float(min(60, max(30, fps.rounded())))
+                    link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: preferred)
                     link.add(to: .main, forMode: .common)
                     self.displayLink = link
                     self.startAudio(sampleRate: rate)
@@ -557,11 +561,14 @@ private final class RetroSession: NSObject, ObservableObject {
         if nextFrame == 0 || link.timestamp - nextFrame > 0.15 { nextFrame = link.timestamp }
         if lastFrame == 0 { lastFrame = link.timestamp }
         var count = 0
-        while nextFrame <= link.timestamp + 0.001, count < 4 {
+        while nextFrame <= link.timestamp + 0.001, count < maxFramesPerTick {
             nextFrame += duration
             count += 1
         }
         guard count > 0 else { return }
+        if nextFrame < link.timestamp {
+            nextFrame = link.timestamp
+        }
         let save = link.timestamp - lastFrame > 10
         if save { lastFrame = link.timestamp }
 
@@ -581,14 +588,17 @@ private final class RetroSession: NSObject, ObservableObject {
                 guard let self else { return }
                 self.inFlight = false
                 guard self.opened, self.generation == token else { return }
+                if output.shutdownRequested {
+                    let detail = output.lastLogError.map { "（\($0)）" } ?? ""
+                    let hint = self.platformID == "ps2"
+                        ? "\n应用已内置 PS2 BIOS 并启用 Metal 渲染/解释器；如仍无法启动，请确认 ISO/CHD 文件完整。"
+                        : ""
+                    self.stop()
+                    self.error = "核心运行异常退出\(detail)\(hint)"
+                    return
+                }
                 self.enqueueAudio(output.audio)
-                guard let bytes = output.pixels, let provider = CGDataProvider(data: bytes as CFData) else { return }
-                let bitmap = CGBitmapInfo.byteOrder32Little.union(CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue))
-                if let cgImage = CGImage(
-                    width: output.width, height: output.height, bitsPerComponent: 8, bitsPerPixel: 32,
-                    bytesPerRow: output.width * 4, space: Self.rgbColorSpace, bitmapInfo: bitmap,
-                    provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
-                ) {
+                if let cgImage = output.image {
                     self.screenView.update(image: cgImage)
                     if !self.hasFrame { self.hasFrame = true }
                 }
@@ -639,7 +649,7 @@ private final class RetroSession: NSObject, ObservableObject {
 
     private func enqueueAudio(_ samples: [Int16]) {
         let frames = samples.count / 2
-        guard frames > 0, let player, let format = audioFormat, audioFrames < Int(format.sampleRate / 8),
+        guard frames > 0, let player, let format = audioFormat, audioFrames < Int(format.sampleRate / 5),
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)),
               let channels = buffer.floatChannelData else { return }
         buffer.frameLength = AVAudioFrameCount(frames)
