@@ -143,7 +143,7 @@ public enum GameSaveLayout {
         guard values.isSymbolicLink != true else { throw Failure("旧存档内部包含目录别名，已保留原数据，请检查迁移备份。") }
         if values.isDirectory == true {
             try fm.createDirectory(at: target, withIntermediateDirectories: true)
-            for file in try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) where file.lastPathComponent != ".DS_Store" {
+            for file in try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) where file.lastPathComponent != ".DS_Store" {
                 try merge(file, into: target.appendingPathComponent(file.lastPathComponent))
             }
         } else if !fm.fileExists(atPath: target.path) {

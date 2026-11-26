@@ -32,14 +32,18 @@ actor GameMetadataService {
     init(session: URLSession? = nil, trace: @escaping @Sendable (String) -> Void = { _ in }) {
         self.session = session ?? Self.networkSession; self.trace = trace
     }
-    private var artworkCatalogs: [GameMetadataPlatform: [String]] = [:]
-    private var screenshotCatalogs: [GameMetadataPlatform: [String]] = [:]
+    private var artworkCatalogs: [GameMetadataPlatform: [(filename: String, normalized: String)]] = [:]
+    private var artworkCatalogTasks: [GameMetadataPlatform: Task<[(filename: String, normalized: String)], Never>] = [:]
     // Base URL each cached filename resolves against — the libretro index or
     // its jsDelivr mirror, whichever produced the catalog.
     private var artworkCatalogSources: [GameMetadataPlatform: URL] = [:]
-    private var screenshotCatalogSources: [GameMetadataPlatform: URL] = [:]
-    private var gameTDBCatalogs: [String: [(id: String, title: String)]] = [:]
-    private var switchCatalogs: [String: [(id: String, title: String)]] = [:]
+    private var gameTDBCatalogs: [String: [(id: String, title: String, normalized: String)]] = [:]
+    private var gameTDBCatalogTasks: [String: Task<[(id: String, title: String, normalized: String)], Never>] = [:]
+    private var switchCatalogs: [String: [(id: String, title: String, normalized: String)]] = [:]
+    private var switchCatalogTasks: [String: Task<[(id: String, title: String, normalized: String)], Never>] = [:]
+
+    private static let boxartHrefRegex = try! NSRegularExpression(pattern: #"href=[\"']([^\"']+\.png)[\"']"#, options: [.caseInsensitive])
+    private static let whitespaceRegex = try! NSRegularExpression(pattern: #"\s+"#)
 
     func lookup(title: String, platform: GameMetadataPlatform, language: String, sourceURL: URL?, titleID explicitTitleID: String? = nil, onText: @escaping @Sendable (GameMetadataResult) async -> Void = { _ in }, onBackdrop: @escaping @Sendable (Data) async -> Void = { _ in }) async -> GameMetadataResult {
         let switch2Metadata = platform == .switchConsole
@@ -130,9 +134,12 @@ actor GameMetadataService {
         if let lbCover = launchBox?.cover { gameCoverCandidates.append(lbCover) }
         if let steamCover = steamResult?.cover { gameCoverCandidates.append(steamCover) }
         if let icon = switch2Metadata?.icon { gameCoverCandidates.append(icon) }
+        var knownArtwork: DownloadedArtwork?
         if let artworkURL = knownSwitchMetadata?.artworkURL,
            let data = try? await download(artworkURL) {
-            gameCoverCandidates.append(DownloadedArtwork(data: data, fileExtension: "jpg", sourceURL: artworkURL.absoluteString))
+            let downloaded = DownloadedArtwork(data: data, fileExtension: "jpg", sourceURL: artworkURL.absoluteString)
+            knownArtwork = downloaded
+            gameCoverCandidates.append(downloaded)
         }
 
         if gameCoverCandidates.isEmpty {
@@ -178,13 +185,21 @@ actor GameMetadataService {
                 ))
             }
         }
-        let selectedArtwork = (gameCoverCandidates.isEmpty ? fallbackCoverCandidates : gameCoverCandidates)
-            .max { pixelArea($0.data) < pixelArea($1.data) }
+        let coverPool = gameCoverCandidates.isEmpty ? fallbackCoverCandidates : gameCoverCandidates
+        let selectedArtwork = coverPool
+            .map { (artwork: $0, area: pixelArea($0.data)) }
+            .max { $0.area < $1.area }?.artwork
 
         // 3. Select true HD 16:9 backdrop (never stretch tiny 400x240 emulator screenshots).
         let knownBackdrop: DownloadedArtwork?
-        if let url = knownSwitchMetadata?.backdropURL, let data = try? await download(url) {
-            knownBackdrop = DownloadedArtwork(data: data, fileExtension: "jpg", sourceURL: url.absoluteString)
+        if let url = knownSwitchMetadata?.backdropURL {
+            if let knownArtwork, knownSwitchMetadata?.artworkURL == url {
+                knownBackdrop = knownArtwork
+            } else if let data = try? await download(url) {
+                knownBackdrop = DownloadedArtwork(data: data, fileExtension: "jpg", sourceURL: url.absoluteString)
+            } else {
+                knownBackdrop = nil
+            }
         } else {
             knownBackdrop = nil
         }
@@ -204,7 +219,7 @@ actor GameMetadataService {
         return GameMetadataResult(
             title: resolvedTitle,
             synopsis: resolvedSynopsis,
-            metadataSourceURL: wiki?.pageURL ?? codeMetadata?.sourceURL ?? knownSwitchMetadata?.sourceURL,
+            metadataSourceURL: wiki?.pageURL ?? baike?.pageURL.absoluteString ?? codeMetadata?.sourceURL ?? knownSwitchMetadata?.sourceURL,
             artworkData: selectedArtwork?.data,
             artworkExtension: selectedArtwork?.fileExtension,
             artworkSourceURL: selectedArtwork?.sourceURL,
@@ -585,6 +600,14 @@ actor GameMetadataService {
 
     /// Maps common Chinese ROM hack / fan-translation names to canonical Chinese & English game titles.
     private static func chineseFranchiseHint(for text: String, platform: GameMetadataPlatform) -> (zh: String, en: String)? {
+        if platform == .gba {
+            if text.contains("红宝石") && !text.contains("欧米伽") {
+                return ("宝可梦 红宝石", "Pokemon Ruby Version")
+            }
+            if text.contains("蓝宝石") && !text.contains("阿尔法") {
+                return ("宝可梦 蓝宝石", "Pokemon Sapphire Version")
+            }
+        }
         let rules: [(patterns: [String], zh: String, en: String)] = [
             (["欧米伽红宝石", "红宝石"], "宝可梦 欧米伽红宝石", "Pokemon Omega Ruby"),
             (["阿尔法蓝宝石", "蓝宝石"], "宝可梦 阿尔法蓝宝石", "Pokemon Alpha Sapphire"),
@@ -607,12 +630,6 @@ actor GameMetadataService {
             // Require either a specific single subtitle match or all listed keywords when multi-word.
             if rule.patterns.count == 1 {
                 if text.contains(rule.patterns[0]) {
-                    if rule.patterns[0] == "红宝石" && platform == .gba {
-                        return ("宝可梦 红宝石", "Pokemon Ruby Version")
-                    }
-                    if rule.patterns[0] == "蓝宝石" && platform == .gba {
-                        return ("宝可梦 蓝宝石", "Pokemon Sapphire Version")
-                    }
                     return (rule.zh, rule.en)
                 }
             } else {
@@ -631,39 +648,75 @@ actor GameMetadataService {
         return nil
     }
 
+    private static func isValidGameTDBID(_ id: String, platform: GameMetadataPlatform) -> Bool {
+        let bytes = Array(id.utf8)
+        func isAsciiAlnum(_ b: UInt8) -> Bool {
+            (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+        }
+        func isAsciiAlpha(_ b: UInt8) -> Bool {
+            (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+        }
+        func isAsciiDigit(_ b: UInt8) -> Bool {
+            b >= 48 && b <= 57
+        }
+        switch platform {
+        case .nds, .threeDS:
+            return bytes.count == 4 && bytes.allSatisfy(isAsciiAlnum)
+        case .wii, .wiiu:
+            return (4...6).contains(bytes.count) && bytes.allSatisfy(isAsciiAlnum)
+        case .ps3:
+            return bytes.count == 9 && bytes.prefix(4).allSatisfy(isAsciiAlpha) && bytes.dropFirst(4).allSatisfy(isAsciiDigit)
+        default:
+            return false
+        }
+    }
+
     private func gameTDBBoxart(for title: String, platform: GameMetadataPlatform, language: String) async -> DownloadedArtwork? {
-        let tdbInfo: (db: String, artPrefix: String, idPattern: String)? = {
+        let tdbInfo: (db: String, artPrefix: String)? = {
             switch platform {
-            case .nds: return ("dstdb", "ds", #"^[A-Za-z0-9]{4}$"#)
-            case .threeDS: return ("3dstdb", "3ds", #"^[A-Za-z0-9]{4}$"#)
-            case .wii: return ("wiitdb", "wii", #"^[A-Za-z0-9]{4,6}$"#)
-            case .wiiu: return ("wiiutdb", "wiiu", #"^[A-Za-z0-9]{4,6}$"#)
-            case .ps3: return ("ps3tdb", "ps3", #"^[A-Za-z]{4}\d{5}$"#)
+            case .nds: return ("dstdb", "ds")
+            case .threeDS: return ("3dstdb", "3ds")
+            case .wii: return ("wiitdb", "wii")
+            case .wiiu: return ("wiiutdb", "wiiu")
+            case .ps3: return ("ps3tdb", "ps3")
             default: return nil
             }
         }()
         guard let tdbInfo else { return nil }
         let cacheKey = "\(tdbInfo.db)-EN"
-        let entries: [(id: String, title: String)]
+        let entries: [(id: String, title: String, normalized: String)]
         if let cached = gameTDBCatalogs[cacheKey] {
             entries = cached
         } else {
-            guard let url = URL(string: "https://www.gametdb.com/\(tdbInfo.db).txt?LANG=EN"),
-                  let data = try? await download(url),
-                  let text = String(data: data, encoding: .utf8) else { return nil }
-            entries = text.split(whereSeparator: \.isNewline).compactMap { line in
-                guard let sep = line.range(of: " = ") else { return nil }
-                let id = String(line[..<sep.lowerBound]).trimmingCharacters(in: .whitespaces)
-                let name = String(line[sep.upperBound...]).trimmingCharacters(in: .whitespaces)
-                guard id.range(of: tdbInfo.idPattern, options: .regularExpression) != nil, !name.isEmpty else { return nil }
-                return (id: id, title: name)
+            let task: Task<[(id: String, title: String, normalized: String)], Never>
+            if let existing = gameTDBCatalogTasks[cacheKey] {
+                task = existing
+            } else {
+                let db = tdbInfo.db
+                task = Task { [weak self] in
+                    guard let self,
+                          let url = URL(string: "https://www.gametdb.com/\(db).txt?LANG=EN"),
+                          let data = try? await self.download(url),
+                          let text = String(data: data, encoding: .utf8) else { return [] }
+                    return text.split(whereSeparator: \.isNewline).compactMap { line in
+                        guard let sep = line.range(of: " = ") else { return nil }
+                        let id = String(line[..<sep.lowerBound]).trimmingCharacters(in: .whitespaces)
+                        let name = String(line[sep.upperBound...]).trimmingCharacters(in: .whitespaces)
+                        guard Self.isValidGameTDBID(id, platform: platform), !name.isEmpty else { return nil }
+                        return (id: id, title: name, normalized: GameTitleMatcher.normalize(name))
+                    }
+                }
+                gameTDBCatalogTasks[cacheKey] = task
             }
+            entries = await task.value
+            gameTDBCatalogTasks[cacheKey] = nil
             guard !entries.isEmpty else { return nil }
             gameTDBCatalogs[cacheKey] = entries
         }
 
+        let normalizedQuery = normalize(title)
         let candidate = entries
-            .map { (entry: $0, score: matchScore(title, $0.title)) }
+            .map { (entry: $0, score: GameTitleMatcher.scoreNormalized(normalizedQuery, $0.normalized)) }
             .max { $0.score < $1.score }
         guard let candidate, candidate.score >= max(0.78, minimumMatchScore(for: title)) else { return nil }
 
@@ -849,24 +902,16 @@ actor GameMetadataService {
             guard let data, data.count == count else { return nil }
             return data
         }
-        func littleEndian<T: FixedWidthInteger>(_ data: Data, at offset: Int, as: T.Type) -> T? {
-            let size = MemoryLayout<T>.size
-            guard offset >= 0, offset + size <= data.count else { return nil }
-            var value: T = 0
-            for byte in 0..<size { value |= T(data[offset + byte]) << (byte * 8) }
-            return value
-        }
-
         guard let header = read(0, 128), header.prefix(3) == Data("NUP".utf8),
-              let tocOffset = littleEndian(header, at: 8, as: UInt64.self),
-              let tocSize = littleEndian(header, at: 16, as: UInt64.self),
-              let declaredSize = littleEndian(header, at: 64, as: UInt64.self),
-              let packageCount = littleEndian(header, at: 72, as: UInt32.self),
+              let tocOffset = Self.readLittleEndian(header, at: 8, as: UInt64.self),
+              let tocSize = Self.readLittleEndian(header, at: 16, as: UInt64.self),
+              let declaredSize = Self.readLittleEndian(header, at: 64, as: UInt64.self),
+              let packageCount = Self.readLittleEndian(header, at: 72, as: UInt32.self),
               declaredSize == fileSize, packageCount > 0, packageCount <= 2048,
               tocOffset <= fileSize, tocSize <= fileSize - tocOffset,
               UInt64(48) + UInt64(packageCount) * 64 <= tocSize,
               let tocHeader = read(tocOffset, 48), tocHeader.prefix(4) == Data([0x54, 0x4f, 0x43, 0x01]),
-              littleEndian(tocHeader, at: 4, as: UInt32.self) == packageCount,
+              Self.readLittleEndian(tocHeader, at: 4, as: UInt32.self) == packageCount,
               let packageTable = read(tocOffset + 48, Int(packageCount) * 64) else { return nil }
 
         struct PackageRecord {
@@ -878,10 +923,10 @@ actor GameMetadataService {
         var packages: [PackageRecord] = []
         for index in 0..<Int(packageCount) {
             let offset = index * 64
-            guard let titleID = littleEndian(packageTable, at: offset, as: UInt64.self),
-                  let kind = littleEndian(packageTable, at: offset + 24, as: UInt8.self),
-                  let metadataOffset = littleEndian(packageTable, at: offset + 28, as: UInt64.self),
-                  let metadataSize = littleEndian(packageTable, at: offset + 36, as: UInt32.self),
+            guard let titleID = Self.readLittleEndian(packageTable, at: offset, as: UInt64.self),
+                  let kind = Self.readLittleEndian(packageTable, at: offset + 24, as: UInt8.self),
+                  let metadataOffset = Self.readLittleEndian(packageTable, at: offset + 28, as: UInt64.self),
+                  let metadataSize = Self.readLittleEndian(packageTable, at: offset + 36, as: UInt32.self),
                   metadataSize <= 2 * 1024 * 1024 else { return nil }
             packages.append(PackageRecord(titleID: titleID, kind: kind, metadataOffset: metadataOffset, metadataSize: metadataSize))
         }
@@ -901,8 +946,8 @@ actor GameMetadataService {
             var values: [UInt16: Data] = [:]
             var cursor = 0
             while cursor + 8 <= metadata.count {
-                guard let type = littleEndian(metadata, at: cursor, as: UInt16.self),
-                      let length = littleEndian(metadata, at: cursor + 4, as: UInt32.self) else { break }
+                guard let type = Self.readLittleEndian(metadata, at: cursor, as: UInt16.self),
+                      let length = Self.readLittleEndian(metadata, at: cursor + 4, as: UInt32.self) else { break }
                 cursor += 8
                 let payloadLength = Int(length)
                 guard payloadLength <= metadata.count - cursor else { break }
@@ -1333,16 +1378,15 @@ actor GameMetadataService {
         if let data = try? await download(url) {
             return DownloadedArtwork(data: data, fileExtension: url.pathExtension.isEmpty ? "png" : url.pathExtension, sourceURL: url.absoluteString)
         }
-        guard let mirror = mirrorArtworkURL(for: encoded, platform: platform, snaps: false),
+        guard let mirror = mirrorArtworkURL(for: encoded, platform: platform),
               let data = try? await download(mirror) else { return nil }
         return DownloadedArtwork(data: data, fileExtension: mirror.pathExtension.isEmpty ? "png" : mirror.pathExtension, sourceURL: mirror.absoluteString)
     }
 
-    private func mirrorArtworkURL(for encodedFilename: String, platform: GameMetadataPlatform, snaps: Bool) -> URL? {
+    private func mirrorArtworkURL(for encodedFilename: String, platform: GameMetadataPlatform) -> URL? {
         guard let systemFolder = retroSystemFolder(for: platform) else { return nil }
         let repository = systemFolder.replacingOccurrences(of: " ", with: "_")
-        let directory = snaps ? "Named_Snaps" : "Named_Boxarts"
-        return URL(string: "https://raw.githubusercontent.com/libretro-thumbnails/\(repository)/master/\(directory)/\(encodedFilename)")
+        return URL(string: "https://raw.githubusercontent.com/libretro-thumbnails/\(repository)/master/Named_Boxarts/\(encodedFilename)")
     }
 
     private func switchBoxartData(for title: String, language: String) async -> DownloadedArtwork? {
@@ -1354,26 +1398,40 @@ actor GameMetadataService {
         default: catalogLanguage = "EN"; coverLanguage = "EN"
         }
 
-        let entries: [(id: String, title: String)]
+        let entries: [(id: String, title: String, normalized: String)]
         if let cached = switchCatalogs[catalogLanguage] {
             entries = cached
         } else {
-            guard let url = URL(string: "https://www.gametdb.com/switchtdb.txt?LANG=\(catalogLanguage)"),
-                  let data = try? await download(url),
-                  let text = String(data: data, encoding: .utf8) else { return nil }
-            entries = text.split(whereSeparator: \.isNewline).compactMap { line in
-                guard let separator = line.range(of: " = ") else { return nil }
-                let id = String(line[..<separator.lowerBound]).trimmingCharacters(in: .whitespaces)
-                let name = String(line[separator.upperBound...]).trimmingCharacters(in: .whitespaces)
-                guard id.range(of: #"^[A-Za-z0-9]{5}$"#, options: .regularExpression) != nil, !name.isEmpty else { return nil }
-                return (id: id, title: name)
+            let task: Task<[(id: String, title: String, normalized: String)], Never>
+            if let existing = switchCatalogTasks[catalogLanguage] {
+                task = existing
+            } else {
+                task = Task { [weak self] in
+                    guard let self,
+                          let url = URL(string: "https://www.gametdb.com/switchtdb.txt?LANG=\(catalogLanguage)"),
+                          let data = try? await self.download(url),
+                          let text = String(data: data, encoding: .utf8) else { return [] }
+                    return text.split(whereSeparator: \.isNewline).compactMap { line in
+                        guard let separator = line.range(of: " = ") else { return nil }
+                        let id = String(line[..<separator.lowerBound]).trimmingCharacters(in: .whitespaces)
+                        let name = String(line[separator.upperBound...]).trimmingCharacters(in: .whitespaces)
+                        guard id.utf8.count == 5,
+                              id.utf8.allSatisfy({ ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122) }),
+                              !name.isEmpty else { return nil }
+                        return (id: id, title: name, normalized: GameTitleMatcher.normalize(name))
+                    }
+                }
+                switchCatalogTasks[catalogLanguage] = task
             }
+            entries = await task.value
+            switchCatalogTasks[catalogLanguage] = nil
             guard !entries.isEmpty else { return nil }
             switchCatalogs[catalogLanguage] = entries
         }
 
+        let normalizedQuery = normalize(title)
         let candidate = entries
-            .map { (entry: $0, score: matchScore(title, $0.title)) }
+            .map { (entry: $0, score: GameTitleMatcher.scoreNormalized(normalizedQuery, $0.normalized)) }
             .max { $0.score < $1.score }
         guard let candidate, candidate.score >= max(0.82, minimumMatchScore(for: title)) else { return nil }
 
@@ -1392,17 +1450,30 @@ actor GameMetadataService {
     }
 
     private func closestBoxart(to title: String, platform: GameMetadataPlatform) async -> (filename: String, source: URL)? {
-        let filenames: [String]
+        let entries: [(filename: String, normalized: String)]
         if let cached = artworkCatalogs[platform] {
-            filenames = cached
+            entries = cached
         } else {
-            filenames = await boxartCatalog(platform: platform, snaps: false)
-            if !filenames.isEmpty { artworkCatalogs[platform] = filenames }
+            let task: Task<[(filename: String, normalized: String)], Never>
+            if let existing = artworkCatalogTasks[platform] {
+                task = existing
+            } else {
+                task = Task { [weak self] in
+                    guard let self else { return [] }
+                    let filenames = await self.boxartCatalog(platform: platform)
+                    return filenames.map { ($0, GameTitleMatcher.normalize($0)) }
+                }
+                artworkCatalogTasks[platform] = task
+            }
+            entries = await task.value
+            artworkCatalogTasks[platform] = nil
+            if !entries.isEmpty { artworkCatalogs[platform] = entries }
         }
         let source = artworkCatalogSources[platform] ?? boxartIndexURL(for: platform)
 
-        let match = filenames
-            .map { (filename: $0, score: matchScore(title, $0)) }
+        let normalizedQuery = normalize(title)
+        let match = entries
+            .map { (filename: $0.filename, score: GameTitleMatcher.scoreNormalized(normalizedQuery, $0.normalized)) }
             .max { $0.score < $1.score }
         guard let match, match.score >= minimumMatchScore(for: title),
               let source else { return nil }
@@ -1410,26 +1481,21 @@ actor GameMetadataService {
     }
 
     /// The libretro thumbnail index is unreachable from some networks. Fall
-    /// back to the GitHub mirror through jsDelivr, which serves the same
-    /// Named_Boxarts / Named_Snaps trees one system per repository.
-    private func boxartCatalog(platform: GameMetadataPlatform, snaps: Bool) async -> [String] {
-        if let indexURL = snaps ? screenshotIndexURL(for: platform) : boxartIndexURL(for: platform),
+    /// back to the GitHub mirror, which serves the same Named_Boxarts trees
+    /// one system per repository.
+    private func boxartCatalog(platform: GameMetadataPlatform) async -> [String] {
+        if let indexURL = boxartIndexURL(for: platform),
            let data = try? await download(indexURL),
            let html = String(data: data, encoding: .utf8) {
             let filenames = boxartFilenames(in: html)
             if !filenames.isEmpty {
-                if snaps { screenshotCatalogSources[platform] = indexURL }
-                else { artworkCatalogSources[platform] = indexURL }
+                artworkCatalogSources[platform] = indexURL
                 return filenames
             }
         }
         guard let systemFolder = retroSystemFolder(for: platform) else { return [] }
         let repository = systemFolder.replacingOccurrences(of: " ", with: "_")
-        let directory = snaps ? "Named_Snaps" : "Named_Boxarts"
-        // The GitHub mirror keeps one system per repository. Walk the root tree
-        // to the artwork directory, then list its blobs; files come straight
-        // from raw.githubusercontent.com — jsDelivr resolves these tagless
-        // repositories unreliably.
+        let directory = "Named_Boxarts"
         let trees = "https://api.github.com/repos/libretro-thumbnails/\(repository)/git/trees"
         guard let rootURL = URL(string: trees + "/master"),
               let rootData = try? await download(rootURL),
@@ -1445,45 +1511,14 @@ actor GameMetadataService {
             return path
         }
         if !filenames.isEmpty {
-            let base = URL(string: "https://raw.githubusercontent.com/libretro-thumbnails/\(repository)/master/\(directory)/")
-            if snaps { screenshotCatalogSources[platform] = base } else { artworkCatalogSources[platform] = base }
+            artworkCatalogSources[platform] = URL(string: "https://raw.githubusercontent.com/libretro-thumbnails/\(repository)/master/\(directory)/")
         }
         return filenames
     }
 
-    private func retroScreenshot(for title: String, platform: GameMetadataPlatform) async -> DownloadedArtwork? {
-        guard platform.isRetroConsole else { return nil }
-        let filenames: [String]
-        if let cached = screenshotCatalogs[platform] {
-            filenames = cached
-        } else {
-            filenames = await boxartCatalog(platform: platform, snaps: true)
-            if !filenames.isEmpty { screenshotCatalogs[platform] = filenames }
-        }
-        let source = screenshotCatalogSources[platform] ?? screenshotIndexURL(for: platform)
-
-        let match = filenames
-            .map { (filename: $0, score: matchScore(title, $0)) }
-            .max { $0.score < $1.score }
-        guard let match, match.score >= minimumMatchScore(for: title),
-              let source,
-              let encoded = match.filename.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-              let url = URL(string: encoded, relativeTo: source)?.absoluteURL else { return nil }
-        var data = try? await download(url)
-        if data == nil, let mirror = mirrorArtworkURL(for: encoded, platform: platform, snaps: true) {
-            data = try? await download(mirror)
-        }
-        guard let data, aspectRatio(data) >= 1.3 else { return nil }
-        return DownloadedArtwork(data: data, fileExtension: url.pathExtension.isEmpty ? "png" : url.pathExtension, sourceURL: url.absoluteString)
-    }
-
     private func boxartFilenames(in html: String) -> [String] {
-        guard let regex = try? NSRegularExpression(
-            pattern: #"href=[\"']([^\"']+\.png)[\"']"#,
-            options: [.caseInsensitive]
-        ) else { return [] }
         let range = NSRange(html.startIndex..., in: html)
-        return regex.matches(in: html, range: range).compactMap { match in
+        return Self.boxartHrefRegex.matches(in: html, range: range).compactMap { match in
             guard let matchRange = Range(match.range(at: 1), in: html) else { return nil }
             let link = String(html[matchRange])
             guard let filename = URL(string: link)?.lastPathComponent.removingPercentEncoding,
@@ -1520,12 +1555,6 @@ actor GameMetadataService {
         return URL(string: "https://thumbnails.libretro.com/\(encodedFolder)/Named_Boxarts/")
     }
 
-    private func screenshotIndexURL(for platform: GameMetadataPlatform) -> URL? {
-        guard let systemFolder = retroSystemFolder(for: platform) else { return nil }
-        let encodedFolder = systemFolder.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? systemFolder
-        return URL(string: "https://thumbnails.libretro.com/\(encodedFolder)/Named_Snaps/")
-    }
-
     private func download(_ url: URL, userAgent: String? = nil) async throws -> Data {
         var request = URLRequest(url: url)
         request.timeoutInterval = 18
@@ -1558,23 +1587,15 @@ actor GameMetadataService {
         return dims.width * dims.height
     }
 
-    private func aspectRatio(_ data: Data) -> Double {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let width = properties[kCGImagePropertyPixelWidth] as? Int,
-              let height = properties[kCGImagePropertyPixelHeight] as? Int,
-              height > 0 else { return 0 }
-        return Double(width) / Double(height)
-    }
-
     private func normalize(_ value: String) -> String { GameTitleMatcher.normalize(value) }
     private func matchScore(_ source: String, _ candidate: String) -> Double { GameTitleMatcher.score(source, candidate) }
     private func minimumMatchScore(for title: String) -> Double { GameTitleMatcher.threshold(title) }
     private func minimumWikipediaMatchScore(for title: String) -> Double { GameTitleMatcher.threshold(title, wikipedia: true) }
 
     private func cleanSynopsis(_ synopsis: String) -> String {
-        let flattened = synopsis.replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        let singleLine = synopsis.replacingOccurrences(of: "\n", with: " ")
+        let range = NSRange(location: 0, length: (singleLine as NSString).length)
+        let flattened = Self.whitespaceRegex.stringByReplacingMatches(in: singleLine, range: range, withTemplate: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard flattened.count > 650 else { return flattened }
         let limit = flattened.index(flattened.startIndex, offsetBy: 650)

@@ -9,12 +9,13 @@ trap 'rm -rf -- "$work"' EXIT
 app="$work/Payload/Game Center.app"
 mkdir -p "$app/Frameworks"
 cp "$root/Mobile/Info.plist" "$app/Info.plist"
-ditto "$root/Mobile/Museum" "$app/Museum"
 cp "$request/platforms.json" "$request/catalog.json" "$app/"
 /usr/bin/python3 - "$request/catalog.json" "$app" <<'PY'
-import json, pathlib, subprocess, sys, uuid
+from concurrent.futures import ThreadPoolExecutor
+import json, os, pathlib, subprocess, sys, uuid
 artwork = pathlib.Path.home() / 'Library/Application Support/Game Center/Artwork'
 destination = pathlib.Path(sys.argv[2]) / 'Covers'
+jobs = []
 for item in json.loads(pathlib.Path(sys.argv[1]).read_bytes()):
     try:
         key = str(uuid.UUID(item['id'])).upper()
@@ -22,9 +23,15 @@ for item in json.loads(pathlib.Path(sys.argv[1]).read_bytes()):
         continue
     source = artwork / (key + '.jpg')
     if source.is_file():
-        destination.mkdir(exist_ok=True)
-        subprocess.run(['/usr/bin/sips', '-Z', '512', '-s', 'format', 'jpeg', str(source),
-                        '--out', str(destination / (key + '.jpg'))], stdout=subprocess.DEVNULL)
+        jobs.append((source, destination / (key + '.jpg')))
+if jobs:
+    destination.mkdir(exist_ok=True)
+    def resize(pair):
+        src, dst = pair
+        subprocess.run(['/usr/bin/sips', '-Z', '512', '-s', 'format', 'jpeg', str(src), '--out', str(dst)],
+                       stdout=subprocess.DEVNULL)
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as pool:
+        list(pool.map(resize, jobs))
 PY
 
 sdk="${GAME_CENTER_IOS_SDK:-iphoneos}"
@@ -86,7 +93,7 @@ xcrun --sdk "$sdk" clang -target "$target" -isysroot "$sdk_path" -fobjc-arc -O2 
   -c "$root/Mobile/S2ArmRuntime.m" -o "$work/S2ArmRuntime.o"
 xcrun --sdk "$sdk" swiftc -target "$target" -sdk "$sdk_path" -O -parse-as-library "${swift_flags[@]}" \
   -import-objc-header "$work/GameCenter-Bridging.h" \
-  "$root/Sources/GameCenter/GameMetadataPlatform.swift" "$root/Sources/GameCenter/GameTitleMatcher.swift" "$root/Sources/GameCenter/GameMetadataService.swift" "$root/Sources/GameCenterSaveSupport/GameSaveLayout.swift" "$root/Sources/GameCenter/MobileLibraryFormat.swift" "$root/Sources/GameCenter/CloudSaveSync.swift" "$root/Sources/GameCenter/CloudSaveSyncView.swift" "$root/Sources/GameCenter/CloudSaveDirectorySync.swift" "$root/Sources/GameCenter/CloudSaveLocation.swift" "$root"/Mobile/*.swift "$work/RetroCore.o" "$work/NXShellMain.o" "$work/S2ArmRuntime.o" \
+  "$root/Sources/GameCenter/GameMetadataPlatform.swift" "$root/Sources/GameCenter/GameTitleMatcher.swift" "$root/Sources/GameCenter/GameMetadataService.swift" "$root/Sources/GameCenterSaveSupport/GameSaveLayout.swift" "$root/Sources/GameCenter/MobileLibraryFormat.swift" "$root/Sources/GameCenter/CloudSaveSyncView.swift" "$root/Sources/GameCenter/CloudSaveDirectorySync.swift" "$root/Sources/GameCenter/CloudSaveLocation.swift" "$root"/Mobile/*.swift "$work/RetroCore.o" "$work/NXShellMain.o" "$work/S2ArmRuntime.o" \
   -o "$binary"
 
 printf 'GC_MOBILE_STAGE\t4\t正在准备 iOS 模拟器核心，首次生成需要下载\n'
@@ -252,9 +259,14 @@ PY
     app_sign_args=(--entitlements "$work/entitlements.plist")
   fi
 fi
+sign_pids=()
 for framework in "$app"/Frameworks/*.framework; do
   [[ -d "$framework" ]] || continue
-  codesign "${sign_args[@]}" "$framework"
+  codesign "${sign_args[@]}" "$framework" &
+  sign_pids+=($!)
+done
+for pid in "${sign_pids[@]}"; do
+  wait "$pid"
 done
 if [[ ${#app_sign_args[@]} -gt 0 ]]; then
   codesign "${sign_args[@]}" "${app_sign_args[@]}" "$app"
@@ -264,6 +276,7 @@ fi
 codesign --verify --deep --strict "$app"
 printf 'GC_MOBILE_STAGE\t6\t正在压缩并写入输出目录\n'
 if [[ "$sdk" == iphonesimulator ]]; then
+  rm -rf "$output"
   ditto "$app" "$output"
 else
   output_stage="$(mktemp "$(dirname "$output")/.game-center-ipa.XXXXXX")"

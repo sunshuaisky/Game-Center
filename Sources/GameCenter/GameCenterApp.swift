@@ -105,13 +105,29 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         }
     }
 
+    private static let bundleCacheLock = NSLock()
+    private static var bundleCache: [String: Bundle] = [:]
+
+    private static func bundle(for identifier: String) -> Bundle? {
+        bundleCacheLock.lock()
+        if let cached = bundleCache[identifier] {
+            bundleCacheLock.unlock()
+            return cached
+        }
+        bundleCacheLock.unlock()
+        guard let url = Bundle.main.url(forResource: identifier, withExtension: "lproj"),
+              let loaded = Bundle(url: url) else { return nil }
+        bundleCacheLock.lock()
+        bundleCache[identifier] = loaded
+        bundleCacheLock.unlock()
+        return loaded
+    }
+
     static func localized(_ key: String) -> String {
         let selected = AppLanguage(
             rawValue: UserDefaults.standard.string(forKey: "appLanguage") ?? AppLanguage.system.rawValue
         ) ?? .system
-        let identifier = selected.localeIdentifier
-        guard let url = Bundle.main.url(forResource: identifier, withExtension: "lproj"),
-              let bundle = Bundle(url: url) else { return key }
+        guard let bundle = bundle(for: selected.localeIdentifier) else { return key }
         return bundle.localizedString(forKey: key, value: key, table: nil)
     }
 

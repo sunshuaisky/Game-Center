@@ -24,11 +24,13 @@ typedef void (*S2AEnableCheatsFunction)(void);
 }
 
 - (NSURL *)enabledURL {
+    if (self.directory.length == 0) return nil;
     return [NSURL fileURLWithPath:[self.directory stringByAppendingPathComponent:@"enabled.txt"]];
 }
 
 - (void)reloadEnabled {
-    NSString *text = [NSString stringWithContentsOfURL:self.enabledURL encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    NSURL *url = self.enabledURL;
+    NSString *text = url ? ([NSString stringWithContentsOfURL:url encoding:NSUTF8StringEncoding error:nil] ?: @"") : @"";
     self.enabled = [NSMutableSet setWithArray:[text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]];
     [self.enabled removeObject:@""];
 }
@@ -85,8 +87,10 @@ typedef void (*S2AEnableCheatsFunction)(void);
     if ([self.enabled containsObject:key]) [self.enabled removeObject:key]; else [self.enabled addObject:key];
     NSString *body = [[self.enabled.allObjects sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@"\n"];
     if (body.length) body = [body stringByAppendingString:@"\n"];
+    NSURL *url = self.enabledURL;
+    if (!url) return;
     NSError *error = nil;
-    if (![body writeToURL:self.enabledURL atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
+    if (![body writeToURL:url atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
         NSAlert *alert = [NSAlert new];
         alert.messageText = @"无法保存金手指设置";
         alert.informativeText = error.localizedDescription ?: @"";
@@ -104,12 +108,12 @@ typedef void (*S2AEnableCheatsFunction)(void);
 @end
 
 static GCStandaloneCheats *gCheats;
+static id gLaunchObserver;
 
 static void GCInstallCheatsMenu(void) {
     if (gCheats || !NSApp.mainMenu) return;
     for (NSMenuItem *item in NSApp.mainMenu.itemArray) {
         if ([item.title isEqualToString:@"金手指"] || [item.title isEqualToString:@"Cheats"]) {
-            fprintf(stderr, "[GameCenter] S2Arm 金手指菜单已由宿主提供\n");
             return;
         }
     }
@@ -122,15 +126,19 @@ static void GCInstallCheatsMenu(void) {
     NSMenuItem *root = [[NSMenuItem alloc] initWithTitle:@"金手指" action:nil keyEquivalent:@""];
     root.submenu = submenu;
     [NSApp.mainMenu addItem:root];
-    fprintf(stderr, "[GameCenter] S2Arm 金手指菜单已安装\n");
 }
 
 __attribute__((constructor)) static void GCStandaloneCheatsLoad(void) {
-    fprintf(stderr, "[GameCenter] S2Arm 金手指菜单组件已加载\n");
     dispatch_async(dispatch_get_main_queue(), ^{
-        [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidFinishLaunchingNotification
-                                                        object:nil queue:NSOperationQueue.mainQueue
-                                                    usingBlock:^(__unused NSNotification *note) { GCInstallCheatsMenu(); }];
+        gLaunchObserver = [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidFinishLaunchingNotification
+                                                                          object:nil queue:NSOperationQueue.mainQueue
+                                                                      usingBlock:^(__unused NSNotification *note) {
+            GCInstallCheatsMenu();
+            if (gLaunchObserver) {
+                [NSNotificationCenter.defaultCenter removeObserver:gLaunchObserver];
+                gLaunchObserver = nil;
+            }
+        }];
         if (NSApp.isRunning) GCInstallCheatsMenu();
     });
 }

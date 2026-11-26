@@ -2,7 +2,6 @@
 import SwiftUI
 
 enum BuildPalette {
-    static let cream = GameCenterColors.action
     static let building = Color(red: 1, green: 0.78, blue: 0.28)
     static let ready = Color(red: 0.28, green: 0.84, blue: 0.50)
 }

@@ -39,8 +39,11 @@ python3 "$ROOT_DIR/scripts/verify-bundled-emulators.py" \
 # S2Arm engine travels inside the bundle so a fresh Mac can install it offline.
 if [[ -d "$ROOT_DIR/build/emulators/Emulators/S2Arm.app/Contents/Resources" ]]; then
   ditto "$ROOT_DIR/build/emulators/Emulators/S2Arm.app/Contents/Resources" "$APP_PATH/Contents/Resources/S2ArmEngine"
-  s2arm_version="$(basename "$ROOT_DIR"/build/emulators/ThirdPartySource/S2Arm-*.tar.gz | sed 's/^S2Arm-//; s/\.tar\.gz$//')"
-  printf '%s\n' "$s2arm_version" > "$APP_PATH/Contents/Resources/S2ArmEngine/engine-version.txt"
+  s2arm_archives=("$ROOT_DIR"/build/emulators/ThirdPartySource/S2Arm-*.tar.gz)
+  if [[ -f "${s2arm_archives[0]}" ]]; then
+    s2arm_version="$(basename "${s2arm_archives[0]}" | sed 's/^S2Arm-//; s/\.tar\.gz$//')"
+    printf '%s\n' "$s2arm_version" > "$APP_PATH/Contents/Resources/S2ArmEngine/engine-version.txt"
+  fi
 fi
 # Locally staged BIOS / firmware seeds the emulators on first run. Personal
 # backups only — a package containing them must not be redistributed.
@@ -63,11 +66,13 @@ ditto "$ROOT_DIR/Sources/GameCenter/Resources/zh-Hans.lproj" "$APP_PATH/Contents
 MOBILE_BUILD="$APP_PATH/Contents/Resources/MobileBuild"
 mkdir -p "$MOBILE_BUILD/scripts" "$MOBILE_BUILD/Sources/GameCenter"
 ditto "$ROOT_DIR/Mobile" "$MOBILE_BUILD/Mobile"
+rm -f "$MOBILE_BUILD/Mobile/README.md"
 cp "$ROOT_DIR/scripts/build-ios-app.sh" "$ROOT_DIR/scripts/fetch-ios-native.py" "$ROOT_DIR/scripts/fetch-ios-cores.sh" "$ROOT_DIR/scripts/prepare-nx-shell.sh" "$MOBILE_BUILD/scripts/"
 cp "$ROOT_DIR/scripts/apple-id-sign.py" "$ROOT_DIR/scripts/export-s2arm-ios.py" "$MOBILE_BUILD/scripts/"
 cp "$ROOT_DIR/scripts/cache_maintenance.py" "$ROOT_DIR/scripts/embed-s2arm-host.py" "$ROOT_DIR/scripts/prepare-s2arm-exit-host.py" "$MOBILE_BUILD/scripts/"
 ditto "$ROOT_DIR/Vendor/AppleSigning" "$MOBILE_BUILD/AppleSigning"
-ditto "$ROOT_DIR/scripts/patches" "$MOBILE_BUILD/scripts/patches"
+mkdir -p "$MOBILE_BUILD/scripts/patches"
+cp "$ROOT_DIR/scripts/patches"/s2arm-session-exit*.patch "$MOBILE_BUILD/scripts/patches/"
 if [[ -d "$ROOT_DIR/build/mobile-host/Shell" ]]; then
   ditto "$ROOT_DIR/build/mobile-host/Shell" "$MOBILE_BUILD/S2ArmExitHost"
 fi
@@ -80,7 +85,7 @@ fi
 mkdir -p "$MOBILE_BUILD/Sources/GameCenterSaveSupport"
 cp "$ROOT_DIR/Sources/GameCenterSaveSupport/GameSaveLayout.swift" "$MOBILE_BUILD/Sources/GameCenterSaveSupport/"
 cp "$ROOT_DIR/Sources/GameCenter/MobileLibraryFormat.swift" "$MOBILE_BUILD/Sources/GameCenter/"
-cp "$ROOT_DIR/Sources/GameCenter/GameMetadataPlatform.swift" "$ROOT_DIR/Sources/GameCenter/GameTitleMatcher.swift" "$ROOT_DIR/Sources/GameCenter/GameMetadataService.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveSync.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveSyncView.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveDirectorySync.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveLocation.swift" "$MOBILE_BUILD/Sources/GameCenter/"
+cp "$ROOT_DIR/Sources/GameCenter/GameMetadataPlatform.swift" "$ROOT_DIR/Sources/GameCenter/GameTitleMatcher.swift" "$ROOT_DIR/Sources/GameCenter/GameMetadataService.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveSyncView.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveDirectorySync.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveLocation.swift" "$MOBILE_BUILD/Sources/GameCenter/"
 
 cat > "$APP_PATH/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

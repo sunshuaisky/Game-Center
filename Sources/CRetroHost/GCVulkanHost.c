@@ -56,7 +56,6 @@ typedef PFN_vkVoidFunction (*PFN_vkGetDeviceProcAddr)(VkDevice, const char *);
 #define VK_TRUE 1
 #define VK_FALSE 0
 #define VK_QUEUE_FAMILY_IGNORED (~0U)
-#define VK_WHOLE_SIZE (~0ULL)
 #define VK_API_VERSION_1_1 ((1U << 22) | (1U << 12))
 #define VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR 0x00000001u
 
@@ -86,7 +85,6 @@ typedef PFN_vkVoidFunction (*PFN_vkGetDeviceProcAddr)(VkDevice, const char *);
 #define VK_SAMPLE_COUNT_1_BIT 1
 
 #define VK_IMAGE_LAYOUT_UNDEFINED 0
-#define VK_IMAGE_LAYOUT_GENERAL 1
 #define VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL 6
 #define VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL 7
 
@@ -824,6 +822,11 @@ GCVulkanHost *gc_vk_create(
         return NULL;
     }
     VkPhysicalDevice *gpus = calloc(gpu_count, sizeof(VkPhysicalDevice));
+    if (!gpus) {
+        set_vk_err(err_buf, err_buf_size, "内存不足，无法枚举 GPU");
+        gc_vk_destroy(vk);
+        return NULL;
+    }
     vk->vkEnumeratePhysicalDevices(vk->instance, &gpu_count, gpus);
     vk->gpu = gpus[0];
     free(gpus);
@@ -831,7 +834,7 @@ GCVulkanHost *gc_vk_create(
     struct retro_vulkan_context ctx;
     memset(&ctx, 0, sizeof(ctx));
     bool negotiated = false;
-    if (negotiated == false && neg && neg->interface_version >= 2 && neg->create_device2) {
+    if (neg && neg->interface_version >= 2 && neg->create_device2) {
         negotiated = neg->create_device2(&ctx, vk->instance, vk->gpu, VK_NULL_HANDLE, vk->get_inst_proc, create_device_wrapper, vk);
     } else if (neg && neg->create_device) {
         VkPhysicalDeviceFeatures req_feats;
@@ -863,6 +866,11 @@ GCVulkanHost *gc_vk_create(
         uint32_t qcount = 0;
         vk->vkGetPhysicalDeviceQueueFamilyProperties(vk->gpu, &qcount, NULL);
         VkQueueFamilyProperties *qprops = calloc(qcount ? qcount : 1, sizeof(*qprops));
+        if (!qprops) {
+            set_vk_err(err_buf, err_buf_size, "内存不足，无法查询 GPU 队列");
+            gc_vk_destroy(vk);
+            return NULL;
+        }
         vk->vkGetPhysicalDeviceQueueFamilyProperties(vk->gpu, &qcount, qprops);
         uint32_t family = 0;
         for (uint32_t i = 0; i < qcount; ++i) {
@@ -983,10 +991,10 @@ void gc_vk_destroy(GCVulkanHost *vk) {
     if (vk->cmd_pool && vk->vkDestroyCommandPool) {
         vk->vkDestroyCommandPool(vk->device, vk->cmd_pool, NULL);
     }
-    if (vk->core_owns_device) {
-        if (vk->core_destroy_device) vk->core_destroy_device();
-        if (vk->device && vk->vkDestroyDevice) vk->vkDestroyDevice(vk->device, NULL);
-    } else if (vk->device && vk->vkDestroyDevice) {
+    if (vk->core_owns_device && vk->core_destroy_device) {
+        vk->core_destroy_device();
+    }
+    if (vk->device && vk->vkDestroyDevice) {
         vk->vkDestroyDevice(vk->device, NULL);
     }
     if (vk->instance && vk->vkDestroyInstance) {
@@ -1020,7 +1028,6 @@ bool gc_vk_readback_frame(
     VkCommandBuffer cmd = vk->copy_cmds[idx];
 
     vk->vkWaitForFences(vk->device, 1, &fence, VK_TRUE, UINT64_MAX);
-    vk->vkResetFences(vk->device, 1, &fence);
     vk->vkResetCommandBuffer(cmd, 0);
 
     VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL };
@@ -1116,21 +1123,32 @@ bool gc_vk_readback_frame(
     submit.pSignalSemaphores = signal_sem ? &signal_sem : NULL;
     vk->wait_sem_count = 0;
 
+    vk->vkResetFences(vk->device, 1, &fence);
     pthread_mutex_lock(&vk->queue_mutex);
     VkResult sub_res = vk->vkQueueSubmit(vk->queue, 1, &submit, fence);
     pthread_mutex_unlock(&vk->queue_mutex);
-    if (sub_res != VK_SUCCESS) return false;
+    if (sub_res != VK_SUCCESS) {
+        /* Recreate signaled fence so subsequent waits never deadlock. */
+        VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, VK_FENCE_CREATE_SIGNALED_BIT };
+        VkFence replacement = VK_NULL_HANDLE;
+        if (vk->vkCreateFence(vk->device, &fci, NULL, &replacement) == VK_SUCCESS) {
+            vk->vkDestroyFence(vk->device, fence, NULL);
+            vk->fences[idx] = replacement;
+        }
+        return false;
+    }
 
     vk->vkWaitForFences(vk->device, 1, &fence, VK_TRUE, UINT64_MAX);
     vk->sync_index = (vk->sync_index + 1u) % GC_VK_SYNC_COUNT;
 
     const uint32_t *src_pixels = (const uint32_t *)vk->staging_mapped;
-    uint32_t dst_stride_px = dst_stride_bytes / 4u;
-    for (uint32_t y = 0; y < height; ++y) {
-        const uint32_t *srow = src_pixels + (size_t)y * width;
-        uint32_t *drow = dst_bgra + (size_t)y * dst_stride_px;
-        for (uint32_t x = 0; x < width; ++x) {
-            drow[x] = srow[x] | 0xFF000000u;
+    size_t row_bytes = (size_t)width * 4u;
+    if (dst_stride_bytes == row_bytes) {
+        memcpy(dst_bgra, src_pixels, row_bytes * (size_t)height);
+    } else {
+        uint32_t dst_stride_px = dst_stride_bytes / 4u;
+        for (uint32_t y = 0; y < height; ++y) {
+            memcpy(dst_bgra + (size_t)y * dst_stride_px, src_pixels + (size_t)y * width, row_bytes);
         }
     }
     return true;

@@ -41,18 +41,18 @@ fragment float4 gc_fragment_main(
     texture2d<float> frameTexture [[texture(0)]],
     sampler frameSampler [[sampler(0)]]
 ) {
-    return frameTexture.sample(frameSampler, in.texCoord);
+    return float4(frameTexture.sample(frameSampler, in.texCoord).rgb, 1.0);
 }
 """
 
 final class InteractiveMetalView: MTKView {
-    var onPointerChange: ((Double, Double, Bool) -> Void)?
-    var onMouseEvent: ((UInt8, Int32, Int32, Int32) -> Void)?
+    var onPointerAndMouse: (((Double, Double, Bool)?, UInt8, Int32, Int32, Int32) -> Void)?
     var onMouseHoverTop: ((Bool) -> Void)?
     var gameContentRect: CGRect = .zero
 
     private var trackingAreaRef: NSTrackingArea?
     private var buttonMask: UInt8 = 0
+    private var lastHoverTop = false
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -74,75 +74,79 @@ final class InteractiveMetalView: MTKView {
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         let inTopZone = point.y >= bounds.height - 68
-        onMouseHoverTop?(inTopZone)
-        let (nx, ny, inside) = normalizeToGameRect(point)
-        if inside {
-            onPointerChange?(nx, ny, (buttonMask & 1) != 0)
+        if inTopZone != lastHoverTop {
+            lastHoverTop = inTopZone
+            onMouseHoverTop?(inTopZone)
         }
+        let (nx, ny, inside) = normalizeToGameRect(point)
         let dx = Int32(event.deltaX.rounded())
         let dy = Int32(event.deltaY.rounded())
-        if dx != 0 || dy != 0 {
-            onMouseEvent?(buttonMask, dx, dy, 0)
+        let pointer: (Double, Double, Bool)? = inside ? (nx, ny, (buttonMask & 1) != 0) : nil
+        if pointer != nil || dx != 0 || dy != 0 {
+            onPointerAndMouse?(pointer, buttonMask, dx, dy, 0)
         }
     }
 
     override func mouseExited(with event: NSEvent) {
-        onMouseHoverTop?(false)
+        if lastHoverTop {
+            lastHoverTop = false
+            onMouseHoverTop?(false)
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         buttonMask |= 1
-        forwardPointer(event, pressed: true)
-        onMouseEvent?(buttonMask, 0, 0, 0)
+        let pointer = pointerPayload(event, pressed: true)
+        onPointerAndMouse?(pointer, buttonMask, 0, 0, 0)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        forwardPointer(event, pressed: true)
-        onMouseEvent?(buttonMask, Int32(event.deltaX.rounded()), Int32(event.deltaY.rounded()), 0)
+        let pointer = pointerPayload(event, pressed: true)
+        onPointerAndMouse?(pointer, buttonMask, Int32(event.deltaX.rounded()), Int32(event.deltaY.rounded()), 0)
     }
 
     override func mouseUp(with event: NSEvent) {
         buttonMask &= ~1
-        forwardPointer(event, pressed: false)
-        onMouseEvent?(buttonMask, 0, 0, 0)
+        let pointer = pointerPayload(event, pressed: false)
+        onPointerAndMouse?(pointer, buttonMask, 0, 0, 0)
     }
 
     override func rightMouseDown(with event: NSEvent) {
         buttonMask |= 2
-        onMouseEvent?(buttonMask, 0, 0, 0)
+        onPointerAndMouse?(nil, buttonMask, 0, 0, 0)
     }
 
     override func rightMouseDragged(with event: NSEvent) {
-        onMouseEvent?(buttonMask, Int32(event.deltaX.rounded()), Int32(event.deltaY.rounded()), 0)
+        onPointerAndMouse?(nil, buttonMask, Int32(event.deltaX.rounded()), Int32(event.deltaY.rounded()), 0)
     }
 
     override func rightMouseUp(with event: NSEvent) {
         buttonMask &= ~2
-        onMouseEvent?(buttonMask, 0, 0, 0)
+        onPointerAndMouse?(nil, buttonMask, 0, 0, 0)
     }
 
     override func otherMouseDown(with event: NSEvent) {
         buttonMask |= 4
-        onMouseEvent?(buttonMask, 0, 0, 0)
+        onPointerAndMouse?(nil, buttonMask, 0, 0, 0)
     }
 
     override func otherMouseUp(with event: NSEvent) {
         buttonMask &= ~4
-        onMouseEvent?(buttonMask, 0, 0, 0)
+        onPointerAndMouse?(nil, buttonMask, 0, 0, 0)
     }
 
     override func scrollWheel(with event: NSEvent) {
         let wy = Int32(event.scrollingDeltaY.rounded())
         if wy != 0 {
-            onMouseEvent?(buttonMask, 0, 0, wy)
+            onPointerAndMouse?(nil, buttonMask, 0, 0, wy)
         }
     }
 
-    private func forwardPointer(_ event: NSEvent, pressed: Bool) {
+    private func pointerPayload(_ event: NSEvent, pressed: Bool) -> (Double, Double, Bool) {
         let point = convert(event.locationInWindow, from: nil)
         let (nx, ny, inside) = normalizeToGameRect(point)
-        onPointerChange?(nx, ny, pressed && inside)
+        return (nx, ny, pressed && inside)
     }
 
     private func normalizeToGameRect(_ viewPoint: NSPoint) -> (Double, Double, Bool) {
@@ -160,8 +164,7 @@ struct MetalGameView: NSViewRepresentable {
     let frameRing: SharedFrameRing
     let crispPixels: Bool
     let isPaused: Bool
-    let onPointerChange: (Double, Double, Bool) -> Void
-    let onMouseEvent: (UInt8, Int32, Int32, Int32) -> Void
+    let onPointerAndMouse: ((Double, Double, Bool)?, UInt8, Int32, Int32, Int32) -> Void
     let onMouseHoverTop: (Bool) -> Void
 
     func makeCoordinator() -> Renderer {
@@ -174,27 +177,46 @@ struct MetalGameView: NSViewRepresentable {
         view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         view.framebufferOnly = true
         view.preferredFramesPerSecond = 120
-        view.isPaused = false
+        view.isPaused = isPaused
         view.enableSetNeedsDisplay = false
         view.delegate = context.coordinator
+        context.coordinator.crispPixels = crispPixels
         context.coordinator.configure(device: view.device, view: view)
         updateCallbacks(view: view)
         return view
     }
 
     func updateNSView(_ view: InteractiveMetalView, context: Context) {
-        context.coordinator.crispPixels = crispPixels
-        context.coordinator.frameRing = frameRing
+        let coordinator = context.coordinator
+        let filterChanged = coordinator.crispPixels != crispPixels
+        coordinator.crispPixels = crispPixels
+        if coordinator.frameRing !== frameRing {
+            coordinator.frameRing = frameRing
+            coordinator.resetForNewRing()
+        }
+        if filterChanged {
+            coordinator.markNeedsRedraw()
+        }
+        if view.isPaused != isPaused {
+            view.isPaused = isPaused
+            if !isPaused {
+                coordinator.markNeedsRedraw()
+            }
+        }
         updateCallbacks(view: view)
+        if isPaused && filterChanged {
+            view.draw()
+        }
     }
 
     private func updateCallbacks(view: InteractiveMetalView) {
-        view.onPointerChange = onPointerChange
-        view.onMouseEvent = onMouseEvent
+        view.onPointerAndMouse = onPointerAndMouse
         view.onMouseHoverTop = onMouseHoverTop
     }
 
     final class Renderer: NSObject, MTKViewDelegate {
+        private static let maxInFlightFrames = 3
+
         var frameRing: SharedFrameRing
         var crispPixels = true
 
@@ -203,14 +225,27 @@ struct MetalGameView: NSViewRepresentable {
         private var pipelineState: MTLRenderPipelineState?
         private var nearestSampler: MTLSamplerState?
         private var linearSampler: MTLSamplerState?
-        private var texture: MTLTexture?
+        private var textures: [MTLTexture] = []
+        private var textureIndex = 0
+        private var activeTexture: MTLTexture?
         private var textureWidth = 0
         private var textureHeight = 0
         private var aspectRatio: Float = 4.0 / 3.0
         private var lastSequence: UInt64 = 0
+        private var needsRedraw = true
+        private let frameSemaphore = DispatchSemaphore(value: maxInFlightFrames)
 
         init(frameRing: SharedFrameRing) {
             self.frameRing = frameRing
+        }
+
+        func markNeedsRedraw() {
+            needsRedraw = true
+        }
+
+        func resetForNewRing() {
+            lastSequence = 0
+            needsRedraw = true
         }
 
         func configure(device: MTLDevice?, view: MTKView) {
@@ -240,41 +275,66 @@ struct MetalGameView: NSViewRepresentable {
             linearSampler = device.makeSamplerState(descriptor: linearDesc)
         }
 
-        func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+        func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+            needsRedraw = true
+            if view.isPaused {
+                view.draw()
+            }
+        }
+
+        private func ensureTextures(device: MTLDevice, width: Int, height: Int) {
+            guard textures.isEmpty || textureWidth != width || textureHeight != height else { return }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm,
+                width: width,
+                height: height,
+                mipmapped: false
+            )
+            desc.usage = [.shaderRead]
+            textures = (0..<Self.maxInFlightFrames).compactMap { _ in device.makeTexture(descriptor: desc) }
+            textureIndex = 0
+            textureWidth = width
+            textureHeight = height
+        }
 
         func draw(in view: MTKView) {
             guard let device,
                   let commandQueue,
-                  let pipelineState,
-                  let renderPass = view.currentRenderPassDescriptor,
-                  let drawable = view.currentDrawable else { return }
+                  let pipelineState else { return }
 
-            if let latest = frameRing.latestFrame(after: lastSequence),
+            let latest = frameRing.latestFrame(after: lastSequence)
+            if latest == nil && !needsRedraw {
+                return
+            }
+
+            // Wait for an available texture slot before uploading pixels or acquiring a drawable.
+            guard frameSemaphore.wait(timeout: .now() + .milliseconds(4)) == .success else { return }
+
+            if let latest,
                let pixelPtr = frameRing.pixelBufferPointer(slotIndex: latest.slotIndex) {
                 lastSequence = latest.sequence
                 aspectRatio = latest.aspectRatio > 0.05 ? latest.aspectRatio : (Float(latest.width) / Float(max(latest.height, 1)))
-                if texture == nil || textureWidth != latest.width || textureHeight != latest.height {
-                    let desc = MTLTextureDescriptor.texture2DDescriptor(
-                        pixelFormat: .bgra8Unorm,
-                        width: latest.width,
-                        height: latest.height,
-                        mipmapped: false
-                    )
-                    desc.usage = [.shaderRead]
-                    texture = device.makeTexture(descriptor: desc)
-                    textureWidth = latest.width
-                    textureHeight = latest.height
-                }
-                if let texture {
+                ensureTextures(device: device, width: latest.width, height: latest.height)
+                if !textures.isEmpty {
+                    let target = textures[textureIndex]
+                    textureIndex = (textureIndex + 1) % textures.count
                     let region = MTLRegionMake2D(0, 0, latest.width, latest.height)
-                    texture.replace(region: region, mipmapLevel: 0, withBytes: pixelPtr, bytesPerRow: latest.bytesPerRow)
+                    target.replace(region: region, mipmapLevel: 0, withBytes: pixelPtr, bytesPerRow: latest.bytesPerRow)
+                    activeTexture = target
                 }
             }
 
-            guard let commandBuffer = commandQueue.makeCommandBuffer(),
-                  let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else { return }
+            guard let renderPass = view.currentRenderPassDescriptor,
+                  let drawable = view.currentDrawable,
+                  let commandBuffer = commandQueue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else {
+                frameSemaphore.signal()
+                return
+            }
 
-            if let texture {
+            needsRedraw = false
+
+            if let texture = activeTexture {
                 let viewW = max(Float(view.drawableSize.width), 1)
                 let viewH = max(Float(view.drawableSize.height), 1)
                 let viewAspect = viewW / viewH
@@ -311,6 +371,10 @@ struct MetalGameView: NSViewRepresentable {
             }
 
             encoder.endEncoding()
+            let semaphore = frameSemaphore
+            commandBuffer.addCompletedHandler { _ in
+                semaphore.signal()
+            }
             commandBuffer.present(drawable)
             commandBuffer.commit()
         }

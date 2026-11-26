@@ -12,12 +12,19 @@ struct PhoneLibrary {
     struct ROM: Identifiable {
         let url: URL
         let platform: Format.Platform
+        let title: String
         var id: URL { url }
-        var title: String {
-            (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-                ? url.lastPathComponent : url.deletingPathExtension().lastPathComponent
+
+        init(url: URL, platform: Format.Platform, isDirectory: Bool? = nil) {
+            self.url = url
+            self.platform = platform
+            let dir = isDirectory ?? ((try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true)
+            self.title = dir ? url.lastPathComponent : url.deletingPathExtension().lastPathComponent
         }
     }
+
+    private static let setupLock = NSLock()
+    private static var hasCompletedLaunchSetup = false
 
     struct SwitchGame: Identifiable {
         let id: String
@@ -33,8 +40,16 @@ struct PhoneLibrary {
         let documents = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
         guard let config = Bundle.main.url(forResource: "platforms", withExtension: "json") else { throw Error.missingConfiguration }
         let library = try Self(documents: documents, platforms: Format.read([Format.Platform].self, at: config))
-        try library.createFolders()
-        try library.writeSigningReceipt()
+        setupLock.lock()
+        let firstLaunch = !hasCompletedLaunchSetup
+        if firstLaunch { hasCompletedLaunchSetup = true }
+        setupLock.unlock()
+        if firstLaunch {
+            try library.createFolders()
+            try library.writeSigningReceipt()
+        } else {
+            try library.migrateSwitchSaves()
+        }
         return library
     }
 
@@ -116,20 +131,6 @@ struct PhoneLibrary {
             }
         }
         try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys]).write(to: documents.appendingPathComponent("Export/GameCenter-signing.json"), options: .atomic)
-    }
-
-    func cloudSaveSlots() throws -> [CloudSaveSlot] {
-        try migrateSwitchSaves()
-        var result = switchGames().compactMap { game -> CloudSaveSlot? in
-            guard let build = game.builds.first else { return nil }
-            return .init(id: "switch/\(build.titleID)", title: game.title,
-                         location: GameSaveLayout.folder(root: root, platform: "switch", game: build.titleID))
-        }
-        for rom in roms() where ["gb", "gbc", "gba"].contains(rom.platform.id) {
-            result.append(.init(id: "rom/\(rom.platform.id)/" + rom.title.lowercased(), title: rom.title,
-                                location: saveFolder(rom).appendingPathComponent("battery.srm"), fileName: "battery.srm"))
-        }
-        return result.sorted { $0.title < $1.title }
     }
 
     func romFolder(_ platform: Format.Platform) -> URL {
@@ -252,11 +253,11 @@ struct PhoneLibrary {
                 if values.isDirectory == true {
                     guard Format.isGameFolder(file, runtime: platform.runtime) else { return nil }
                     files.skipDescendants()
-                    return ROM(url: file, platform: platform)
+                    return ROM(url: file, platform: platform, isDirectory: true)
                 }
                 guard values.isRegularFile == true,
                       platform.extensions.contains(file.pathExtension.lowercased()) else { return nil }
-                return ROM(url: file, platform: platform)
+                return ROM(url: file, platform: platform, isDirectory: false)
             }
             let playable = Set(Format.playableEntries(candidates.map(\.url)))
             return candidates.filter { playable.contains($0.url) }

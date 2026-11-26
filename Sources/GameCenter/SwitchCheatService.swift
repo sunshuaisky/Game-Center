@@ -97,11 +97,16 @@ enum SwitchCheatService {
         var items: [SwitchCheatItem] = []
         for file in parsed {
             let regular = file.entries.filter { !$0.isMaster }
-            let uniqueNames = regular.reduce(into: [String]()) { names, entry in
-                if !names.contains(entry.name) { names.append(entry.name) }
+            var countsByName: [String: Int] = [:]
+            var uniqueNames: [String] = []
+            for entry in regular {
+                if countsByName[entry.name] == nil {
+                    uniqueNames.append(entry.name)
+                }
+                countsByName[entry.name, default: 0] += 1
             }
             for name in uniqueNames {
-                let duplicates = regular.filter { $0.name == name }.count
+                let duplicates = countsByName[name] ?? 1
                 let nxKeys = (1...duplicates).map { index in index == 1 ? name : "\(name) #\(index)" }
                 let nxEnabled = nxKeys.allSatisfy { enabledByBuild[file.buildID]?.contains($0) == true }
                 let isEnabled = hasExistingState && (nxEnabled || s2armEnabled.contains("\(file.url.lastPathComponent)/\(name)"))
@@ -143,7 +148,12 @@ enum SwitchCheatService {
             isMaster: item.isMaster, isEnabled: enabled, duplicateCount: item.duplicateCount
         )
         try writeStates(items: items, directory: catalog.directory)
-        return try load(titleID: catalog.titleID, directory: catalog.directory)
+        return SwitchCheatCatalog(
+            titleID: catalog.titleID,
+            directory: catalog.directory,
+            items: items,
+            unsupportedFiles: catalog.unsupportedFiles
+        )
     }
 
     static func openFolder(_ directory: URL) {
@@ -182,7 +192,7 @@ enum SwitchCheatService {
                 let name = String(line.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
                 current = (name.isEmpty ? (master ? "主代码" : "未命名") : name, master)
                 hasCode = false
-            } else if line.range(of: #"^[0-9A-Fa-f\s]+$"#, options: .regularExpression) != nil {
+            } else if isHexCodeLine(line) {
                 if current == nil { current = ("未命名", false) }
                 hasCode = true
             } else {
@@ -193,17 +203,29 @@ enum SwitchCheatService {
         return entries
     }
 
+    private static func isHexCodeLine(_ line: String) -> Bool {
+        for byte in line.utf8 {
+            let isHex = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102)
+            let isSpace = byte == 32 || byte == 9
+            if !isHex && !isSpace { return false }
+        }
+        return true
+    }
+
     private static func readLines(_ url: URL) -> [String] {
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
         return text.split(whereSeparator: \.isNewline).map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
     }
 
+    private static let titleIDRegex = try! NSRegularExpression(pattern: #"(?i)[0-9a-f]{16}"#)
+
     private static func titleID(in string: String) -> String? {
-        guard let range = string.range(of: #"(?i)[0-9a-f]{16}"#, options: .regularExpression) else { return nil }
-        return String(string[range]).uppercased()
+        let ns = string as NSString
+        guard let match = titleIDRegex.firstMatch(in: string, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        return ns.substring(with: match.range).uppercased()
     }
 
     private static func isTitleID(_ value: String) -> Bool {
-        value.range(of: #"(?i)^[0-9a-f]{16}$"#, options: .regularExpression) != nil
+        value.count == 16 && value.allSatisfy(\.isHexDigit)
     }
 }

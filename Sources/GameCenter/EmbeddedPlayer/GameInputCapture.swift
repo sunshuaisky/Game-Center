@@ -55,6 +55,7 @@ final class GameInputCapture {
     private var pollTimer: Timer?
     private var connectObserver: NSObjectProtocol?
     private var disconnectObserver: NSObjectProtocol?
+    private var connectedControllers: [GCController] = []
 
     private var keyboardButtons: UInt16 = 0
     private var keyboardFastForward = false
@@ -82,6 +83,13 @@ final class GameInputCapture {
         self.mirrorLeftStickToDPad = mirrorLeftStickToDPad
     }
 
+    deinit {
+        pollTimer?.invalidate()
+        if let connectObserver { NotificationCenter.default.removeObserver(connectObserver) }
+        if let disconnectObserver { NotificationCenter.default.removeObserver(disconnectObserver) }
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+    }
+
     func attach(to window: NSWindow) {
         detach()
         targetWindow = window
@@ -89,10 +97,16 @@ final class GameInputCapture {
         GCController.startWirelessControllerDiscovery(completionHandler: nil)
         connectObserver = NotificationCenter.default.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { [weak self] note in
             let name = (note.object as? GCController)?.vendorName ?? "外接手柄"
-            Task { @MainActor [weak self] in self?.onControllerChanged?("已连接手柄：\(name)") }
+            MainActor.assumeIsolated {
+                self?.refreshControllers()
+                self?.onControllerChanged?("已连接手柄：\(name)")
+            }
         }
         disconnectObserver = NotificationCenter.default.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.onControllerChanged?("外接手柄已断开") }
+            MainActor.assumeIsolated {
+                self?.refreshControllers()
+                self?.onControllerChanged?("外接手柄已断开")
+            }
         }
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
@@ -102,13 +116,34 @@ final class GameInputCapture {
             return self.handleKeyEvent(event) ? nil : event
         }
 
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.flushToSharedMemory()
+        refreshControllers()
+    }
+
+    private func refreshControllers() {
+        connectedControllers = Array(
+            GCController.controllers()
+                .filter { $0.extendedGamepad != nil || $0.microGamepad != nil }
+                .prefix(4)
+        )
+        updatePollTimer()
+        flushToSharedMemory()
+    }
+
+    private func updatePollTimer() {
+        let shouldPoll = targetWindow != nil && !connectedControllers.isEmpty
+        if shouldPoll {
+            if pollTimer == nil {
+                let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.flushToSharedMemory()
+                    }
+                }
+                RunLoop.main.add(timer, forMode: .common)
+                pollTimer = timer
             }
-        }
-        if let pollTimer {
-            RunLoop.main.add(pollTimer, forMode: .common)
+        } else {
+            pollTimer?.invalidate()
+            pollTimer = nil
         }
     }
 
@@ -128,6 +163,7 @@ final class GameInputCapture {
         }
         pollTimer?.invalidate()
         pollTimer = nil
+        connectedControllers.removeAll()
         keyboardButtons = 0
         keyboardFastForward = false
         pointerPressed = false
@@ -155,17 +191,20 @@ final class GameInputCapture {
         flushToSharedMemory()
     }
 
-    func updatePointer(normalizedX: Double, normalizedY: Double, pressed: Bool) {
-        // Libretro pointer range is [-0x7fff, 0x7fff]
-        let clampedX = min(max(normalizedX, 0.0), 1.0)
-        let clampedY = min(max(normalizedY, 0.0), 1.0)
-        pointerX = Int16((clampedX * 2.0 - 1.0) * 32767.0)
-        pointerY = Int16((clampedY * 2.0 - 1.0) * 32767.0)
-        pointerPressed = pressed
-        flushToSharedMemory()
-    }
-
-    func updateMouse(buttonMask: UInt8, deltaX: Int32 = 0, deltaY: Int32 = 0, wheelY: Int32 = 0) {
+    func updatePointerAndMouse(
+        pointer: (Double, Double, Bool)?,
+        buttonMask: UInt8,
+        deltaX: Int32 = 0,
+        deltaY: Int32 = 0,
+        wheelY: Int32 = 0
+    ) {
+        if let (normalizedX, normalizedY, pressed) = pointer {
+            let clampedX = min(max(normalizedX, 0.0), 1.0)
+            let clampedY = min(max(normalizedY, 0.0), 1.0)
+            pointerX = Int16((clampedX * 2.0 - 1.0) * 32767.0)
+            pointerY = Int16((clampedY * 2.0 - 1.0) * 32767.0)
+            pointerPressed = pressed
+        }
         mouseButtons = buttonMask
         pendingMouseDX += deltaX
         pendingMouseDY += deltaY
@@ -265,84 +304,89 @@ final class GameInputCapture {
     }
 
     private func flushToSharedMemory() {
-        var buttons = [UInt16](repeating: 0, count: 4)
-        var axes = [Int16](repeating: 0, count: 16)
+        var buttons: (UInt16, UInt16, UInt16, UInt16) = (isPaused ? 0 : keyboardButtons, 0, 0, 0)
+        var axes: (Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16) =
+            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
-        if !isPaused {
-            buttons[0] |= keyboardButtons
-        }
+        withUnsafeMutablePointer(to: &buttons) { bRaw in
+            bRaw.withMemoryRebound(to: UInt16.self, capacity: 4) { bPtr in
+                withUnsafeMutablePointer(to: &axes) { aRaw in
+                    aRaw.withMemoryRebound(to: Int16.self, capacity: 16) { aPtr in
+                        for idx in 0..<connectedControllers.count {
+                            let controller = connectedControllers[idx]
+                            if let pad = controller.extendedGamepad {
+                                // Check pause chord on player 1 (Menu + Options)
+                                if idx == 0 {
+                                    let chord = pad.buttonMenu.isPressed && (pad.buttonOptions?.isPressed == true)
+                                    if chord && !lastPauseChordPressed {
+                                        onTogglePauseOverlay?()
+                                    }
+                                    lastPauseChordPressed = chord
+                                }
 
-        let controllers = GCController.controllers().filter { $0.extendedGamepad != nil || $0.microGamepad != nil }
-        for (idx, controller) in controllers.prefix(4).enumerated() {
-            if let pad = controller.extendedGamepad {
-                // Check pause chord on player 1 (Menu + Options)
-                if idx == 0 {
-                    let chord = pad.buttonMenu.isPressed && (pad.buttonOptions?.isPressed == true)
-                    if chord && !lastPauseChordPressed {
-                        onTogglePauseOverlay?()
+                                guard !isPaused else { continue }
+
+                                var mask: UInt16 = 0
+                                if pad.buttonA.isPressed { mask |= (1 << RetroButton.b.rawValue) }
+                                if pad.buttonB.isPressed { mask |= (1 << RetroButton.a.rawValue) }
+                                if pad.buttonX.isPressed { mask |= (1 << RetroButton.y.rawValue) }
+                                if pad.buttonY.isPressed { mask |= (1 << RetroButton.x.rawValue) }
+                                if pad.buttonOptions?.isPressed == true { mask |= (1 << RetroButton.select.rawValue) }
+                                if pad.buttonMenu.isPressed { mask |= (1 << RetroButton.start.rawValue) }
+                                if pad.dpad.up.isPressed || (mirrorLeftStickToDPad && pad.leftThumbstick.yAxis.value > 0.45) { mask |= (1 << RetroButton.up.rawValue) }
+                                if pad.dpad.down.isPressed || (mirrorLeftStickToDPad && pad.leftThumbstick.yAxis.value < -0.45) { mask |= (1 << RetroButton.down.rawValue) }
+                                if pad.dpad.left.isPressed || (mirrorLeftStickToDPad && pad.leftThumbstick.xAxis.value < -0.45) { mask |= (1 << RetroButton.left.rawValue) }
+                                if pad.dpad.right.isPressed || (mirrorLeftStickToDPad && pad.leftThumbstick.xAxis.value > 0.45) { mask |= (1 << RetroButton.right.rawValue) }
+                                if pad.leftShoulder.isPressed { mask |= (1 << RetroButton.l.rawValue) }
+                                if pad.rightShoulder.isPressed { mask |= (1 << RetroButton.r.rawValue) }
+                                if pad.leftTrigger.value > 0.25 { mask |= (1 << RetroButton.l2.rawValue) }
+                                if pad.rightTrigger.value > 0.25 { mask |= (1 << RetroButton.r2.rawValue) }
+                                if pad.leftThumbstickButton?.isPressed == true { mask |= (1 << RetroButton.l3.rawValue) }
+                                if pad.rightThumbstickButton?.isPressed == true { mask |= (1 << RetroButton.r3.rawValue) }
+                                bPtr[idx] |= mask
+
+                                let base = idx * 4
+                                aPtr[base + 0] = Int16(max(-32767, min(32767, Int(pad.leftThumbstick.xAxis.value * 32767.0))))
+                                aPtr[base + 1] = Int16(max(-32767, min(32767, Int(-pad.leftThumbstick.yAxis.value * 32767.0))))
+                                aPtr[base + 2] = Int16(max(-32767, min(32767, Int(pad.rightThumbstick.xAxis.value * 32767.0))))
+                                aPtr[base + 3] = Int16(max(-32767, min(32767, Int(-pad.rightThumbstick.yAxis.value * 32767.0))))
+                            } else if let micro = controller.microGamepad, !isPaused {
+                                var mask: UInt16 = 0
+                                if micro.buttonA.isPressed { mask |= (1 << RetroButton.b.rawValue) }
+                                if micro.buttonX.isPressed { mask |= (1 << RetroButton.a.rawValue) }
+                                if micro.buttonMenu.isPressed { mask |= (1 << RetroButton.start.rawValue) }
+                                if micro.dpad.up.isPressed { mask |= (1 << RetroButton.up.rawValue) }
+                                if micro.dpad.down.isPressed { mask |= (1 << RetroButton.down.rawValue) }
+                                if micro.dpad.left.isPressed { mask |= (1 << RetroButton.left.rawValue) }
+                                if micro.dpad.right.isPressed { mask |= (1 << RetroButton.right.rawValue) }
+                                bPtr[idx] |= mask
+                            }
+                        }
+
+                        let dx = pendingMouseDX
+                        let dy = pendingMouseDY
+                        let wy = pendingMouseWheelY
+                        pendingMouseDX = 0
+                        pendingMouseDY = 0
+                        pendingMouseWheelY = 0
+
+                        let speed: UInt8 = (keyboardFastForward || manualFastForward) ? 3 : 1
+                        inputRegion.write(
+                            buttonsPointer: bPtr,
+                            axesPointer: aPtr,
+                            pointerX: pointerX,
+                            pointerY: pointerY,
+                            pointerPressed: isPaused ? false : pointerPressed,
+                            mouseButtons: isPaused ? 0 : mouseButtons,
+                            mouseDXDelta: isPaused ? 0 : dx,
+                            mouseDYDelta: isPaused ? 0 : dy,
+                            mouseWheelDelta: isPaused ? 0 : wy,
+                            fastForward: speed,
+                            paused: isPaused
+                        )
                     }
-                    lastPauseChordPressed = chord
                 }
-
-                guard !isPaused else { continue }
-
-                var mask: UInt16 = 0
-                if pad.buttonA.isPressed { mask |= (1 << RetroButton.b.rawValue) }
-                if pad.buttonB.isPressed { mask |= (1 << RetroButton.a.rawValue) }
-                if pad.buttonX.isPressed { mask |= (1 << RetroButton.y.rawValue) }
-                if pad.buttonY.isPressed { mask |= (1 << RetroButton.x.rawValue) }
-                if pad.buttonOptions?.isPressed == true { mask |= (1 << RetroButton.select.rawValue) }
-                if pad.buttonMenu.isPressed { mask |= (1 << RetroButton.start.rawValue) }
-                if pad.dpad.up.isPressed || (mirrorLeftStickToDPad && pad.leftThumbstick.yAxis.value > 0.45) { mask |= (1 << RetroButton.up.rawValue) }
-                if pad.dpad.down.isPressed || (mirrorLeftStickToDPad && pad.leftThumbstick.yAxis.value < -0.45) { mask |= (1 << RetroButton.down.rawValue) }
-                if pad.dpad.left.isPressed || (mirrorLeftStickToDPad && pad.leftThumbstick.xAxis.value < -0.45) { mask |= (1 << RetroButton.left.rawValue) }
-                if pad.dpad.right.isPressed || (mirrorLeftStickToDPad && pad.leftThumbstick.xAxis.value > 0.45) { mask |= (1 << RetroButton.right.rawValue) }
-                if pad.leftShoulder.isPressed { mask |= (1 << RetroButton.l.rawValue) }
-                if pad.rightShoulder.isPressed { mask |= (1 << RetroButton.r.rawValue) }
-                if pad.leftTrigger.value > 0.25 { mask |= (1 << RetroButton.l2.rawValue) }
-                if pad.rightTrigger.value > 0.25 { mask |= (1 << RetroButton.r2.rawValue) }
-                if pad.leftThumbstickButton?.isPressed == true { mask |= (1 << RetroButton.l3.rawValue) }
-                if pad.rightThumbstickButton?.isPressed == true { mask |= (1 << RetroButton.r3.rawValue) }
-                buttons[idx] |= mask
-
-                let base = idx * 4
-                axes[base + 0] = Int16(max(-32767, min(32767, Int(pad.leftThumbstick.xAxis.value * 32767.0))))
-                axes[base + 1] = Int16(max(-32767, min(32767, Int(-pad.leftThumbstick.yAxis.value * 32767.0))))
-                axes[base + 2] = Int16(max(-32767, min(32767, Int(pad.rightThumbstick.xAxis.value * 32767.0))))
-                axes[base + 3] = Int16(max(-32767, min(32767, Int(-pad.rightThumbstick.yAxis.value * 32767.0))))
-            } else if let micro = controller.microGamepad, !isPaused {
-                var mask: UInt16 = 0
-                if micro.buttonA.isPressed { mask |= (1 << RetroButton.b.rawValue) }
-                if micro.buttonX.isPressed { mask |= (1 << RetroButton.a.rawValue) }
-                if micro.buttonMenu.isPressed { mask |= (1 << RetroButton.start.rawValue) }
-                if micro.dpad.up.isPressed { mask |= (1 << RetroButton.up.rawValue) }
-                if micro.dpad.down.isPressed { mask |= (1 << RetroButton.down.rawValue) }
-                if micro.dpad.left.isPressed { mask |= (1 << RetroButton.left.rawValue) }
-                if micro.dpad.right.isPressed { mask |= (1 << RetroButton.right.rawValue) }
-                buttons[idx] |= mask
             }
         }
-
-        let dx = pendingMouseDX
-        let dy = pendingMouseDY
-        let wy = pendingMouseWheelY
-        pendingMouseDX = 0
-        pendingMouseDY = 0
-        pendingMouseWheelY = 0
-
-        let speed: UInt8 = (keyboardFastForward || manualFastForward) ? 3 : 1
-        inputRegion.write(
-            buttons: buttons,
-            axes: axes,
-            pointerX: pointerX,
-            pointerY: pointerY,
-            pointerPressed: isPaused ? false : pointerPressed,
-            mouseButtons: isPaused ? 0 : mouseButtons,
-            mouseDXDelta: isPaused ? 0 : dx,
-            mouseDYDelta: isPaused ? 0 : dy,
-            mouseWheelDelta: isPaused ? 0 : wy,
-            fastForward: speed,
-            paused: isPaused
-        )
     }
 }

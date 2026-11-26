@@ -83,17 +83,25 @@ def _prepare(installed, check_only=False):
         return build(installed, revision, archive_sha, patch, fingerprint, cache, shell)
 
 
+def sha256_file(path):
+    hasher = hashlib.sha256()
+    with open(path, 'rb') as source:
+        for chunk in iter(lambda: source.read(1 << 20), b''):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def build(installed, revision, archive_sha, patch, fingerprint, cache, shell):
     make = shutil.which('gmake') or '/opt/homebrew/bin/gmake'
     dotnet = os.environ.get('DOTNET', str(Path.home() / '.dotnet/dotnet'))
     if not Path(make).is_file() or not Path(dotnet).is_file():
         raise RuntimeError('重新编译退出宿主需要 GNU Make 4 和微软 .NET 10 SDK。发布版 Mac 应用可直接使用随附的预编译宿主。')
     archive = cache / 'source.tar.gz'
-    if not archive.is_file() or hashlib.sha256(archive.read_bytes()).hexdigest() != archive_sha:
+    if not archive.is_file() or sha256_file(archive) != archive_sha:
         subprocess.run(['curl', '-fL', '--retry', '2', '--connect-timeout', '30', '--max-time', '300',
                         'https://codeload.github.com/jhaizhou-ops/S2Arm/tar.gz/' + revision, '-o', str(archive)], check=True, stdout=sys.stderr)
-    if hashlib.sha256(archive.read_bytes()).hexdigest() != archive_sha:
-        raise RuntimeError('S2Arm 源码校验失败')
+        if sha256_file(archive) != archive_sha:
+            raise RuntimeError('S2Arm 源码校验失败')
     engine = cache / 'Engine'
     if not engine.is_dir():
         with tempfile.TemporaryDirectory(prefix="source-", dir=cache) as tmp:
@@ -111,7 +119,8 @@ def build(installed, revision, archive_sha, patch, fingerprint, cache, shell):
     env = dict(os.environ, DOTNET=dotnet, DOTNET_ROOT=str(Path(dotnet).parent),
                S2A_PREBUILT_TOOLS=str(engine / 'Binaries/Prepare'), S2A_CS_CACHE=str(cache / 'cs-cache'))
     env['PATH'] = str(Path(make).parent) + ':' + str(Path(dotnet).parent) + ':' + env.get('PATH', '')
-    subprocess.run([make, '-s', '-j4', 'ios', 'S2A_CS=1', 'S2A_SHELLUI=1', 'S2A_COMMIT=' + revision],
+    jobs = str(max(2, os.cpu_count() or 4))
+    subprocess.run([make, '-s', '-j' + jobs, 'ios', 'S2A_CS=1', 'S2A_SHELLUI=1', 'S2A_COMMIT=' + revision],
                    cwd=engine.resolve(), env=env, check=True, stdout=sys.stderr)
     return package(installed / 'Shell', engine / 'build/ios/S2Arm.app', shell, fingerprint)
 

@@ -1,5 +1,6 @@
 #include "GCSharedMemory.h"
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define GC_FRAME_MAGIC 0x47434631u
@@ -46,7 +47,9 @@ void gc_shm_input_write(
     /* Odd sequence number signals writer-in-progress (seqlock). */
     uint64_t current = atomic_load_explicit(seq, memory_order_relaxed);
     uint64_t odd = (current & 1ULL) ? current : (current + 1ULL);
-    atomic_store_explicit(seq, odd, memory_order_release);
+    atomic_store_explicit(seq, odd, memory_order_relaxed);
+    /* Prevent payload writes from being reordered before seq becomes odd on ARM64. */
+    atomic_thread_fence(memory_order_release);
 
     if (buttons) {
         memcpy(dst->buttons, buttons, sizeof(dst->buttons));
@@ -78,7 +81,9 @@ void gc_shm_input_read(
         uint64_t s1 = atomic_load_explicit(seq, memory_order_acquire);
         if (s1 & 1ULL) continue;
         memcpy(&copy, src, sizeof(copy));
-        uint64_t s2 = atomic_load_explicit(seq, memory_order_acquire);
+        /* Prevent payload reads from being reordered after loading s2 on ARM64. */
+        atomic_thread_fence(memory_order_acquire);
+        uint64_t s2 = atomic_load_explicit(seq, memory_order_relaxed);
         if (s1 == s2) {
             *out_snapshot = copy;
             break;
@@ -152,20 +157,123 @@ bool gc_shm_frame_latest(
     const _Atomic uint64_t *seq = (const _Atomic uint64_t *)&ring->frame_sequence;
     const _Atomic uint32_t *active = (const _Atomic uint32_t *)&ring->active_slot;
 
-    uint64_t current_seq = atomic_load_explicit(seq, memory_order_acquire);
-    if (current_seq == 0 || current_seq == last_seen_sequence) return false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        uint64_t current_seq = atomic_load_explicit(seq, memory_order_acquire);
+        if (current_seq == 0 || current_seq == last_seen_sequence) return false;
 
-    uint32_t slot = atomic_load_explicit(active, memory_order_acquire);
-    if (slot >= GC_FRAME_SLOTS) return false;
+        uint32_t slot = atomic_load_explicit(active, memory_order_acquire);
+        if (slot >= GC_FRAME_SLOTS) return false;
 
-    GCSharedFrameSlotMeta meta = ring->slots[slot];
-    if (meta.width == 0 || meta.height == 0) return false;
+        GCSharedFrameSlotMeta meta = ring->slots[slot];
+        if (meta.width == 0 || meta.height == 0) return false;
+        if (meta.frame_number != current_seq) continue;
 
-    if (out_slot_index) *out_slot_index = slot;
-    if (out_width) *out_width = meta.width;
-    if (out_height) *out_height = meta.height;
-    if (out_bytes_per_row) *out_bytes_per_row = meta.bytes_per_row;
-    if (out_aspect_ratio) *out_aspect_ratio = meta.aspect_ratio;
-    if (out_sequence) *out_sequence = current_seq;
-    return true;
+        if (out_slot_index) *out_slot_index = slot;
+        if (out_width) *out_width = meta.width;
+        if (out_height) *out_height = meta.height;
+        if (out_bytes_per_row) *out_bytes_per_row = meta.bytes_per_row;
+        if (out_aspect_ratio) *out_aspect_ratio = meta.aspect_ratio;
+        if (out_sequence) *out_sequence = current_seq;
+        return true;
+    }
+    return false;
+}
+
+struct GCAudioRing {
+    uint32_t mask;
+    uint32_t capacity;
+    _Atomic uint32_t read_pos;
+    _Atomic uint32_t write_pos;
+    _Atomic bool muted;
+    int16_t *samples;
+};
+
+GCAudioRing *gc_audio_ring_create(uint32_t capacity_frames_pow2) {
+    uint32_t cap = 1024u;
+    while (cap < capacity_frames_pow2 && cap < (1u << 20)) cap <<= 1u;
+    GCAudioRing *ring = calloc(1, sizeof(GCAudioRing));
+    if (!ring) return NULL;
+    ring->samples = calloc((size_t)cap * 2u, sizeof(int16_t));
+    if (!ring->samples) {
+        free(ring);
+        return NULL;
+    }
+    ring->capacity = cap;
+    ring->mask = cap - 1u;
+    atomic_init(&ring->read_pos, 0u);
+    atomic_init(&ring->write_pos, 0u);
+    atomic_init(&ring->muted, false);
+    return ring;
+}
+
+void gc_audio_ring_destroy(GCAudioRing *ring) {
+    if (!ring) return;
+    free(ring->samples);
+    free(ring);
+}
+
+void gc_audio_ring_clear(GCAudioRing *ring) {
+    if (!ring) return;
+    uint32_t w = atomic_load_explicit(&ring->write_pos, memory_order_acquire);
+    atomic_store_explicit(&ring->read_pos, w, memory_order_release);
+}
+
+uint32_t gc_audio_ring_available(const GCAudioRing *ring) {
+    if (!ring) return 0u;
+    uint32_t w = atomic_load_explicit(&ring->write_pos, memory_order_acquire);
+    uint32_t r = atomic_load_explicit(&ring->read_pos, memory_order_acquire);
+    return w - r;
+}
+
+uint32_t gc_audio_ring_write(GCAudioRing *ring, const int16_t *samples, uint32_t frame_count) {
+    if (!ring || !samples || frame_count == 0u) return 0u;
+    uint32_t w = atomic_load_explicit(&ring->write_pos, memory_order_relaxed);
+    uint32_t r = atomic_load_explicit(&ring->read_pos, memory_order_acquire);
+    uint32_t free_frames = ring->capacity - (w - r);
+    uint32_t to_write = frame_count < free_frames ? frame_count : free_frames;
+    if (to_write == 0u) return 0u;
+
+    uint32_t idx = w & ring->mask;
+    uint32_t first = ring->capacity - idx;
+    if (first > to_write) first = to_write;
+    memcpy(ring->samples + (size_t)idx * 2u, samples, (size_t)first * 4u);
+    uint32_t rem = to_write - first;
+    if (rem > 0u) {
+        memcpy(ring->samples, samples + (size_t)first * 2u, (size_t)rem * 4u);
+    }
+    atomic_store_explicit(&ring->write_pos, w + to_write, memory_order_release);
+    return to_write;
+}
+
+uint32_t gc_audio_ring_read(GCAudioRing *ring, int16_t *out_samples, uint32_t frame_count) {
+    if (!ring || !out_samples || frame_count == 0u) return 0u;
+    uint32_t r = atomic_load_explicit(&ring->read_pos, memory_order_relaxed);
+    uint32_t w = atomic_load_explicit(&ring->write_pos, memory_order_acquire);
+    uint32_t avail = w - r;
+    uint32_t to_read = frame_count < avail ? frame_count : avail;
+    if (to_read == 0u) return 0u;
+
+    if (atomic_load_explicit(&ring->muted, memory_order_relaxed)) {
+        memset(out_samples, 0, (size_t)to_read * 4u);
+    } else {
+        uint32_t idx = r & ring->mask;
+        uint32_t first = ring->capacity - idx;
+        if (first > to_read) first = to_read;
+        memcpy(out_samples, ring->samples + (size_t)idx * 2u, (size_t)first * 4u);
+        uint32_t rem = to_read - first;
+        if (rem > 0u) {
+            memcpy(out_samples + (size_t)first * 2u, ring->samples, (size_t)rem * 4u);
+        }
+    }
+    atomic_store_explicit(&ring->read_pos, r + to_read, memory_order_release);
+    return to_read;
+}
+
+void gc_audio_ring_set_muted(GCAudioRing *ring, bool muted) {
+    if (!ring) return;
+    atomic_store_explicit(&ring->muted, muted, memory_order_relaxed);
+}
+
+bool gc_audio_ring_is_muted(const GCAudioRing *ring) {
+    return ring ? atomic_load_explicit(&ring->muted, memory_order_relaxed) : false;
 }

@@ -1,10 +1,14 @@
 #include "RetroCore.h"
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define GC_RETRO_AUDIO_FRAMES 16384u
+#define GC_RETRO_AUDIO_MASK (GC_RETRO_AUDIO_FRAMES - 1u)
 
 /* The libretro ABI uses process-wide callbacks. The app presents one core at a time. */
 struct GameInfo { const char *path; const void *data; size_t size; const char *meta; };
@@ -23,8 +27,8 @@ struct GCRetro {
     uint16_t buttons;
     int16_t axes[4], pointer_x, pointer_y;
     bool pointer_pressed;
-    int16_t audio[32768];
-    size_t audio_frames;
+    int16_t audio[GC_RETRO_AUDIO_FRAMES * 2];
+    size_t audio_read, audio_write;
     bool initialized, loaded, hardware_requested;
     void (*run)(void), (*unload)(void), (*deinit)(void);
     size_t (*memory_size)(unsigned);
@@ -188,6 +192,28 @@ static bool environment(unsigned command, void *arg) {
     }
 }
 
+static uint32_t g_rgb565_lut[65536];
+static uint32_t g_xrgb1555_lut[65536];
+static pthread_once_t g_lut_once = PTHREAD_ONCE_INIT;
+
+static void init_pixel_luts(void) {
+    for (uint32_t p = 0; p < 65536u; ++p) {
+        uint32_t b5 = p & 31u;
+        uint32_t b8 = (b5 << 3) | (b5 >> 2);
+        uint32_t r5 = (p >> 11) & 31u;
+        uint32_t g6 = (p >> 5) & 63u;
+        uint32_t r8 = (r5 << 3) | (r5 >> 2);
+        uint32_t g8 = (g6 << 2) | (g6 >> 4);
+        g_rgb565_lut[p] = (r8 << 16) | (g8 << 8) | b8;
+
+        uint32_t r15 = (p >> 10) & 31u;
+        uint32_t g15 = (p >> 5) & 31u;
+        uint32_t r15_8 = (r15 << 3) | (r15 >> 2);
+        uint32_t g15_8 = (g15 << 3) | (g15 >> 2);
+        g_xrgb1555_lut[p] = (r15_8 << 16) | (g15_8 << 8) | b8;
+    }
+}
+
 static void video(const void *data, unsigned w, unsigned h, size_t pitch) {
     if (!active || !data || data == (const void *)-1 || !w || !h || w > 4096 || h > 4096
         || pitch < w * (active->format == 1 ? 4 : 2)) return;
@@ -198,31 +224,44 @@ static void video(const void *data, unsigned w, unsigned h, size_t pitch) {
         active->width = w;
         active->height = h;
     }
-    for (unsigned y = 0; y < h; y++) {
-        const uint8_t *line = (const uint8_t *)data + y * pitch;
-        uint32_t *out = active->pixels + y * w;
-        if (active->format == 1) {
-            memcpy(out, line, 4 * w);
-            continue;
+    if (active->format == 1) {
+        size_t row_bytes = (size_t)w * 4u;
+        if (pitch == row_bytes) {
+            memcpy(active->pixels, data, row_bytes * (size_t)h);
+        } else {
+            for (unsigned y = 0; y < h; y++) {
+                memcpy(active->pixels + (size_t)y * w, (const uint8_t *)data + (size_t)y * pitch, row_bytes);
+            }
         }
-        const uint16_t *src = (const uint16_t *)line;
-        for (unsigned x = 0; x < w; x++) {
-            unsigned p = src[x], r, g, b = (p & 31) * 255 / 31;
-            if (active->format == 2) { r = (p >> 11) * 255 / 31; g = ((p >> 5) & 63) * 255 / 63; }
-            else { r = ((p >> 10) & 31) * 255 / 31; g = ((p >> 5) & 31) * 255 / 31; }
-            out[x] = (r << 16) | (g << 8) | b;
+    } else {
+        pthread_once(&g_lut_once, init_pixel_luts);
+        const uint32_t *lut = active->format == 2 ? g_rgb565_lut : g_xrgb1555_lut;
+        for (unsigned y = 0; y < h; y++) {
+            const uint16_t *src = (const uint16_t *)((const uint8_t *)data + (size_t)y * pitch);
+            uint32_t *out = active->pixels + (size_t)y * w;
+            for (unsigned x = 0; x < w; x++) {
+                out[x] = lut[src[x]];
+            }
         }
     }
     ++active->sequence;
 }
 
 static size_t audio(const int16_t *data, size_t frames) {
-    if (!active || !data) return 0;
-    const size_t capacity = sizeof(active->audio) / (2 * sizeof(int16_t));
-    size_t count = capacity - active->audio_frames;
+    if (!active || !data || frames == 0) return 0;
+    size_t used = active->audio_write - active->audio_read;
+    size_t count = GC_RETRO_AUDIO_FRAMES - used;
     if (count > frames) count = frames;
-    memcpy(active->audio + active->audio_frames * 2, data, count * 2 * sizeof(int16_t));
-    active->audio_frames += count;
+    if (count == 0) return frames;
+    size_t idx = active->audio_write & GC_RETRO_AUDIO_MASK;
+    size_t first = GC_RETRO_AUDIO_FRAMES - idx;
+    if (first > count) first = count;
+    memcpy(active->audio + idx * 2, data, first * 2 * sizeof(int16_t));
+    size_t rem = count - first;
+    if (rem > 0) {
+        memcpy(active->audio, data + first * 2, rem * 2 * sizeof(int16_t));
+    }
+    active->audio_write += count;
     return frames;
 }
 static void sample(int16_t l, int16_t r) { const int16_t pair[] = {l, r}; audio(pair, 1); }
@@ -242,7 +281,6 @@ static int16_t input(unsigned port, unsigned device, unsigned index, unsigned id
 }
 
 const char *gc_retro_error(void) { return error; }
-const char *gc_retro_last_log_error(void) { return last_log_error; }
 
 GCRetro *gc_retro_open(const char *core, const char *rom, const char *system, const char *save) {
     if (active) { snprintf(error, sizeof(error), "已有游戏正在运行"); return NULL; }
@@ -333,10 +371,18 @@ const void *gc_retro_frame(GCRetro *s, int *w, int *h, uint64_t *sequence) {
     *w = s->width; *h = s->height; *sequence = s->sequence; return s->pixels;
 }
 size_t gc_retro_audio(GCRetro *s, int16_t *output, size_t frames) {
-    if (frames > s->audio_frames) frames = s->audio_frames;
-    memcpy(output, s->audio, frames * 2 * sizeof(int16_t));
-    s->audio_frames -= frames;
-    memmove(s->audio, s->audio + frames * 2, s->audio_frames * 2 * sizeof(int16_t));
+    size_t avail = s->audio_write - s->audio_read;
+    if (frames > avail) frames = avail;
+    if (frames == 0) return 0;
+    size_t idx = s->audio_read & GC_RETRO_AUDIO_MASK;
+    size_t first = GC_RETRO_AUDIO_FRAMES - idx;
+    if (first > frames) first = frames;
+    memcpy(output, s->audio + idx * 2, first * 2 * sizeof(int16_t));
+    size_t rem = frames - first;
+    if (rem > 0) {
+        memcpy(output + first * 2, s->audio, rem * 2 * sizeof(int16_t));
+    }
+    s->audio_read += frames;
     return frames;
 }
 void gc_retro_save(GCRetro *s) {
@@ -349,8 +395,9 @@ void gc_retro_save(GCRetro *s) {
     FILE *file = fopen(temporary, "wb");
     if (file) {
         bool written = fwrite(memory, 1, size, file) == size;
-        if (!fclose(file) && written) rename(temporary, s->battery);
-        remove(temporary);
+        if (fclose(file) != 0 || !written || rename(temporary, s->battery) != 0) {
+            remove(temporary);
+        }
     }
     free(temporary);
 }

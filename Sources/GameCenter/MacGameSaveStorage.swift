@@ -207,9 +207,9 @@ enum MacGameSaveStorage {
         if isS2 && updateLauncher, let launcher = Bundle.main.resourceURL?.appendingPathComponent("Tools/S2ArmStandaloneLauncher") {
             let target = app.appendingPathComponent("Contents/MacOS/S2ArmGameLauncher")
             let replacement = try Data(contentsOf: launcher)
-            if try Data(contentsOf: target) != replacement {
+            let previous = try Data(contentsOf: target)
+            if previous != replacement {
                 // Existing S2Arm apps need the new write-back path as well as new builds.
-                let previous = try Data(contentsOf: target)
                 do {
                     try replacement.write(to: target, options: .atomic)
                     try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: target.path)
@@ -263,8 +263,8 @@ enum MacGameSaveStorage {
 
     /// Point Cemu's emulated NAND (mlc01) at the library save folder.
     private static func setCemuMLCPath(at file: URL, to value: String) throws {
-        var xml = (try? String(contentsOf: file, encoding: .utf8))
-            ?? "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<content>\n</content>\n"
+        let original = try? String(contentsOf: file, encoding: .utf8)
+        var xml = original ?? "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<content>\n</content>\n"
         let tag = "mlc_path"
         let escaped = value.replacingOccurrences(of: "&", with: "&amp;")
         if let range = xml.range(of: "<\(tag)>[^<]*</\(tag)>", options: .regularExpression) {
@@ -274,6 +274,7 @@ enum MacGameSaveStorage {
         } else {
             throw GameSaveLayout.Failure("Cemu 配置里找不到 mlc_path 设置项。")
         }
+        guard xml != original else { return }
         try xml.write(to: file, atomically: true, encoding: .utf8)
     }
 
@@ -289,13 +290,16 @@ enum MacGameSaveStorage {
         return nil
     }
     static func setINI(at file: URL, section: String, key: String, value: String) throws {
-        var lines = ((try? String(contentsOf: file, encoding: .utf8)) ?? "").components(separatedBy: .newlines)
+        let original = try? String(contentsOf: file, encoding: .utf8)
+        var lines = (original ?? "").components(separatedBy: .newlines)
         if let start = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "[\(section)]" }) {
             let end = lines[(start + 1)...].firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("[") }) ?? lines.endIndex
             if let index = lines[(start + 1)..<end].firstIndex(where: { $0.split(separator: "=", maxSplits: 1).first?.trimmingCharacters(in: .whitespaces) == key }) { lines[index] = "\(key) = \(value)" }
             else { lines.insert("\(key) = \(value)", at: end) }
         } else { lines += ["[\(section)]", "\(key) = \(value)"] }
+        let updated = lines.joined(separator: "\n")
+        guard updated != original else { return }
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try lines.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
+        try updated.write(to: file, atomically: true, encoding: .utf8)
     }
 }

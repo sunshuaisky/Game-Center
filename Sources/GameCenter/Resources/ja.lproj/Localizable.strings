@@ -52,7 +52,7 @@
 "选择…" = "選択…";
 "检查 S2Arm 更新" = "S2Arm の更新を確認";
 "选择 Switch 游戏或 Switch 2 NUP" = "Switch ゲームまたは Switch 2 NUP を選択";
-"构建 Switch 游戏" = "Switch ゲームをビルド";
+"选择自己的 prod.keys" = "自分の prod.keys を選択";
 "方向键浏览   ↑↓ 切换平台   A 查看详情" = "矢印キーで移動   ↑↓ 機種切替   A 詳細";
 "方向键浏览   LB/RB 切换平台   A 详情   Y 选项   B 返回" = "方向キーで移動   LB/RB 機種切替   A 詳細   Y オプション   B 戻る";
 "macOS 原生游戏" = "Mac ゲーム";

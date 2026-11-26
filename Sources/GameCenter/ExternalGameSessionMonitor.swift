@@ -16,12 +16,10 @@ final class ExternalGameSessionMonitor: ObservableObject {
     private var trackedApp: NSRunningApplication?
     private var trackedPID: pid_t = 0
     private var terminationObserver: NSObjectProtocol?
+    private var connectObserver: NSObjectProtocol?
+    private var disconnectObserver: NSObjectProtocol?
     private var chordTimer: Timer?
     private var chordHoldStart: Date?
-
-    var isExternalGameActive: Bool {
-        trackedApp != nil && trackedApp?.isTerminated == false
-    }
 
     private init() {}
 
@@ -38,21 +36,36 @@ final class ExternalGameSessionMonitor: ObservableObject {
             queue: .main
         ) { [weak self] notification in
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 guard let self, app.processIdentifier == self.trackedPID else { return }
                 self.clearTracking()
                 self.restoreGameCenterToFront()
             }
         }
 
-        // Start lightweight gamepad chord watcher (hold Menu + Options for 1.5s to exit & return)
-        chordTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.checkExitChord()
-            }
+        connectObserver = NotificationCenter.default.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateChordTimer() }
         }
-        if let chordTimer {
-            RunLoop.main.add(chordTimer, forMode: .common)
+        disconnectObserver = NotificationCenter.default.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateChordTimer() }
+        }
+        updateChordTimer()
+    }
+
+    private func updateChordTimer() {
+        let hasController = trackedApp != nil && GCController.controllers().contains { $0.extendedGamepad != nil }
+        if hasController {
+            if chordTimer == nil {
+                let timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.checkExitChord() }
+                }
+                RunLoop.main.add(timer, forMode: .common)
+                chordTimer = timer
+            }
+        } else {
+            chordTimer?.invalidate()
+            chordTimer = nil
+            chordHoldStart = nil
         }
     }
 
@@ -114,6 +127,14 @@ final class ExternalGameSessionMonitor: ObservableObject {
         if let observer = terminationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
             terminationObserver = nil
+        }
+        if let observer = connectObserver {
+            NotificationCenter.default.removeObserver(observer)
+            connectObserver = nil
+        }
+        if let observer = disconnectObserver {
+            NotificationCenter.default.removeObserver(observer)
+            disconnectObserver = nil
         }
         chordTimer?.invalidate()
         chordTimer = nil

@@ -16,6 +16,7 @@ let package = Package(
             name: "CRetroHost",
             path: "Sources/CRetroHost",
             publicHeadersPath: "include",
+            cSettings: [.define("GL_SILENCE_DEPRECATION")],
             linkerSettings: [.linkedFramework("OpenGL")]
         ),
         .target(
@@ -26,7 +27,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "GameCenterCoreHelper",
-            dependencies: ["CRetroHost", "CoreHostIPC", "GameCenterSaveSupport"],
+            dependencies: ["CRetroHost", "CoreHostIPC"],
             path: "Sources/GameCenterCoreHelper",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
@@ -35,18 +36,6 @@ let package = Package(
             name: "GameCenter",
             dependencies: ["GameCenterSaveSupport", "CoreHostIPC"],
             path: "Sources/GameCenter",
-            exclude: [
-                "Resources/family-game.glb",
-                "Resources/game-child-advance.glb",
-                "Resources/game-child-color.glb",
-                "Resources/game-child.glb",
-                "Resources/gameboy-poly.glb",
-                "Resources/gamepad-controller.glb",
-                "Resources/handheld-console.glb",
-                "Resources/retro-laptop.glb",
-                "Resources/switch-poly.glb",
-                "Resources/videogame-poly.glb"
-            ],
             resources: [.process("Resources")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

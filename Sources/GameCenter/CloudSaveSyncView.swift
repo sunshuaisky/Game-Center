@@ -126,19 +126,36 @@ struct CloudSaveSyncView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(white: 0.075))
         .task {
-            guard let root = try? saveRoot() else { return }
-            switchTitles = ((try? FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("switch").path)) ?? [])
-                .filter { $0.range(of: "^[0-9A-Fa-f]{16}$", options: .regularExpression) != nil }.sorted()
-            chosenTitle = switchTitles.first ?? ""
-            localPath = root.path
-            do { cloudPath = try CloudSaveLocation.resolve(bookmark: bookmark).folder.path }
-            catch let failure as CloudSaveLocation.Failure {
-                switch failure {
-                case .authorizationRequired, .staleAuthorization: needsAuthorization = true
-                case .unavailable: failed = true
-                }
-                message = failure.localizedDescription
-            } catch { failed = true; message = error.localizedDescription }
+            let resolveRoot = saveRoot
+            let savedBookmark = bookmark
+            let setup: (root: URL, titles: [String], cloudPath: String?, needsAuth: Bool, failed: Bool, message: String?)? =
+                await Task.detached(priority: .utility) {
+                    guard let root = try? resolveRoot() else { return nil }
+                    let titles = ((try? FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("switch").path)) ?? [])
+                        .filter { $0.count == 16 && $0.allSatisfy(\.isHexDigit) }
+                        .sorted()
+                    do {
+                        let path = try CloudSaveLocation.resolve(bookmark: savedBookmark).folder.path
+                        return (root, titles, path, false, false, nil)
+                    } catch let failure as CloudSaveLocation.Failure {
+                        switch failure {
+                        case .authorizationRequired, .staleAuthorization:
+                            return (root, titles, nil, true, false, failure.localizedDescription)
+                        case .unavailable:
+                            return (root, titles, nil, false, true, failure.localizedDescription)
+                        }
+                    } catch {
+                        return (root, titles, nil, false, true, error.localizedDescription)
+                    }
+                }.value
+            guard let setup else { return }
+            switchTitles = setup.titles
+            chosenTitle = setup.titles.first ?? ""
+            localPath = setup.root.path
+            cloudPath = setup.cloudPath
+            needsAuthorization = setup.needsAuth
+            failed = setup.failed
+            if let msg = setup.message { message = msg }
         }
         .confirmationDialog(pendingTransfer?.upload == true ? "使用本机进度更新 iCloud？" : "使用 iCloud 进度更新本机？",
                             isPresented: $confirmsTransfer) {
@@ -192,55 +209,61 @@ struct CloudSaveSyncView: View {
     private func run(transfer: CloudSaveDirectorySync.SwitchTransfer? = nil) {
         guard !syncing else { return }
         guard !isPlaying() else { failed = true; message = "请先退出正在运行的游戏，再同步存档。"; return }
-        do {
-            let local = try saveRoot()
-            localPath = local.path
-            let savedBookmark = bookmark
-            syncing = true
-            failed = false
-            #if os(macOS)
-            message = "正在检查本机与 iCloud 存档。如系统询问文件访问，请允许后继续。"
-            #else
-            message = "正在检查本机与 iCloud 存档…"
-            #endif
-            Task {
-                defer { syncing = false }
-                do {
-                    #if os(macOS)
-                    let macNames = true
-                    #else
-                    let macNames = false
-                    #endif
-                    let (result, remote) = try await Task.detached(priority: .utility) {
-                        let access = try CloudSaveLocation.resolve(bookmark: savedBookmark)
-                        let accessed = access.scope?.startAccessingSecurityScopedResource() ?? false
-                        defer { if accessed { access.scope?.stopAccessingSecurityScopedResource() } }
-                        let result = try CloudSaveDirectorySync().sync(local: local, cloud: access.folder.appendingPathComponent("save"), macBatteryNames: macNames, switchTransfer: transfer) { status in
-                            Task { @MainActor in message = status }
-                        }
-                        return (result, access.folder.path)
-                    }.value
-                    cloudPath = remote
-                    needsAuthorization = false
-                    outcome = result
-                    lastSync = Date()
-                    message = transfer.map { $0.upload ? "已将这款游戏的本机进度写入 iCloud 同步目录。" : "已从 iCloud 恢复这款游戏的进度，可以重新打开游戏。" } ?? "本机与 iCloud 已合并。云端上传完成后，另一台设备即可获取最新进度。"
-                    if !result.sameDateConflicts.isEmpty {
-                        failed = true
-                        message += "\n\(result.sameDateConflicts.count) 项存档修改时间相同但内容不同，已保留两端：\n" + result.sameDateConflicts.prefix(8).joined(separator: "\n")
-                    }
-                } catch {
-                    if let failure = error as? CloudSaveLocation.Failure {
-                        switch failure {
-                        case .authorizationRequired, .staleAuthorization: needsAuthorization = true
-                        case .unavailable: break
+        let savedBookmark = bookmark
+        let resolveRoot = saveRoot
+        syncing = true
+        failed = false
+        #if os(macOS)
+        message = "正在检查本机与 iCloud 存档。如系统询问文件访问，请允许后继续。"
+        #else
+        message = "正在检查本机与 iCloud 存档…"
+        #endif
+        Task {
+            defer { syncing = false }
+            do {
+                #if os(macOS)
+                let macNames = true
+                #else
+                let macNames = false
+                #endif
+                // Run blocking iCloud wait & file sync on a dedicated GCD thread to avoid starving Swift concurrency pool.
+                let (result, local, remote): (CloudSaveDirectorySync.Result, String, String) = try await withCheckedThrowingContinuation { continuation in
+                    DispatchQueue.global(qos: .utility).async {
+                        do {
+                            let localURL = try resolveRoot()
+                            let access = try CloudSaveLocation.resolve(bookmark: savedBookmark)
+                            let accessed = access.scope?.startAccessingSecurityScopedResource() ?? false
+                            defer { if accessed { access.scope?.stopAccessingSecurityScopedResource() } }
+                            let result = try CloudSaveDirectorySync().sync(local: localURL, cloud: access.folder.appendingPathComponent("save"), macBatteryNames: macNames, switchTransfer: transfer) { status in
+                                Task { @MainActor in message = status }
+                            }
+                            continuation.resume(returning: (result, localURL.path, access.folder.path))
+                        } catch {
+                            continuation.resume(throwing: error)
                         }
                     }
-                    failed = true
-                    message = needsAuthorization ? "首次连接时，请授权访问 iCloud Drive 中的“Game Center存档”。之后会自动记住。" : error.localizedDescription
                 }
+                localPath = local
+                cloudPath = remote
+                needsAuthorization = false
+                outcome = result
+                lastSync = Date()
+                message = transfer.map { $0.upload ? "已将这款游戏的本机进度写入 iCloud 同步目录。" : "已从 iCloud 恢复这款游戏的进度，可以重新打开游戏。" } ?? "本机与 iCloud 已合并。云端上传完成后，另一台设备即可获取最新进度。"
+                if !result.sameDateConflicts.isEmpty {
+                    failed = true
+                    message += "\n\(result.sameDateConflicts.count) 项存档修改时间相同但内容不同，已保留两端：\n" + result.sameDateConflicts.prefix(8).joined(separator: "\n")
+                }
+            } catch {
+                if let failure = error as? CloudSaveLocation.Failure {
+                    switch failure {
+                    case .authorizationRequired, .staleAuthorization: needsAuthorization = true
+                    case .unavailable: break
+                    }
+                }
+                failed = true
+                message = needsAuthorization ? "首次连接时，请授权访问 iCloud Drive 中的“Game Center存档”。之后会自动记住。" : error.localizedDescription
             }
-        } catch { failed = true; message = error.localizedDescription }
+        }
     }
 }
 

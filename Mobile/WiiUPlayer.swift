@@ -5,15 +5,22 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 import QuartzCore
-import Metal
 
 final class NativeMetalView: UIView {
     override class var layerClass: AnyClass { CAMetalLayer.self }
     var resized: (() -> Void)?
+    private var lastSize: CGSize = .zero
+    private var lastScale: CGFloat = 0
+
     override func layoutSubviews() {
         super.layoutSubviews()
-        contentScaleFactor = window?.screen.scale ?? traitCollection.displayScale
-        if bounds.width > 1 && bounds.height > 1 { resized?() }
+        let scale = window?.screen.scale ?? traitCollection.displayScale
+        contentScaleFactor = scale
+        if bounds.width > 1 && bounds.height > 1 && (bounds.size != lastSize || scale != lastScale) {
+            lastSize = bounds.size
+            lastScale = scale
+            resized?()
+        }
     }
 }
 
@@ -37,7 +44,6 @@ private final class WiiUCore: @unchecked Sendable {
     typealias StatusText = @convention(c) () -> UnsafePointer<CChar>?
 
     private static var instance: WiiUCore?
-    private let handle: UnsafeMutableRawPointer
     let initialize: Initialize
     let boot: Boot
     let surface: Surface
@@ -113,7 +119,6 @@ private final class WiiUCore: @unchecked Sendable {
             dlclose(library)
             throw error
         }
-        handle = library
         view.backgroundColor = .black
         view.isMultipleTouchEnabled = false
     }
@@ -158,6 +163,16 @@ private final class WiiUCore: @unchecked Sendable {
     }
 }
 
+private final class WiiUDisplayLinkProxy: NSObject {
+    weak var target: WiiUSession?
+    init(target: WiiUSession) { self.target = target }
+    @objc func tick() {
+        MainActor.assumeIsolated {
+            target?.pollGamepad()
+        }
+    }
+}
+
 @MainActor
 private final class WiiUSession: NSObject, ObservableObject {
     @Published var error: String?
@@ -167,16 +182,19 @@ private final class WiiUSession: NSObject, ObservableObject {
     @Published fileprivate var core: WiiUCore?
     private var closing = false
     private var launched = false
+    private var bootSucceeded = false
     private var displayLink: CADisplayLink?
     private var connectObserver: NSObjectProtocol?
     private var disconnectObserver: NSObjectProtocol?
-    private var touchButtons = Set<Int32>()
+    private var touchButtonsMask: UInt32 = 0
     private var touchSticks: [(Float, Float)] = [(0, 0), (0, 0)]
-    private var lastSentButtons = Set<Int32>()
+    private var lastSentButtonsMask: UInt32 = 0
     private var lastSentSticks: [(Float, Float)] = [(0, 0), (0, 0)]
 
     func setTouchButton(_ id: Int32, pressed: Bool) {
-        if pressed { touchButtons.insert(id) } else { touchButtons.remove(id) }
+        guard id >= 1 && id <= 31 else { return }
+        let bit: UInt32 = 1 << UInt32(id)
+        if pressed { touchButtonsMask |= bit } else { touchButtonsMask &= ~bit }
         pollGamepad()
     }
 
@@ -187,17 +205,37 @@ private final class WiiUSession: NSObject, ObservableObject {
     }
 
     private func startGamepadPolling() {
-        guard displayLink == nil else { return }
+        guard connectObserver == nil else { return }
         GCController.startWirelessControllerDiscovery(completionHandler: nil)
         connectObserver = NotificationCenter.default.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.core?.refreshInputDevices?() }
+            MainActor.assumeIsolated {
+                self?.core?.refreshInputDevices?()
+                self?.updateGamepadDisplayLink()
+            }
         }
         disconnectObserver = NotificationCenter.default.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.core?.refreshInputDevices?() }
+            MainActor.assumeIsolated {
+                self?.core?.refreshInputDevices?()
+                self?.updateGamepadDisplayLink()
+            }
         }
-        let link = CADisplayLink(target: self, selector: #selector(pollGamepad))
-        link.add(to: .main, forMode: .common)
-        displayLink = link
+        updateGamepadDisplayLink()
+    }
+
+    private func updateGamepadDisplayLink() {
+        let hasController = !GCController.controllers().isEmpty
+        if hasController && !closing && bootSucceeded {
+            if displayLink == nil {
+                let proxy = WiiUDisplayLinkProxy(target: self)
+                let link = CADisplayLink(target: proxy, selector: #selector(WiiUDisplayLinkProxy.tick))
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+                link.add(to: .main, forMode: .common)
+                displayLink = link
+            }
+        } else {
+            displayLink?.invalidate()
+            displayLink = nil
+        }
     }
 
     private func stopGamepadPolling() {
@@ -206,36 +244,36 @@ private final class WiiUSession: NSObject, ObservableObject {
         GCController.stopWirelessControllerDiscovery()
         if let connectObserver { NotificationCenter.default.removeObserver(connectObserver); self.connectObserver = nil }
         if let disconnectObserver { NotificationCenter.default.removeObserver(disconnectObserver); self.disconnectObserver = nil }
-        touchButtons.removeAll()
+        touchButtonsMask = 0
         touchSticks = [(0, 0), (0, 0)]
-        lastSentButtons.removeAll()
+        lastSentButtonsMask = 0
         lastSentSticks = [(0, 0), (0, 0)]
     }
 
-    @objc private func pollGamepad() {
-        guard let core, launched, !closing else { return }
-        var buttons = touchButtons
+    func pollGamepad() {
+        guard let core, bootSucceeded, !closing else { return }
+        var buttons = touchButtonsMask
         var leftStick = touchSticks[0]
         var rightStick = touchSticks[1]
 
         if let pad = (GCController.current ?? GCController.controllers().first)?.extendedGamepad {
             // Nintendo layout: East(B) -> A(1), South(A) -> B(2), North(Y) -> X(3), West(X) -> Y(4)
-            if pad.buttonB.isPressed { buttons.insert(1) }
-            if pad.buttonA.isPressed { buttons.insert(2) }
-            if pad.buttonY.isPressed { buttons.insert(3) }
-            if pad.buttonX.isPressed { buttons.insert(4) }
-            if pad.leftShoulder.isPressed { buttons.insert(5) }
-            if pad.rightShoulder.isPressed { buttons.insert(6) }
-            if pad.leftTrigger.value > 0.25 { buttons.insert(7) }
-            if pad.rightTrigger.value > 0.25 { buttons.insert(8) }
-            if pad.buttonMenu.isPressed { buttons.insert(9) }
-            if pad.buttonOptions?.isPressed == true { buttons.insert(10) }
-            if pad.dpad.up.isPressed { buttons.insert(11) }
-            if pad.dpad.down.isPressed { buttons.insert(12) }
-            if pad.dpad.left.isPressed { buttons.insert(13) }
-            if pad.dpad.right.isPressed { buttons.insert(14) }
-            if pad.leftThumbstickButton?.isPressed == true { buttons.insert(15) }
-            if pad.rightThumbstickButton?.isPressed == true { buttons.insert(16) }
+            if pad.buttonB.isPressed { buttons |= (1 << 1) }
+            if pad.buttonA.isPressed { buttons |= (1 << 2) }
+            if pad.buttonY.isPressed { buttons |= (1 << 3) }
+            if pad.buttonX.isPressed { buttons |= (1 << 4) }
+            if pad.leftShoulder.isPressed { buttons |= (1 << 5) }
+            if pad.rightShoulder.isPressed { buttons |= (1 << 6) }
+            if pad.leftTrigger.value > 0.25 { buttons |= (1 << 7) }
+            if pad.rightTrigger.value > 0.25 { buttons |= (1 << 8) }
+            if pad.buttonMenu.isPressed { buttons |= (1 << 9) }
+            if pad.buttonOptions?.isPressed == true { buttons |= (1 << 10) }
+            if pad.dpad.up.isPressed { buttons |= (1 << 11) }
+            if pad.dpad.down.isPressed { buttons |= (1 << 12) }
+            if pad.dpad.left.isPressed { buttons |= (1 << 13) }
+            if pad.dpad.right.isPressed { buttons |= (1 << 14) }
+            if pad.leftThumbstickButton?.isPressed == true { buttons |= (1 << 15) }
+            if pad.rightThumbstickButton?.isPressed == true { buttons |= (1 << 16) }
 
             let lx = pad.leftThumbstick.xAxis.value
             let ly = pad.leftThumbstick.yAxis.value
@@ -244,20 +282,25 @@ private final class WiiUSession: NSObject, ObservableObject {
             let ry = pad.rightThumbstick.yAxis.value
             if abs(rx) > 0.05 || abs(ry) > 0.05 { rightStick = (rx, ry) }
         } else if let micro = (GCController.current ?? GCController.controllers().first)?.microGamepad {
-            if micro.buttonX.isPressed { buttons.insert(1) }
-            if micro.buttonA.isPressed { buttons.insert(2) }
-            if micro.buttonMenu.isPressed { buttons.insert(9) }
-            if micro.dpad.up.isPressed { buttons.insert(11) }
-            if micro.dpad.down.isPressed { buttons.insert(12) }
-            if micro.dpad.left.isPressed { buttons.insert(13) }
-            if micro.dpad.right.isPressed { buttons.insert(14) }
+            if micro.buttonX.isPressed { buttons |= (1 << 1) }
+            if micro.buttonA.isPressed { buttons |= (1 << 2) }
+            if micro.buttonMenu.isPressed { buttons |= (1 << 9) }
+            if micro.dpad.up.isPressed { buttons |= (1 << 11) }
+            if micro.dpad.down.isPressed { buttons |= (1 << 12) }
+            if micro.dpad.left.isPressed { buttons |= (1 << 13) }
+            if micro.dpad.right.isPressed { buttons |= (1 << 14) }
         }
 
-        let changed = buttons.symmetricDifference(lastSentButtons)
-        for id in changed {
-            core.button(id, buttons.contains(id))
+        let changed = buttons ^ lastSentButtonsMask
+        if changed != 0 {
+            var remaining = changed
+            while remaining != 0 {
+                let bitIndex = remaining.trailingZeroBitCount
+                remaining &= remaining - 1
+                core.button(Int32(bitIndex), (buttons & (1 << UInt32(bitIndex))) != 0)
+            }
+            lastSentButtonsMask = buttons
         }
-        lastSentButtons = buttons
 
         if leftStick != lastSentSticks[0] {
             core.stick(0, leftStick.0, leftStick.1)
@@ -273,92 +316,106 @@ private final class WiiUSession: NSObject, ObservableObject {
         guard !launched, !closing else { return }
         error = nil
         starting = true
-        do {
-            // Release S2Arm's unused 60+ GiB constructor VA window before Cemu's MMU
-            // reserves 4 GiB via vm_allocate (otherwise Cemu MMU.cpp exits immediately).
-            if gc_s2arm_release_va_window() != 0 {
-                throw WiiUCore.Failure("当前进程已运行过 Switch 游戏并占用虚拟地址空间，请彻底关闭并重新打开 Game Center 后再启动 Wii U 游戏。")
-            }
-            let core = try self.core ?? WiiUCore.shared()
-            self.core = core
-            library.seedSystemFiles(for: rom.platform)
-            let root = library.root.appendingPathComponent("save/wiiu/mlc", isDirectory: true)
-            let biosCandidates = [
-                library.bios.appendingPathComponent("\(rom.platform.folder)/keys.txt"),
-                library.bios.appendingPathComponent("WiiU/keys.txt")
-            ]
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            if let bios = biosCandidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
-                let data = try Data(contentsOf: bios)
-                try data.write(to: root.appendingPathComponent("keys.txt"), options: .atomic)
-                let keysDir = library.documents.appendingPathComponent("keys", isDirectory: true)
-                try FileManager.default.createDirectory(at: keysDir, withIntermediateDirectories: true)
-                try data.write(to: keysDir.appendingPathComponent("keys.txt"), options: .atomic)
-            }
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
-            try AVAudioSession.sharedInstance().setActive(true)
+        // Release S2Arm's unused 60+ GiB constructor VA window before Cemu's MMU
+        // reserves 4 GiB via vm_allocate (otherwise Cemu MMU.cpp exits immediately).
+        if gc_s2arm_release_va_window() != 0 {
+            self.error = "当前进程已运行过 Switch 游戏并占用虚拟地址空间，请彻底关闭并重新打开 Game Center 后再启动 Wii U 游戏。"
+            starting = false
+            return
+        }
+        let existingCore = self.core
+        Task { [weak self] in
+            do {
+                let setup: (WiiUCore, URL, String) = try await Task.detached(priority: .userInitiated) {
+                    let core = try existingCore ?? WiiUCore.shared()
+                    library.seedSystemFiles(for: rom.platform)
+                    let root = library.root.appendingPathComponent("save/wiiu/mlc", isDirectory: true)
+                    let biosCandidates = [
+                        library.bios.appendingPathComponent("\(rom.platform.folder)/keys.txt"),
+                        library.bios.appendingPathComponent("WiiU/keys.txt")
+                    ]
+                    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                    if let bios = biosCandidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
+                        let data = try Data(contentsOf: bios)
+                        try data.write(to: root.appendingPathComponent("keys.txt"), options: .atomic)
+                        let keysDir = library.documents.appendingPathComponent("keys", isDirectory: true)
+                        try FileManager.default.createDirectory(at: keysDir, withIntermediateDirectories: true)
+                        try data.write(to: keysDir.appendingPathComponent("keys.txt"), options: .atomic)
+                    }
+                    let bootPath = Self.resolveBootPath(for: rom.url)
+                    return (core, root, bootPath)
+                }.value
 
-            let surface = core.view
-            let bootPath = Self.resolveBootPath(for: rom.url)
-
-            let handleSurfaceLayout: () -> Void = { [weak self] in
                 guard let self, !self.closing else { return }
-                let scale = max(1.0, Double(surface.contentScaleFactor))
-                let width = Int32(max(1, surface.bounds.width))
-                let height = Int32(max(1, surface.bounds.height))
-                guard width > 1, height > 1 else { return }
+                let (core, root, bootPath) = setup
+                self.core = core
+                try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+                try AVAudioSession.sharedInstance().setActive(true)
 
-                if self.launched {
-                    core.resize(width, height, scale, true)
-                    return
-                }
-                self.launched = true
-                core.registerSurface(width: width, height: height, scale: scale)
-                core.queue.async {
-                    var failure: String?
-                    do {
-                        try core.prepare(root: root)
-                        // Native Metal renderer (2 = Metal, 1 = Vulkan); recompiler falls back to interpreter without JIT.
-                        core.setGraphicsAPI?(2)
-                        core.setRecompiler?(true)
-                        let status = bootPath.withCString(core.boot)
-                        if status != 0 {
-                            let detail = core.latestStatus().map { "\n" + $0 } ?? ""
-                            switch status {
-                            case 3, 4, 9:
-                                failure = "缺少此加密 Wii U 游戏的密钥。请点击右上角「导入 keys.txt」或将 keys.txt 放入 BIOS/wiiu 后重试。"
-                            case 6:
-                                failure = "选中的是更新或 DLC，请先导入并启动基础游戏。"
-                            default:
-                                failure = "Wii U 核心无法载入此游戏，错误码 " + String(status) + detail
+                let surface = core.view
+                let handleSurfaceLayout: () -> Void = { [weak self] in
+                    guard let self, !self.closing else { return }
+                    let scale = max(1.0, Double(surface.contentScaleFactor))
+                    let width = Int32(max(1, surface.bounds.width))
+                    let height = Int32(max(1, surface.bounds.height))
+                    guard width > 1, height > 1 else { return }
+
+                    if self.launched {
+                        core.resize(width, height, scale, true)
+                        return
+                    }
+                    self.launched = true
+                    core.registerSurface(width: width, height: height, scale: scale)
+                    core.queue.async { [weak self] in
+                        var failure: String?
+                        do {
+                            try core.prepare(root: root)
+                            // Native Metal renderer (2 = Metal, 1 = Vulkan); recompiler falls back to interpreter without JIT.
+                            core.setGraphicsAPI?(2)
+                            core.setRecompiler?(true)
+                            let status = bootPath.withCString(core.boot)
+                            if status != 0 {
+                                let detail = core.latestStatus().map { "\n" + $0 } ?? ""
+                                switch status {
+                                case 3, 4, 9:
+                                    failure = "缺少此加密 Wii U 游戏的密钥。请点击右上角「导入 keys.txt」或将 keys.txt 放入 BIOS/wiiu 后重试。"
+                                case 6:
+                                    failure = "选中的是更新或 DLC，请先导入并启动基础游戏。"
+                                default:
+                                    failure = "Wii U 核心无法载入此游戏，错误码 " + String(status) + detail
+                                }
+                            }
+                        } catch {
+                            failure = error.localizedDescription
+                        }
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self else { return }
+                            self.starting = false
+                            self.error = failure
+                            if failure == nil {
+                                self.bootSucceeded = true
+                                self.startGamepadPolling()
+                            } else {
+                                self.launched = false
                             }
                         }
-                    } catch {
-                        failure = error.localizedDescription
-                    }
-                    DispatchQueue.main.async {
-                        self.starting = false
-                        self.error = failure
-                        if failure == nil {
-                            self.startGamepadPolling()
-                        }
                     }
                 }
-            }
 
-            surface.resized = handleSurfaceLayout
-            if surface.bounds.width > 1 && surface.bounds.height > 1 {
-                handleSurfaceLayout()
-            } else {
-                surface.setNeedsLayout()
+                surface.resized = handleSurfaceLayout
+                if surface.bounds.width > 1 && surface.bounds.height > 1 {
+                    handleSurfaceLayout()
+                } else {
+                    surface.setNeedsLayout()
+                }
+            } catch {
+                self?.error = error.localizedDescription
+                self?.starting = false
             }
-        } catch {
-            self.error = error.localizedDescription
-            starting = false
         }
     }
 
-    private static func resolveBootPath(for url: URL) -> String {
+    nonisolated private static func resolveBootPath(for url: URL) -> String {
         let fm = FileManager.default
         guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
             return url.path
@@ -373,7 +430,7 @@ private final class WiiUSession: NSObject, ObservableObject {
     }
 
     func setPaused(_ paused: Bool) {
-        guard let core, launched, !closing else { return }
+        guard let core, bootSucceeded, !closing else { return }
         core.releaseButtons()
         core.queue.async { paused ? core.pause() : core.resume() }
     }
@@ -386,9 +443,9 @@ private final class WiiUSession: NSObject, ObservableObject {
         guard let core else { completion(); return }
         core.view.resized = nil
         core.releaseButtons()
-        let wasLaunched = launched
+        let shouldStop = bootSucceeded || launched
         core.queue.async {
-            if wasLaunched { core.stop() }
+            if shouldStop { core.stop() }
             DispatchQueue.main.async {
                 self.stopping = false
                 completion()
@@ -406,9 +463,7 @@ private final class WiiUSession: NSObject, ObservableObject {
 private struct WiiUSurface: UIViewRepresentable {
     let core: WiiUCore
     func makeUIView(context: Context) -> UIView { core.view }
-    func updateUIView(_ view: UIView, context: Context) {
-        view.setNeedsLayout()
-    }
+    func updateUIView(_ view: UIView, context: Context) {}
 }
 
 struct WiiUPlayer: View {

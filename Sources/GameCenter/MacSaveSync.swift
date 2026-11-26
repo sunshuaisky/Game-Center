@@ -13,12 +13,12 @@ enum MacSaveSync {
         }
     }
 
-    static func slots(root: String?) throws -> [CloudSaveSlot] {
-        guard let root else { return [] }
+    /// Migrates any legacy Switch or GB/GBC/GBA battery saves into the unified `save/` tree before sync.
+    static func prepareForSync(root: String?) throws {
+        guard let root, !isPlaying(root: root) else { return }
         let directory = URL(fileURLWithPath: root)
         let fm = FileManager.default
         let switchRoot = directory.lastPathComponent.lowercased() == "switch" ? directory : directory.appendingPathComponent("switch")
-        var slots: [CloudSaveSlot] = []
         let apps = (try? fm.contentsOfDirectory(at: switchRoot, includingPropertiesForKeys: nil)) ?? []
         for app in apps where app.pathExtension == "app" {
             let resources = app.appendingPathComponent("Contents/Resources")
@@ -29,17 +29,18 @@ enum MacSaveSync {
                   let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let id = (info[engine == "S2Arm" ? "gameID" : "game"] as? String)?.uppercased(),
                   MobileLibraryFormat.isTitleID(id) else { continue }
-            if !isPlaying(root: root) {
-                _ = try MacGameSaveStorage.prepareSwitch(app: app, root: GameSaveLayout.root(besidePlatformDirectory: switchRoot), updateLauncher: false)
-            }
-            let canonical = GameSaveLayout.folder(root: GameSaveLayout.root(besidePlatformDirectory: switchRoot), platform: "switch", game: id)
-            slots.append(.init(id: "switch/\(id)", title: app.deletingPathExtension().lastPathComponent,
-                               location: canonical))
+            _ = try MacGameSaveStorage.prepareSwitch(
+                app: app,
+                root: GameSaveLayout.root(besidePlatformDirectory: switchRoot),
+                updateLauncher: false
+            )
         }
         // VBA-M's battery file is a raw SRAM/flash image, matching libretro.
+        let saveRoot = directory.appendingPathComponent("save")
+        let skippedFolders: Set<String> = ["switch", "build", "save", "saves", "ios", "bios"]
         let files = fm.enumerator(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles, .skipsPackageDescendants])
         while let rom = files?.nextObject() as? URL {
-            if ["switch", "build", "save", "saves", "ios", "bios"].contains(rom.lastPathComponent.lowercased()) {
+            if skippedFolders.contains(rom.lastPathComponent.lowercased()) {
                 files?.skipDescendants()
                 continue
             }
@@ -50,16 +51,10 @@ enum MacSaveSync {
             case "gba": platform = "gba"
             default: continue
             }
-            if !isPlaying(root: root) {
-                let old = rom.deletingPathExtension().appendingPathExtension("sav")
-                let target = GameSaveLayout.folder(root: directory, platform: platform, game: rom.deletingPathExtension().lastPathComponent).appendingPathComponent(old.lastPathComponent)
-                try GameSaveLayout.migrate(old, to: target, saveRoot: directory.appendingPathComponent("save"))
-            }
-            slots.append(.init(id: "rom/\(platform)/" + rom.deletingPathExtension().lastPathComponent.lowercased(),
-                               title: rom.deletingPathExtension().lastPathComponent,
-                               location: GameSaveLayout.folder(root: directory, platform: platform, game: rom.deletingPathExtension().lastPathComponent).appendingPathComponent(rom.deletingPathExtension().lastPathComponent + ".sav"), fileName: "battery.srm"))
+            let old = rom.deletingPathExtension().appendingPathExtension("sav")
+            let target = GameSaveLayout.folder(root: directory, platform: platform, game: rom.deletingPathExtension().lastPathComponent)
+                .appendingPathComponent(old.lastPathComponent)
+            try GameSaveLayout.migrate(old, to: target, saveRoot: saveRoot)
         }
-        var seen = Set<String>()
-        return slots.filter { seen.insert($0.id).inserted }.sorted { $0.title < $1.title }
     }
 }

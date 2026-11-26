@@ -767,8 +767,17 @@ static S2AGameCenterCheatsMenu *g_s2a_game_center_cheats;
         process.standardOutput = output
         process.standardError = errors
         try process.run()
+        var errorData = Data()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            errorData = errors.fileHandleForReading.readDataToEndOfFile()
+            try? errors.fileHandleForReading.close()
+            group.leave()
+        }
         let data = output.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
+        try? output.fileHandleForReading.close()
+        group.wait()
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
             let detail = String(decoding: errorData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)

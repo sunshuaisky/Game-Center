@@ -100,6 +100,17 @@ bool gc_shm_frame_latest(
     uint64_t *out_sequence
 );
 
+/* Lock-free single-producer / single-consumer stereo Int16 audio ring buffer. */
+typedef struct GCAudioRing GCAudioRing;
+GCAudioRing *gc_audio_ring_create(uint32_t capacity_frames_pow2);
+void gc_audio_ring_destroy(GCAudioRing *ring);
+void gc_audio_ring_clear(GCAudioRing *ring);
+uint32_t gc_audio_ring_available(const GCAudioRing *ring);
+uint32_t gc_audio_ring_write(GCAudioRing *ring, const int16_t *samples, uint32_t frame_count);
+uint32_t gc_audio_ring_read(GCAudioRing *ring, int16_t *out_samples, uint32_t frame_count);
+void gc_audio_ring_set_muted(GCAudioRing *ring, bool muted);
+bool gc_audio_ring_is_muted(const GCAudioRing *ring);
+
 #ifdef __cplusplus
 }
 #endif

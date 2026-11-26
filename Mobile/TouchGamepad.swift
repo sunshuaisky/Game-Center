@@ -85,7 +85,6 @@ final class PadButtonUIView: UIView {
     private var activeTouches = Set<UITouch>()
     private var isPressedState = false
     var onChange: ((Bool) -> Void)?
-    var isCircular = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -105,10 +104,10 @@ final class PadButtonUIView: UIView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(title: String, circular: Bool, onChange: @escaping (Bool) -> Void) {
-        label.text = title
-        isCircular = circular
+    func configure(title: String, onChange: @escaping (Bool) -> Void) {
         self.onChange = onChange
+        guard label.text != title else { return }
+        label.text = title
         accessibilityLabel = title
         accessibilityTraits = .button
         isAccessibilityElement = true
@@ -117,7 +116,7 @@ final class PadButtonUIView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         label.frame = bounds.insetBy(dx: 4, dy: 2)
-        layer.cornerRadius = isCircular ? min(bounds.width, bounds.height) / 2 : min(16, bounds.height / 2)
+        layer.cornerRadius = min(16, bounds.height / 2)
     }
 
     private func setPressed(_ pressed: Bool) {
@@ -147,17 +146,16 @@ final class PadButtonUIView: UIView {
 
 struct TouchPadButton: UIViewRepresentable {
     let title: String
-    var circular: Bool = false
     let onChange: (Bool) -> Void
 
     func makeUIView(context: Context) -> PadButtonUIView {
         let view = PadButtonUIView()
-        view.configure(title: title, circular: circular, onChange: onChange)
+        view.configure(title: title, onChange: onChange)
         return view
     }
 
     func updateUIView(_ uiView: PadButtonUIView, context: Context) {
-        uiView.configure(title: title, circular: circular, onChange: onChange)
+        uiView.configure(title: title, onChange: onChange)
     }
 }
 
@@ -357,27 +355,47 @@ final class TouchDiamondPadUIView: UIView {
 
     private func recompute() {
         var next = State()
-        let targets: [(UILabel, WritableKeyPath<State, Bool>)] = [
-            (topView, \.top), (leftView, \.left), (rightView, \.right), (bottomView, \.bottom)
-        ].filter { !$0.0.isHidden && $0.0.bounds.width > 1 }
+        let refWidth: CGFloat = !rightView.isHidden && rightView.bounds.width > 1
+            ? rightView.bounds.width
+            : (!bottomView.isHidden && bottomView.bounds.width > 1 ? bottomView.bounds.width : 44)
+        let hitRadius = max(28, refWidth * 0.66)
+        let hitRadiusSq = hitRadius * hitRadius
+        let fallbackRadiusSq = (hitRadius * 1.45) * (hitRadius * 1.45)
 
         for touch in activeTouches {
             let p = touch.location(in: self)
-            let hitRadius = max(28, (targets.first?.0.bounds.width ?? 44) * 0.66)
             var matchedAny = false
-            for (view, keyPath) in targets {
-                let d = hypot(p.x - view.center.x, p.y - view.center.y)
-                if d <= hitRadius {
-                    next[keyPath: keyPath] = true
-                    matchedAny = true
+            var nearestDistSq = CGFloat.greatestFiniteMagnitude
+            var nearestIndex = -1
+
+            func test(_ view: UILabel, index: Int) -> Bool {
+                guard !view.isHidden && view.bounds.width > 1 else { return false }
+                let dx = p.x - view.center.x
+                let dy = p.y - view.center.y
+                let distSq = dx * dx + dy * dy
+                if distSq < nearestDistSq {
+                    nearestDistSq = distSq
+                    nearestIndex = index
                 }
+                if distSq <= hitRadiusSq {
+                    matchedAny = true
+                    return true
+                }
+                return false
             }
-            if !matchedAny, let nearest = targets.min(by: {
-                hypot(p.x - $0.0.center.x, p.y - $0.0.center.y) < hypot(p.x - $1.0.center.x, p.y - $1.0.center.y)
-            }) {
-                let d = hypot(p.x - nearest.0.center.x, p.y - nearest.0.center.y)
-                if d <= hitRadius * 1.45 {
-                    next[keyPath: nearest.1] = true
+
+            if test(topView, index: 0) { next.top = true }
+            if test(leftView, index: 1) { next.left = true }
+            if test(rightView, index: 2) { next.right = true }
+            if test(bottomView, index: 3) { next.bottom = true }
+
+            if !matchedAny && nearestDistSq <= fallbackRadiusSq {
+                switch nearestIndex {
+                case 0: next.top = true
+                case 1: next.left = true
+                case 2: next.right = true
+                case 3: next.bottom = true
+                default: break
                 }
             }
         }
@@ -542,10 +560,27 @@ struct TouchAnalogStick: UIViewRepresentable {
 enum TouchPadHaptics {
     static let defaultsKey = "phone.player.haptics"
     private static let generator = UIImpactFeedbackGenerator(style: .light)
-
-    static var isEnabled: Bool {
+    private static var cachedEnabled: Bool = {
         if UserDefaults.standard.object(forKey: defaultsKey) == nil { return true }
         return UserDefaults.standard.bool(forKey: defaultsKey)
+    }()
+    private static let observer: NSObjectProtocol = NotificationCenter.default.addObserver(
+        forName: UserDefaults.didChangeNotification,
+        object: nil,
+        queue: .main
+    ) { _ in
+        MainActor.assumeIsolated {
+            if UserDefaults.standard.object(forKey: defaultsKey) == nil {
+                cachedEnabled = true
+            } else {
+                cachedEnabled = UserDefaults.standard.bool(forKey: defaultsKey)
+            }
+        }
+    }
+
+    static var isEnabled: Bool {
+        _ = observer
+        return cachedEnabled
     }
 
     static func tap() {

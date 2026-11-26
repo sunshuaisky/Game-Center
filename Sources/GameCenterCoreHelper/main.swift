@@ -46,6 +46,7 @@ private final class HelperRuntimeContext {
     let frameRing: SharedFrameRing
     let audio: CoreAudioOutput
     var isFastForwarding = false
+    var suppressVideo = false
 
     init(frameRing: SharedFrameRing, audio: CoreAudioOutput) {
         self.frameRing = frameRing
@@ -136,6 +137,7 @@ enum GameCenterCoreHelperMain {
         try? channel.send(HelperEvent.ready)
 
         var host: OpaquePointer?
+        var isVulkanCore = false
         var paused = false
         var shouldExit = false
         var fps = 60.0
@@ -146,6 +148,7 @@ enum GameCenterCoreHelperMain {
         let acquireFrame: gc_acquire_frame_fn = { ctx, width, height, outStride, outSlot in
             guard let ctx else { return nil }
             let runtime = Unmanaged<HelperRuntimeContext>.fromOpaque(ctx).takeUnretainedValue()
+            if runtime.suppressVideo { return nil }
             let slot = runtime.frameRing.nextWriteSlot()
             guard let ptr = runtime.frameRing.pixelBufferPointer(slotIndex: slot) else { return nil }
             outStride?.pointee = width * 4
@@ -231,6 +234,7 @@ enum GameCenterCoreHelperMain {
                     return
                 }
                 host = opened
+                isVulkanCore = gc_host_is_vulkan(opened)
                 fps = gc_host_fps(opened)
                 let rate = gc_host_sample_rate(opened)
                 targetAudioFrames = max(Int(rate * 0.055), 1024)
@@ -338,8 +342,10 @@ enum GameCenterCoreHelperMain {
                 let dx = step == 0 ? mouseDX : 0
                 let dy = step == 0 ? mouseDY : 0
                 let wy = step == 0 ? mouseWheelY : 0
+                runtimeContext.suppressVideo = !isVulkanCore && step < speed - 1
                 gc_host_run_frame(activeHost, &frameInput, dx, dy, wy)
             }
+            runtimeContext.suppressVideo = false
 
             let now = DispatchTime.now().uptimeNanoseconds
             if now &- lastSaveCheck >= 20_000_000_000 {
@@ -365,9 +371,15 @@ enum GameCenterCoreHelperMain {
             let afterRun = DispatchTime.now().uptimeNanoseconds
             if nextFrameDeadline > afterRun {
                 let waitNs = nextFrameDeadline - afterRun
-                if waitNs > 500_000 && waitNs < 100_000_000 {
-                    var ts = timespec(tv_sec: 0, tv_nsec: Int(waitNs))
-                    nanosleep(&ts, nil)
+                if waitNs < 100_000_000 {
+                    // Leave ~1.2 ms headroom for nanosleep timer coalescing, then yield briefly.
+                    if waitNs > 1_500_000 {
+                        var ts = timespec(tv_sec: 0, tv_nsec: Int(waitNs - 1_200_000))
+                        nanosleep(&ts, nil)
+                    }
+                    while DispatchTime.now().uptimeNanoseconds < nextFrameDeadline {
+                        sched_yield()
+                    }
                 }
             } else if afterRun - nextFrameDeadline > 100_000_000 {
                 nextFrameDeadline = afterRun

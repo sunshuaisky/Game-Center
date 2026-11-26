@@ -33,11 +33,14 @@ struct EmbeddedGameWindowView: View {
                 frameRing: session.frameRing,
                 crispPixels: session.crispPixels,
                 isPaused: isPaused,
-                onPointerChange: { nx, ny, pressed in
-                    session.inputCapture.updatePointer(normalizedX: nx, normalizedY: ny, pressed: pressed)
-                },
-                onMouseEvent: { buttons, dx, dy, wheelY in
-                    session.inputCapture.updateMouse(buttonMask: buttons, deltaX: dx, deltaY: dy, wheelY: wheelY)
+                onPointerAndMouse: { pointer, buttons, dx, dy, wheelY in
+                    session.inputCapture.updatePointerAndMouse(
+                        pointer: pointer,
+                        buttonMask: buttons,
+                        deltaX: dx,
+                        deltaY: dy,
+                        wheelY: wheelY
+                    )
                 },
                 onMouseHoverTop: { hovering in
                     withAnimation(.easeInOut(duration: 0.16)) {
@@ -380,7 +383,7 @@ struct EmbeddedGameWindowView: View {
             ForEach(session.saveSlots) { slot in
                 HStack(spacing: 12) {
                     Group {
-                        if slot.exists, let nsImage = NSImage(contentsOf: slot.thumbnailURL) {
+                        if slot.exists, let nsImage = session.slotThumbnails[slot.slot] {
                             Image(nsImage: nsImage)
                                 .resizable()
                                 .aspectRatio(contentMode: .fill)

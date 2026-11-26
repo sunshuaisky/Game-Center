@@ -28,7 +28,6 @@ struct GameLibraryView: View {
     let language: AppLanguage
     let onLanguageChange: (AppLanguage) -> Void
 
-    @State private var platform: GamePlatform = .gba
     @State private var libraryFilter: LibraryFilter = .recent
     @State private var searchText = ""
     @FocusState private var isSearchFocused: Bool
@@ -36,7 +35,6 @@ struct GameLibraryView: View {
     @State private var isSettingsVisible = false
     @StateObject private var mobileBuildSession = MobileAppBuildSession()
     @State private var isMobileBuildVisible = false
-    @State private var mobileBuildNotice: String?
     @State private var actionMenuGameID: UUID?
     @State private var actionMenuSelection: Int?
     @State private var settingsSelection = 0
@@ -62,14 +60,45 @@ struct GameLibraryView: View {
 
     private var inverseColor: Color { Color(white: 0.06) }
 
-    private var activePlatforms: [GamePlatform] {
+    private struct FilterCounts {
+        var all = 0
+        var recent = 0
+        var favorites = 0
+        var byPlatform: [GamePlatform: Int] = [:]
+
+        func count(for filter: LibraryFilter) -> Int {
+            switch filter {
+            case .all: all
+            case .recent: recent
+            case .favorites: favorites
+            case .platform(let p): byPlatform[p] ?? 0
+            }
+        }
+    }
+
+    private func computeFilterCounts() -> FilterCounts {
+        var counts = FilterCounts()
+        for game in library.games where game.platform.isEnabled {
+            counts.all += 1
+            if game.lastPlayedAt != nil { counts.recent += 1 }
+            if game.isFavorite { counts.favorites += 1 }
+            counts.byPlatform[game.platform, default: 0] += 1
+        }
+        return counts
+    }
+
+    private func activePlatforms(using counts: FilterCounts) -> [GamePlatform] {
         guard hideEmptyPlatforms else { return GamePlatform.allCases }
-        let nonEmpty = GamePlatform.allCases.filter { count(for: $0) > 0 }
+        let nonEmpty = GamePlatform.allCases.filter { (counts.byPlatform[$0] ?? 0) > 0 }
         return nonEmpty.isEmpty ? GamePlatform.allCases : nonEmpty
     }
 
+    private func availableFilters(using counts: FilterCounts) -> [LibraryFilter] {
+        [.recent, .favorites] + activePlatforms(using: counts).map(LibraryFilter.platform)
+    }
+
     private var availableFilters: [LibraryFilter] {
-        [.recent, .favorites] + activePlatforms.map(LibraryFilter.platform)
+        availableFilters(using: computeFilterCounts())
     }
 
     private var visibleGames: [Game] {
@@ -196,19 +225,23 @@ struct GameLibraryView: View {
                         buildPage(for: buildGame)
                     }
                 } else {
-                    backdrop
+                    let counts = computeFilterCounts()
+                    let filters = availableFilters(using: counts)
+                    let games = visibleGames
+                    let selected = games.first(where: { $0.id == selectedGameID }) ?? games.first
+                    backdrop(selectedGame: selected)
                     VStack(spacing: 0) {
-                        hero(compact: isCompactHero)
+                        hero(compact: isCompactHero, selectedGame: selected, totalCount: games.count)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                             .padding(.horizontal, 36)
 
                         VStack(spacing: 0) {
-                            platformPicker
+                            platformPicker(filters: filters, counts: counts)
                                 .frame(height: 46)
                                 .padding(.horizontal, 36)
                                 .padding(.top, 14)
 
-                            gameGrid
+                            gameGrid(games: games, selectedID: selected?.id)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                             if let runningTitle = externalSession.activeGameTitle {
@@ -336,7 +369,7 @@ struct GameLibraryView: View {
         .sheet(isPresented: $showingSaveSync) {
             CloudSaveSyncView(saveRoot: {
                 guard let path = library.gameDirectoryPath else { throw CloudSaveDirectorySync.Failure("请先在设置中选择游戏目录。") }
-                _ = try MacSaveSync.slots(root: path)
+                try MacSaveSync.prepareForSync(root: path)
                 return URL(fileURLWithPath: path).lastPathComponent.lowercased() == "switch"
                     ? URL(fileURLWithPath: path).deletingLastPathComponent().appendingPathComponent("save")
                     : URL(fileURLWithPath: path).appendingPathComponent("save")
@@ -411,19 +444,6 @@ struct GameLibraryView: View {
         }
     }
 
-    private func count(for value: GamePlatform) -> Int {
-        library.games.filter { $0.platform == value }.count
-    }
-
-    private func count(for filter: LibraryFilter) -> Int {
-        switch filter {
-        case .all: library.games.filter { $0.platform.isEnabled }.count
-        case .recent: library.games.filter { $0.platform.isEnabled && $0.lastPlayedAt != nil }.count
-        case .favorites: library.games.filter { $0.platform.isEnabled && $0.isFavorite }.count
-        case .platform(let value): count(for: value)
-        }
-    }
-
     private func externalSessionBanner(title runningTitle: String) -> some View {
         HStack(spacing: 10) {
             Circle()
@@ -447,7 +467,7 @@ struct GameLibraryView: View {
         .padding(.bottom, 6)
     }
 
-    private var backdrop: some View {
+    private func backdrop(selectedGame: Game?) -> some View {
         GeometryReader { geometry in
             ZStack {
                 Color(white: 0.055)
@@ -592,14 +612,6 @@ struct GameLibraryView: View {
 
             MobileAppBuildButton(session: mobileBuildSession, isPresented: $isMobileBuildVisible,
                                  chooseDirectory: buildMobileApp)
-            .alert("生成 iOS App", isPresented: Binding(
-                get: { mobileBuildNotice != nil },
-                set: { if !$0 { mobileBuildNotice = nil } }
-            )) {
-                Button("好", role: .cancel) {}
-            } message: {
-                Text(mobileBuildNotice ?? "")
-            }
 
             Button {
                 isSettingsVisible.toggle()
@@ -813,8 +825,9 @@ struct GameLibraryView: View {
         .preferredColorScheme(.dark)
     }
 
-    private func hero(compact: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+    private func hero(compact: Bool, selectedGame: Game?, totalCount: Int) -> some View {
+        let requiresBuild = selectedGame.map { $0.platform == .switchConsole && !$0.isDirectlyLaunchable } ?? false
+        return VStack(alignment: .leading, spacing: 0) {
             Spacer(minLength: 8)
 
             if let selectedGame {
@@ -833,7 +846,7 @@ struct GameLibraryView: View {
                                         .stroke(Color.white.opacity(0.12), lineWidth: 1)
                                 )
 
-                            if selectedGameRequiresBuild {
+                            if requiresBuild {
                                 Text("需先构建")
                                     .font(.system(size: 11, weight: .medium))
                                     .foregroundStyle(BuildPalette.building)
@@ -865,11 +878,11 @@ struct GameLibraryView: View {
                         HStack(spacing: 10) {
                             Text(AppLanguage.localized(selectedGame.isFavorite ? "已收藏" : "游戏库"))
                             Text("·")
-                            Text(AppLanguage.localized(selectedGame.lastPlayedAt.map {
+                            Text(selectedGame.lastPlayedAt.map {
                                 AppLanguage.format("上次游玩 %@", $0.formatted(date: .abbreviated, time: .omitted))
-                            } ?? "尚未游玩"))
+                            } ?? AppLanguage.localized("尚未游玩"))
                             Text("·")
-                            Text(AppLanguage.format("%d 款游戏", visibleGames.count))
+                            Text(AppLanguage.format("%d 款游戏", totalCount))
                         }
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.white.opacity(0.62))
@@ -985,7 +998,7 @@ struct GameLibraryView: View {
                 }
                 .buttonStyle(TactileActionButtonStyle(appearance: .secondary, cornerRadius: 999, minHeight: 36, horizontalPadding: 16, fontSize: 12))
                 .padding(.top, 4)
-            } else if visibleGames.isEmpty && library.gameDirectoryPath == nil {
+            } else if library.gameDirectoryPath == nil {
                 Button {
                     if let url = GameImporter.chooseGameDirectory() {
                         library.setGameDirectory(url)
@@ -1005,12 +1018,12 @@ struct GameLibraryView: View {
         .padding(.vertical, 20)
     }
 
-    private var platformPicker: some View {
+    private func platformPicker(filters: [LibraryFilter], counts: FilterCounts) -> some View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
-                    ForEach(availableFilters, id: \.id) { filter in
-                        filterButton(filter)
+                    ForEach(filters, id: \.id) { filter in
+                        filterButton(filter, count: counts.count(for: filter))
                     }
                 }
                 .padding(.trailing, 24)
@@ -1049,10 +1062,10 @@ struct GameLibraryView: View {
         )
     }
 
-    private var gameGrid: some View {
+    private func gameGrid(games: [Game], selectedID: UUID?) -> some View {
         let columns = Array(repeating: GridItem(.fixed(132), spacing: 18, alignment: .top), count: gridColumnCount)
         return Group {
-            if visibleGames.isEmpty {
+            if games.isEmpty {
                 HStack(spacing: 9) {
                     Image(systemName: "square.stack.3d.up")
                     Text(AppLanguage.localized("扫描到的游戏封面会排列在这里"))
@@ -1065,12 +1078,12 @@ struct GameLibraryView: View {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: false) {
                         LazyVGrid(columns: columns, alignment: .leading, spacing: 20) {
-                            ForEach(visibleGames) { game in
+                            ForEach(games) { game in
                                 GameCoverTile(
                                     game: game,
                                     cardWidth: 132,
                                     cardHeight: 160,
-                                    isSelected: game.id == selectedGame?.id,
+                                    isSelected: game.id == selectedID,
                                     isBuildingThisGame: switchBuildSession.isBuilding && switchBuildSession.game?.id == game.id,
                                     isMenuOpen: actionMenuGameID == game.id,
                                     buildOverlay: { buildProgressOverlay },
@@ -1364,9 +1377,6 @@ struct GameLibraryView: View {
     private func selectFilter(_ filter: LibraryFilter) {
         guard filter != libraryFilter else { return }
         withAnimation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.86)) {
-            if case .platform(let value) = filter {
-                platform = value
-            }
             libraryFilter = filter
         }
     }
@@ -1380,9 +1390,8 @@ struct GameLibraryView: View {
         }
     }
 
-    private func filterButton(_ filter: LibraryFilter) -> some View {
+    private func filterButton(_ filter: LibraryFilter, count itemCount: Int) -> some View {
         let isSelected = libraryFilter == filter
-        let itemCount = count(for: filter)
         return PlatformTabButton(
             title: title(for: filter),
             count: itemCount,
@@ -1919,23 +1928,20 @@ private final class GamepadManager: ObservableObject {
         lastStickVerticalDirection = 0
         thumbstick.valueChangedHandler = { [weak self] _, x, y in
             guard let self else { return }
-            Task { @MainActor in
-                guard NSApp.isActive, !EmbeddedPlayCoordinator.shared.hasKeyPlayWindow else { return }
-                self.updateStickDirection(x, axis: &self.lastStickHorizontalDirection, callback: self.onMoveHorizontal)
-                self.updateStickDirection(y, axis: &self.lastStickVerticalDirection, callback: self.onMoveVertical)
+            let nextH = x > 0.58 ? 1 : (x < -0.58 ? -1 : (abs(x) < 0.25 ? 0 : self.lastStickHorizontalDirection))
+            let nextV = y > 0.58 ? 1 : (y < -0.58 ? -1 : (abs(y) < 0.25 ? 0 : self.lastStickVerticalDirection))
+            let hChanged = nextH != self.lastStickHorizontalDirection
+            let vChanged = nextV != self.lastStickVerticalDirection
+            guard hChanged || vChanged else { return }
+            self.lastStickHorizontalDirection = nextH
+            self.lastStickVerticalDirection = nextV
+            guard nextH != 0 || nextV != 0 else { return }
+            Task { @MainActor [weak self] in
+                guard let self, NSApp.isActive, !EmbeddedPlayCoordinator.shared.hasKeyPlayWindow else { return }
+                if hChanged && nextH != 0 { self.onMoveHorizontal?(nextH) }
+                if vChanged && nextV != 0 { self.onMoveVertical?(nextV) }
             }
         }
-    }
-
-    private func updateStickDirection(_ value: Float, axis: inout Int, callback: ((Int) -> Void)?) {
-        let next = value > 0.58 ? 1 : (value < -0.58 ? -1 : 0)
-        if next == 0 {
-            if abs(value) < 0.25 { axis = 0 }
-            return
-        }
-        guard next != axis else { return }
-        axis = next
-        callback?(next)
     }
 
     private func clearDirectionHandlers(_ directionPad: GCControllerDirectionPad) {

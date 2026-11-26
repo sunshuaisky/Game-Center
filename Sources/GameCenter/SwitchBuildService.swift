@@ -18,20 +18,6 @@ enum SwitchBuildMethod: String, CaseIterable, Identifiable, Codable {
         case .nxnative: "nxnative"
         }
     }
-
-    var description: String {
-        switch self {
-        case .s2arm: AppLanguage.localized("构建包含引擎和游戏运行文件的独立 Mac 应用")
-        case .nxnative: AppLanguage.localized("直接使用 nxnative 源码构建独立 Mac 游戏")
-        }
-    }
-
-    var repositoryURL: URL {
-        switch self {
-        case .s2arm: URL(string: "https://github.com/jhaizhou-ops/S2Arm/releases/latest")!
-        case .nxnative: URL(string: "https://github.com/seedds/nxnative")!
-        }
-    }
 }
 
 enum SwitchBuildTarget: String, CaseIterable, Identifiable, Codable {
@@ -1589,16 +1575,26 @@ enum SwitchBuildService {
         }
         let total = max(1, entries.reduce(Int64.zero) { $0 + ($1.2 ? 0 : $1.4) })
         let sourceIsDirectory = (try? source.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-        try fm.createDirectory(at: sourceIsDirectory ? destination : destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let rootDir = sourceIsDirectory ? destination : destination.deletingLastPathComponent()
+        try fm.createDirectory(at: rootDir, withIntermediateDirectories: true)
+        var createdDirs: Set<String> = [rootDir.path]
         var copied: Int64 = 0
         for (sourceItem, target, isDirectory, isSymlink, size) in entries {
             if isSymlink {
-                try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let parent = target.deletingLastPathComponent()
+                if createdDirs.insert(parent.path).inserted {
+                    try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+                }
                 try fm.createSymbolicLink(atPath: target.path, withDestinationPath: try fm.destinationOfSymbolicLink(atPath: sourceItem.path))
             } else if isDirectory {
-                try fm.createDirectory(at: target, withIntermediateDirectories: true)
+                if createdDirs.insert(target.path).inserted {
+                    try fm.createDirectory(at: target, withIntermediateDirectories: true)
+                }
             } else {
-                try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let parent = target.deletingLastPathComponent()
+                if createdDirs.insert(parent.path).inserted {
+                    try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+                }
                 if clonefile(sourceItem.path, target.path, 0) != 0 {
                     try fm.copyItem(at: sourceItem, to: target)
                 }
@@ -1695,7 +1691,14 @@ enum SwitchBuildService {
         environment: [String: String]? = nil,
         progress: @escaping @Sendable (String) -> Void
     ) async throws -> Int32 {
-        let result = try await capture(executable, arguments: arguments, environment: environment, progress: progress)
+        let result = try await capture(
+            executable,
+            arguments: arguments,
+            environment: environment,
+            trackAsActive: true,
+            maxOutputBytes: 512 * 1024,
+            progress: progress
+        )
         return result.status
     }
 
@@ -1703,6 +1706,8 @@ enum SwitchBuildService {
         _ executable: URL,
         arguments: [String],
         environment processEnvironment: [String: String]? = nil,
+        trackAsActive: Bool = false,
+        maxOutputBytes: Int? = nil,
         progress: (@Sendable (String) -> Void)? = nil
     ) async throws -> (status: Int32, output: String) {
         let process = Process()
@@ -1717,51 +1722,81 @@ enum SwitchBuildService {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
-        var allOutput = ""
+        var allOutput = Data()
         var pending = Data()
         let queue = DispatchQueue(label: "GameCenter.SwitchBuildProcessOutput")
         let handle = pipe.fileHandleForReading
 
+        func emitLines(from buffer: inout Data, flushRemainder: Bool) {
+            while let newline = buffer.firstIndex(of: 10) {
+                let lineData = buffer.prefix(upTo: newline)
+                buffer.removeSubrange(...newline)
+                let line = String(decoding: lineData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !line.isEmpty { progress?(line) }
+            }
+            if flushRemainder && !buffer.isEmpty {
+                let line = String(decoding: buffer, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                buffer.removeAll(keepingCapacity: false)
+                if !line.isEmpty { progress?(line) }
+            }
+        }
+
+        func appendOutput(_ chunk: Data) {
+            guard !chunk.isEmpty else { return }
+            allOutput.append(chunk)
+            if let limit = maxOutputBytes, allOutput.count > limit * 2 {
+                allOutput.removeFirst(allOutput.count - limit)
+            }
+        }
+
         return try await withCheckedThrowingContinuation { continuation in
             handle.readabilityHandler = { fileHandle in
                 let data = fileHandle.availableData
-                guard !data.isEmpty else { return }
+                guard !data.isEmpty else {
+                    fileHandle.readabilityHandler = nil
+                    return
+                }
                 queue.async {
-                    allOutput += String(decoding: data, as: UTF8.self)
-                    pending.append(data)
-                    while let newline = pending.firstIndex(of: 10) {
-                        let lineData = pending.prefix(upTo: newline)
-                        pending.removeSubrange(...newline)
-                        let line = String(decoding: lineData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !line.isEmpty { progress?(line) }
+                    appendOutput(data)
+                    if progress != nil {
+                        pending.append(data)
+                        emitLines(from: &pending, flushRemainder: false)
                     }
                 }
             }
             process.terminationHandler = { process in
                 handle.readabilityHandler = nil
-                processLock.lock()
-                if activeProcess === process { activeProcess = nil }
-                processLock.unlock()
+                if trackAsActive {
+                    processLock.lock()
+                    if activeProcess === process { activeProcess = nil }
+                    processLock.unlock()
+                }
                 queue.async {
                     let rest = handle.readDataToEndOfFile()
-                    allOutput += String(decoding: rest, as: UTF8.self)
-                    pending.append(rest)
-                    if !pending.isEmpty {
-                        let line = String(decoding: pending, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !line.isEmpty { progress?(line) }
+                    try? handle.close()
+                    appendOutput(rest)
+                    if progress != nil {
+                        pending.append(rest)
+                        emitLines(from: &pending, flushRemainder: true)
                     }
-                    continuation.resume(returning: (process.terminationStatus, allOutput))
+                    continuation.resume(returning: (process.terminationStatus, String(decoding: allOutput, as: UTF8.self)))
                 }
             }
             do {
-                processLock.lock()
-                activeProcess = process
-                processLock.unlock()
+                if trackAsActive {
+                    processLock.lock()
+                    activeProcess = process
+                    processLock.unlock()
+                }
                 try process.run()
             } catch {
-                processLock.lock()
-                if activeProcess === process { activeProcess = nil }
-                processLock.unlock()
+                handle.readabilityHandler = nil
+                try? handle.close()
+                if trackAsActive {
+                    processLock.lock()
+                    if activeProcess === process { activeProcess = nil }
+                    processLock.unlock()
+                }
                 continuation.resume(throwing: error)
             }
         }
@@ -1771,10 +1806,6 @@ enum SwitchBuildService {
         let invalid = CharacterSet(charactersIn: "/:\0")
         let name = title.components(separatedBy: invalid).filter { !$0.isEmpty }.joined(separator: "-")
         return name.isEmpty ? "Switch Game" : name
-    }
-
-    private static func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
 }

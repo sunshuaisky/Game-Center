@@ -11,7 +11,8 @@ final class GameLibrary: ObservableObject {
     @Published var errorMessage: String?
 
     private let fileManager = FileManager.default
-    private let metadataService = GameMetadataService(trace: MetadataTraceLog.write)
+    private let metadataService = GameMetadataService(trace: { MetadataTraceLog.write($0) })
+    private let persistenceQueue = DispatchQueue(label: "GameCenter.LibraryPersistence", qos: .utility)
     private var activeMetadataLookups = Set<UUID>()
     private struct MetadataJob {
         let id: UUID
@@ -41,35 +42,13 @@ final class GameLibrary: ObservableObject {
         refreshMissingMetadata(language: preferredMetadataLanguage)
     }
 
-    func games(matching filter: LibraryFilter, search: String) -> [Game] {
-        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        return games
-            .filter { game in
-                switch filter {
-                case .all: true
-                case .recent: game.lastPlayedAt != nil
-                case .favorites: game.isFavorite
-                case .platform(let platform): game.platform == platform
-                }
-            }
-            .filter { game in
-                query.isEmpty
-                    || (game.metadataTitle ?? game.title).localizedCaseInsensitiveContains(query)
-                    || game.title.localizedCaseInsensitiveContains(query)
-                    || game.platform.shortTitle.localizedCaseInsensitiveContains(query)
-            }
-            .sorted { lhs, rhs in
-                switch filter {
-                case .recent:
-                    (lhs.lastPlayedAt ?? .distantPast) > (rhs.lastPlayedAt ?? .distantPast)
-                default:
-                    lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
-                }
-            }
-    }
-
-    func count(for platform: GamePlatform) -> Int {
-        games.filter { $0.platform == platform }.count
+    deinit {
+        if let directoryEventStream {
+            FSEventStreamStop(directoryEventStream)
+            FSEventStreamInvalidate(directoryEventStream)
+            FSEventStreamRelease(directoryEventStream)
+        }
+        securityScopedDirectoryURL?.stopAccessingSecurityScopedResource()
     }
 
     func resolvedGameURL(for game: Game) -> URL? {
@@ -162,8 +141,9 @@ final class GameLibrary: ObservableObject {
                 self.metadataQueue.removeAll()
                 self.activeMetadataLookups.subtract(queuedIDs)
                 for game in self.games {
-                    self.refreshMetadata(for: game.id, language: targetLanguage, force: true)
+                    self.refreshMetadata(for: game.id, language: targetLanguage, force: true, persist: false)
                 }
+                self.saveChanges()
             }
             self.isScanning = false
         }
@@ -219,39 +199,51 @@ final class GameLibrary: ObservableObject {
         }
     }
 
-    func refreshMetadata(for id: UUID, language: String, force: Bool = true) {
+    func refreshMetadata(for id: UUID, language: String, force: Bool = true, persist: Bool = true) {
         guard !activeMetadataLookups.contains(id),
               let index = games.firstIndex(where: { $0.id == id }) else { return }
         if !force, !needsMetadataRefresh(games[index], language: language) { return }
 
         activeMetadataLookups.insert(id)
         games[index].metadataStatus = "searching"
-        saveChanges()
+        if persist { saveChanges() }
         metadataQueue.append(MetadataJob(id: id, language: language))
         processMetadataQueue()
     }
 
     func refreshMissingMetadata(language: String) {
         preferredMetadataLanguage = language
+        var enqueuedAny = false
         if UserDefaults.standard.integer(forKey: "metadataMatchingVersion") < 11 {
             UserDefaults.standard.set(11, forKey: "metadataMatchingVersion")
-            games.forEach { refreshMetadata(for: $0.id, language: language, force: true) }
+            for game in games {
+                refreshMetadata(for: game.id, language: language, force: true, persist: false)
+                enqueuedAny = true
+            }
         }
         let switch2MetadataVersionKey = "switch2MetadataVersion"
         if UserDefaults.standard.integer(forKey: switch2MetadataVersionKey) < 5 {
             UserDefaults.standard.set(5, forKey: switch2MetadataVersionKey)
-            games.filter { $0.platform == .switchConsole }.forEach {
-                refreshMetadata(for: $0.id, language: language, force: true)
+            for game in games where game.platform == .switchConsole {
+                refreshMetadata(for: game.id, language: language, force: true, persist: false)
+                enqueuedAny = true
             }
         }
         let artworkQualityKey = "artworkQualityVersion"
         if UserDefaults.standard.integer(forKey: artworkQualityKey) < 15 {
             UserDefaults.standard.set(15, forKey: artworkQualityKey)
-            games.forEach { refreshMetadata(for: $0.id, language: language, force: true) }
+            for game in games {
+                refreshMetadata(for: game.id, language: language, force: true, persist: false)
+                enqueuedAny = true
+            }
+            if enqueuedAny { saveChanges() }
             return
         }
-        games.filter { needsMetadataRefresh($0, language: language) }
-            .forEach { refreshMetadata(for: $0.id, language: language, force: false) }
+        for game in games where needsMetadataRefresh(game, language: language) {
+            refreshMetadata(for: game.id, language: language, force: false, persist: false)
+            enqueuedAny = true
+        }
+        if enqueuedAny { saveChanges() }
     }
 
     private func needsMetadataRefresh(_ game: Game, language: String) -> Bool {
@@ -280,7 +272,7 @@ final class GameLibrary: ObservableObject {
                         onText: { partial in await self.applyText(partial, to: job.id, language: job.language) },
                         onBackdrop: { data in await self.applyBackdrop(data, to: job.id, language: job.language) }
                     )
-                    apply(result, to: job.id, language: job.language)
+                    await apply(result, to: job.id, language: job.language)
                     if preferredMetadataLanguage != job.language {
                         refreshMetadata(for: job.id, language: preferredMetadataLanguage, force: false)
                     }
@@ -289,12 +281,16 @@ final class GameLibrary: ObservableObject {
         }
     }
 
-    private func applyBackdrop(_ data: Data, to id: UUID, language: String) {
-        guard preferredMetadataLanguage == language, let index = games.firstIndex(where: { $0.id == id }) else { return }
-        let url = artworkDirectory.appendingPathComponent(id.uuidString + "-backdrop.jpg")
+    private func applyBackdrop(_ data: Data, to id: UUID, language: String) async {
+        guard preferredMetadataLanguage == language, games.contains(where: { $0.id == id }) else { return }
+        let dir = artworkDirectory
+        let url = dir.appendingPathComponent(id.uuidString + "-backdrop.jpg")
         do {
-            try fileManager.createDirectory(at: artworkDirectory, withIntermediateDirectories: true)
-            try data.write(to: url, options: .atomic)
+            try await Task.detached(priority: .utility) {
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                try data.write(to: url, options: .atomic)
+            }.value
+            guard preferredMetadataLanguage == language, let index = games.firstIndex(where: { $0.id == id }) else { return }
             games[index].metadataBackdropPath = url.path
             games[index].metadataLastUpdated = .now
             saveChanges()
@@ -311,69 +307,79 @@ final class GameLibrary: ObservableObject {
         saveChanges()
     }
 
-    private func apply(_ result: GameMetadataResult, to id: UUID, language: String) {
+    private func apply(_ result: GameMetadataResult, to id: UUID, language: String) async {
         defer { activeMetadataLookups.remove(id) }
+        guard let initialIndex = games.firstIndex(where: { $0.id == id }) else { return }
+        let dir = artworkDirectory
+        let existingBackdrop = games[initialIndex].metadataBackdropPath
+
+        struct DiskMediaResult {
+            var artworkPath: String?
+            var artworkFailed = false
+            var backdropPath: String?
+            var backdropFailed = false
+            var clearExistingBackdrop = false
+        }
+
+        let media = await Task.detached(priority: .utility) { () -> DiskMediaResult in
+            let fm = FileManager.default
+            var outcome = DiskMediaResult()
+            if let artworkData = result.artworkData {
+                let requestedExtension = result.artworkExtension?.lowercased() ?? ""
+                let fileExtension = ["png", "jpg", "jpeg", "webp"].contains(requestedExtension) ? requestedExtension : "png"
+                let artworkURL = dir.appendingPathComponent(id.uuidString).appendingPathExtension(fileExtension)
+                do {
+                    try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: nil)
+                    try artworkData.write(to: artworkURL, options: .atomic)
+                    outcome.artworkPath = artworkURL.path
+                } catch {
+                    outcome.artworkFailed = true
+                }
+            }
+            if let backdropData = result.backdropData {
+                let backdropURL = dir.appendingPathComponent(id.uuidString + "-backdrop").appendingPathExtension("jpg")
+                do {
+                    try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: nil)
+                    try backdropData.write(to: backdropURL, options: .atomic)
+                    outcome.backdropPath = backdropURL.path
+                } catch {
+                    outcome.backdropFailed = true
+                }
+            } else if let existingBackdrop {
+                // Clear stale low-res (< 960x540) backdrop so GameArtwork falls back to softly blurred HD box art.
+                let isTooSmall: Bool = {
+                    let url = URL(fileURLWithPath: existingBackdrop)
+                    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                          let w = props[kCGImagePropertyPixelWidth] as? Int,
+                          let h = props[kCGImagePropertyPixelHeight] as? Int else { return true }
+                    return w < 960 || h < 540
+                }()
+                if isTooSmall {
+                    try? fm.removeItem(atPath: existingBackdrop)
+                    outcome.clearExistingBackdrop = true
+                }
+            }
+            return outcome
+        }.value
+
         guard let index = games.firstIndex(where: { $0.id == id }) else { return }
         if let metadataTitle = result.title { games[index].metadataTitle = metadataTitle }
         if let synopsis = result.synopsis { games[index].synopsis = synopsis }
         if let source = result.metadataSourceURL { games[index].metadataSourceURL = source }
         if let artworkSource = result.artworkSourceURL { games[index].artworkSourceURL = artworkSource }
-
-        if let artworkData = result.artworkData {
-            let requestedExtension = result.artworkExtension?.lowercased() ?? ""
-            let fileExtension = ["png", "jpg", "jpeg", "webp"].contains(requestedExtension)
-                ? requestedExtension
-                : "png"
-            let artworkURL = artworkDirectory
-                .appendingPathComponent(id.uuidString)
-                .appendingPathExtension(fileExtension)
-            do {
-                try fileManager.createDirectory(
-                    at: artworkDirectory,
-                    withIntermediateDirectories: true,
-                    attributes: nil
-                )
-                try artworkData.write(to: artworkURL, options: .atomic)
-                games[index].metadataArtworkPath = artworkURL.path
-            } catch {
-                if games[index].synopsis == nil { games[index].metadataStatus = "error" }
-            }
+        if let artworkPath = media.artworkPath { games[index].metadataArtworkPath = artworkPath }
+        if let backdropPath = media.backdropPath {
+            games[index].metadataBackdropPath = backdropPath
+        } else if media.clearExistingBackdrop {
+            games[index].metadataBackdropPath = nil
         }
 
-        if let backdropData = result.backdropData {
-            let backdropURL = artworkDirectory
-                .appendingPathComponent(id.uuidString + "-backdrop")
-                .appendingPathExtension("jpg")
-            do {
-                try fileManager.createDirectory(
-                    at: artworkDirectory,
-                    withIntermediateDirectories: true,
-                    attributes: nil
-                )
-                try backdropData.write(to: backdropURL, options: .atomic)
-                games[index].metadataBackdropPath = backdropURL.path
-            } catch {
-                if games[index].synopsis == nil { games[index].metadataStatus = "error" }
-            }
-        } else if let existingBackdrop = games[index].metadataBackdropPath {
-            // Clear stale low-res (< 960x540) backdrop so GameArtwork falls back to softly blurred HD box art.
-            let isTooSmall: Bool = {
-                let url = URL(fileURLWithPath: existingBackdrop)
-                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                      let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-                      let w = props[kCGImagePropertyPixelWidth] as? Int,
-                      let h = props[kCGImagePropertyPixelHeight] as? Int else { return true }
-                return w < 960 || h < 540
-            }()
-            if isTooSmall {
-                try? fileManager.removeItem(atPath: existingBackdrop)
-                games[index].metadataBackdropPath = nil
-            }
+        if (media.artworkFailed || media.backdropFailed) && games[index].synopsis == nil {
+            games[index].metadataStatus = "error"
+        } else {
+            games[index].metadataStatus = result.hasMetadata || games[index].synopsis != nil ? "found" : "notFound"
         }
-
-        games[index].metadataStatus = result.hasMetadata || games[index].synopsis != nil
-            ? "found"
-            : "notFound"
         games[index].metadataLastUpdated = .now
         games[index].metadataLanguage = language
         saveChanges()
@@ -413,19 +419,22 @@ final class GameLibrary: ObservableObject {
     }
 
     private func saveChanges() {
-        do {
-            try saveGames()
-        } catch {
-            errorMessage = AppLanguage.format("保存游戏资料库失败：%@", error.localizedDescription)
+        let snapshot = games
+        let url = Self.libraryURL
+        persistenceQueue.async { [weak self] in
+            do {
+                let directory = url.deletingLastPathComponent()
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                try encoder.encode(snapshot).write(to: url, options: .atomic)
+            } catch {
+                let message = AppLanguage.format("保存游戏资料库失败：%@", error.localizedDescription)
+                Task { @MainActor [weak self] in
+                    self?.errorMessage = message
+                }
+            }
         }
-    }
-
-    private func saveGames() throws {
-        let directory = Self.libraryURL.deletingLastPathComponent()
-        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(games).write(to: Self.libraryURL, options: .atomic)
     }
 
     private func restoreGameDirectory() {
@@ -542,7 +551,7 @@ final class GameLibrary: ObservableObject {
         let previousGames = games
         var reconciled: [Game] = []
         var unresolvedGames: [Game] = []
-        var retainedPaths = Set<String>()
+        var reconciledIndexByPath: [String: Int] = [:]
 
         func merge(_ source: Game, into target: inout Game) {
             target.isFavorite = target.isFavorite || source.isFavorite
@@ -572,16 +581,15 @@ final class GameLibrary: ObservableObject {
                 }
                 game.bookmark = replacementBookmark
                 path = GameDirectoryScanner.canonicalPath(replacement)
-                if game.title.count >= 16 && game.title.range(of: #"^[0-9a-fA-F]{16}$"#, options: .regularExpression) != nil {
+                if game.title.count == 16 && game.title.allSatisfy(\.isHexDigit) {
                     game.title = GameImporter.title(for: replacement, platform: .switchConsole)
                 }
             }
-            guard retainedPaths.insert(path).inserted else {
-                if let index = reconciled.firstIndex(where: { (try? $0.resolvedURL()).map(GameDirectoryScanner.canonicalPath) == path }) {
-                    merge(game, into: &reconciled[index])
-                }
+            if let existingIndex = reconciledIndexByPath[path] {
+                merge(game, into: &reconciled[existingIndex])
                 continue
             }
+            reconciledIndexByPath[path] = reconciled.count
             reconciled.append(game)
         }
 
@@ -624,7 +632,10 @@ final class GameLibrary: ObservableObject {
             }
         }
         saveChanges()
-        discoveredIDs.forEach { refreshMetadata(for: $0, language: preferredMetadataLanguage) }
+        for id in discoveredIDs {
+            refreshMetadata(for: id, language: preferredMetadataLanguage, persist: false)
+        }
+        if !discoveredIDs.isEmpty { saveChanges() }
     }
 
     private static func safeGameFolderName(_ value: String) -> String {
@@ -641,18 +652,12 @@ final class GameLibrary: ObservableObject {
     private static func isSwitchBuildSource(_ url: URL) -> Bool {
         ["nsp", "xci", "nsz", "xcz", "nup"].contains(url.pathExtension.lowercased())
     }
-
-    private static func hasSwitch2NUPSource(_ game: Game) -> Bool {
-        guard game.platform == .switchConsole, let url = try? game.resolvedURL() else { return false }
-        if url.pathExtension.lowercased() == "nup" { return true }
-        guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
-              let children = try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return false }
-        return children.contains { $0.pathExtension.lowercased() == "nup" }
-    }
 }
 
 enum GameDirectoryScanner {
     private static let switchPackageExtensions: Set<String> = ["nsp", "xci", "nsz", "xcz", "nup", "nro", "nso", "nca"]
+    private static let bracketRegex = try! NSRegularExpression(pattern: #"\[[^\]]*\]|\([^)]*\)"#)
+    private static let titleIDRegex = try! NSRegularExpression(pattern: #"[0-9a-fA-F]{16}"#)
 
     static func switchPackagesShadowedByApps(in urls: [URL], under root: URL) -> Set<String> {
         let switchApps = urls.filter { url in
@@ -676,12 +681,11 @@ enum GameDirectoryScanner {
 
     private static func switchComparableName(_ url: URL) -> String {
         let extensionName = url.pathExtension.lowercased()
-        var name = (switchPackageExtensions.contains(extensionName) || extensionName == "app")
+        let raw = (switchPackageExtensions.contains(extensionName) || extensionName == "app")
             ? url.deletingPathExtension().lastPathComponent
             : url.lastPathComponent
-        for pattern in [#"\[[^\]]*\]"#, #"\([^)]*\)"#] {
-            name = name.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
-        }
+        let range = NSRange(location: 0, length: (raw as NSString).length)
+        let name = bracketRegex.stringByReplacingMatches(in: raw, range: range, withTemplate: "")
         return name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
             .filter { $0.isLetter || $0.isNumber }
     }
@@ -695,20 +699,26 @@ enum GameDirectoryScanner {
         for url in urls {
             byPath[canonicalPath(url)] = url
         }
-        let pathUnique = Array(byPath.values)
-        let switchCandidates = pathUnique.filter { GamePlatform.detect(for: $0, under: root) == .switchConsole }
-        let otherCandidates = pathUnique.filter { GamePlatform.detect(for: $0, under: root) != .switchConsole }
-        var bestByTitleID: [String: URL] = [:]
-        for url in switchCandidates {
-            guard let id = switchTitleID(url) else { continue }
-            if let current = bestByTitleID[id], switchPriority(current) <= switchPriority(url) { continue }
-            bestByTitleID[id] = url
+        var otherCandidates: [(path: String, url: URL)] = []
+        var switchWithoutIDs: [(path: String, url: URL)] = []
+        var bestByTitleID: [String: (path: String, url: URL, priority: Int)] = [:]
+
+        for (path, url) in byPath {
+            if GamePlatform.detect(for: url, under: root) == .switchConsole {
+                if let id = switchTitleID(url) {
+                    let priority = switchPriority(url)
+                    if let current = bestByTitleID[id], current.priority <= priority { continue }
+                    bestByTitleID[id] = (path, url, priority)
+                } else {
+                    switchWithoutIDs.append((path, url))
+                }
+            } else {
+                otherCandidates.append((path, url))
+            }
         }
-        let deduplicatedSwitchIDs = Set(bestByTitleID.values.map(canonicalPath))
-        let switchWithoutIDs = switchCandidates.filter { switchTitleID($0) == nil }
-        return (otherCandidates + switchWithoutIDs + Array(bestByTitleID.values))
-            .sorted { canonicalPath($0).localizedStandardCompare(canonicalPath($1)) == .orderedAscending }
-            .filter { GamePlatform.detect(for: $0, under: root) != .switchConsole || deduplicatedSwitchIDs.contains(canonicalPath($0)) || switchTitleID($0) == nil }
+        var merged = otherCandidates + switchWithoutIDs + bestByTitleID.values.map { ($0.path, $0.url) }
+        merged.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        return merged.map(\.url)
     }
 
     private static func switchPriority(_ url: URL) -> Int {
@@ -721,8 +731,9 @@ enum GameDirectoryScanner {
     }
 
     static func switchTitleID(_ url: URL) -> String? {
-        if let match = url.lastPathComponent.range(of: #"[0-9a-fA-F]{16}"#, options: .regularExpression) {
-            return String(url.lastPathComponent[match]).uppercased()
+        let filename = url.lastPathComponent
+        if let match = titleIDRegex.firstMatch(in: filename, range: NSRange(location: 0, length: (filename as NSString).length)) {
+            return (filename as NSString).substring(with: match.range).uppercased()
         }
         if url.pathExtension.lowercased() == "app" {
             let manifest = url.appendingPathComponent("Contents/Resources/S2ArmStandalone/standalone.json")
@@ -732,8 +743,8 @@ enum GameDirectoryScanner {
                 return id.uppercased()
             }
             if let bundle = Bundle(url: url), let identifier = bundle.bundleIdentifier,
-               let match = identifier.range(of: #"[0-9a-fA-F]{16}"#, options: .regularExpression) {
-                return String(identifier[match]).uppercased()
+               let match = titleIDRegex.firstMatch(in: identifier, range: NSRange(location: 0, length: (identifier as NSString).length)) {
+                return (identifier as NSString).substring(with: match.range).uppercased()
             }
         }
         if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
@@ -790,31 +801,37 @@ enum GameDirectoryScanner {
             }
         }
         let shadowedPackages = switchPackagesShadowedByApps(in: results, under: root)
-        return MobileLibraryFormat.playableEntries(results.filter { !shadowedPackages.contains($0.standardizedFileURL.path) })
+        return MobileLibraryFormat.playableEntries(results.filter { !shadowedPackages.contains(canonicalPath($0)) })
     }
 }
 
 /// Scraping diagnosis log: the requests and verdicts behind every lookup, in
 /// ~/Library/Logs/GameCenter-metadata.log. One file per launch, capped.
-private enum MetadataTraceLog {
-    private static let url = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+private final class MetadataTraceLog: @unchecked Sendable {
+    private static let shared = MetadataTraceLog()
+    private let url = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Logs/GameCenter-metadata.log")
-    private static let queue = DispatchQueue(label: "GameCenter.MetadataTrace")
-    private static var opened = false
-    private static var bytes = 0
+    private let queue = DispatchQueue(label: "GameCenter.MetadataTrace")
+    private let formatter = ISO8601DateFormatter()
+    private var opened = false
+    private var bytes = 0
 
-    static func write(_ message: String) {
-        queue.async {
+    @Sendable static func write(_ message: String) {
+        shared.append(message)
+    }
+
+    private func append(_ message: String) {
+        queue.async { [self] in
             if !opened {
                 try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try? Data().write(to: url, options: .atomic)
                 opened = true
             }
             guard bytes < 1_000_000,
-                  let line = (ISO8601DateFormatter().string(from: .now) + " " + message + "\n").data(using: .utf8),
+                  let line = (formatter.string(from: .now) + " " + message + "\n").data(using: .utf8),
                   let handle = try? FileHandle(forWritingTo: url) else { return }
             defer { try? handle.close() }
-            try? handle.seekToEnd()
+            _ = try? handle.seekToEnd()
             try? handle.write(contentsOf: line)
             bytes += line.count
         }

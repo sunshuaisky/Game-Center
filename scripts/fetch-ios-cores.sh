@@ -25,33 +25,42 @@ archives=(
 mkdir -p -- "$temporary_directory/cores"
 mkdir -p -- "$output_directory"
 
+missing_archives=()
 for archive in $archives; do
-  print "下载 iOS 核心：${archive%.zip}"
-  curl --fail --silent --show-error --location --retry 3 --output "$temporary_directory/$archive" "$base_url/$archive"
-  unzip -q -o "$temporary_directory/$archive" -d "$temporary_directory/cores" "${archive%.zip}"
+  if [[ ! -s "$output_directory/${archive%.zip}" ]]; then
+    missing_archives+=("$archive")
+  fi
 done
 
-typeset -a core_modules
-core_modules=("$temporary_directory/cores"/*.dylib(N))
-if (( ${#core_modules} != ${#archives} )); then
-  print -u2 "核心数量不正确：期望 ${#archives}，实际 ${#core_modules}"
-  exit 65
+if (( ${#missing_archives} > 0 )); then
+  for archive in $missing_archives; do
+    print "下载 iOS 核心：${archive%.zip}"
+    curl --fail --silent --show-error --location --retry 3 --output "$temporary_directory/$archive" "$base_url/$archive"
+    unzip -q -o "$temporary_directory/$archive" -d "$temporary_directory/cores" "${archive%.zip}"
+  done
+
+  typeset -a core_modules
+  core_modules=("$temporary_directory/cores"/*.dylib(N))
+  if (( ${#core_modules} != ${#missing_archives} )); then
+    print -u2 "核心数量不正确：期望 ${#missing_archives}，实际 ${#core_modules}"
+    exit 65
+  fi
+
+  for module in $core_modules; do
+    if ! xcrun lipo -verify_arch arm64 "$module"; then
+      print -u2 "不是 iOS arm64 核心：$module"
+      exit 66
+    fi
+    build_platform=$(xcrun vtool -arch arm64 -show-build "$module")
+    if ! grep -Eq 'platform[[:space:]]+IOS$|LC_VERSION_MIN_IPHONEOS' <<< "$build_platform"; then
+      print -u2 "核心不是 iOS 真机二进制：$module"
+      exit 66
+    fi
+    chmod 0755 "$module"
+  done
+
+  cp "$temporary_directory/cores/"*.dylib "$output_directory/"
 fi
-
-for module in $core_modules; do
-  if ! xcrun lipo -verify_arch arm64 "$module"; then
-    print -u2 "不是 iOS arm64 核心：$module"
-    exit 66
-  fi
-  build_platform=$(xcrun vtool -arch arm64 -show-build "$module")
-  if ! grep -Eq 'platform[[:space:]]+IOS$|LC_VERSION_MIN_IPHONEOS' <<< "$build_platform"; then
-    print -u2 "核心不是 iOS 真机二进制：$module"
-    exit 66
-  fi
-  chmod 0755 "$module"
-done
-
-cp "$temporary_directory/cores/"*.dylib "$output_directory/"
 if [[ ! -f "$output_directory/System/Wii/dolphin-emu/Sys/codehandler.bin" ]]; then
   curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
     --output "$temporary_directory/dolphin-source.tar.gz" \

@@ -3,7 +3,6 @@ import SwiftUI
 enum GameCenterColors {
     static let action = Color(white: 0.94)
     static let actionHover = Color.white
-    static let progress = Color(white: 0.88)
 
     static let surface = Color.white.opacity(0.045)
     static let surfaceElevated = Color.white.opacity(0.085)
