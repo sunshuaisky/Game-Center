@@ -82,7 +82,52 @@ enum GamePlatform: String, Codable, CaseIterable, Identifiable {
         .switchConsole, .psp, .psv, .ps1, .ps2, .ps3, .macOS
     ]
 
-    var isEnabled: Bool { Self.allCases.contains(self) }
+    private static let enabledSet: Set<GamePlatform> = Set(allCases)
+
+    private static let folderNames: [String: GamePlatform] = [
+        "gba": .gba,
+        "gb": .gb,
+        "gbc": .gbc,
+        "nds": .nds,
+        "3ds": .threeDS,
+        "3dsx": .threeDS,
+        "psp": .psp,
+        "famicom": .famicom,
+        "fc": .famicom,
+        "nes": .famicom,
+        "superfamicom": .superFamicom,
+        "sfc": .superFamicom,
+        "snes": .superFamicom,
+        "n64": .n64,
+        "md": .megaDrive,
+        "megadrive": .megaDrive,
+        "mega drive": .megaDrive,
+        "ps1": .ps1,
+        "psx": .ps1,
+        "vita": .psv, "psvita": .psv, "ps vita": .psv,
+        "gc": .gamecube, "ngc": .gamecube, "dc": .dreamcast, "wii u": .wiiu,
+        "mac": .macOS,
+        "macos": .macOS,
+        "switch": .switchConsole
+    ]
+
+    private static let platformExtensions: [GamePlatform: Set<String>] = [
+        .gba: ["gba"],
+        .gb: ["gb", "zip"],
+        .gbc: ["gbc", "zip"],
+        .nds: ["nds"],
+        .threeDS: ["3ds", "3dsx", "cci", "cxi", "app"],
+        .psp: ["iso", "cso", "pbp", "chd"],
+        .famicom: ["nes", "unf", "unif", "fds", "zip"],
+        .superFamicom: ["sfc", "smc", "fig", "swc", "zip"],
+        .n64: ["n64", "v64", "z64", "ndd", "zip"],
+        .megaDrive: ["md", "gen", "smd", "bin", "zip"],
+        .ps1: ["cue", "ccd", "img", "chd", "m3u", "pbp", "iso", "bin"],
+        .macOS: ["app"],
+        .switchConsole: ["app", "nsp", "xci", "nsz", "xcz", "nup", "nro", "nso", "nca"]
+    ]
+
+    var isEnabled: Bool { Self.enabledSet.contains(self) }
 
     var id: String { rawValue }
 
@@ -135,63 +180,11 @@ enum GamePlatform: String, Codable, CaseIterable, Identifiable {
         }
     }
 
-    var isRetroConsole: Bool {
-        switch self {
-        case .gba, .gb, .gbc, .nds, .threeDS, .psp, .famicom, .superFamicom, .n64, .megaDrive, .ps1: true
-        case .switchConsole, .macOS: false
-        default: true
-        }
-    }
-
-    static func detect(for url: URL) -> GamePlatform? {
-        switch url.pathExtension.lowercased() {
-        case "gba": .gba
-        case "gb": .gb
-        case "gbc": .gbc
-        case "nds": .nds
-        case "3ds", "3dsx", "cci", "cxi", "cia": .threeDS
-        case "iso", "cso", "pbp": .psp
-        case "nes", "unf", "unif", "fds": .famicom
-        case "sfc", "smc", "fig", "swc": .superFamicom
-        case "n64", "v64", "z64", "ndd": .n64
-        case "gen", "md", "smd": .megaDrive
-        case "cue", "chd", "m3u": .ps1
-        case "app": .macOS
-        default: nil
-        }
-    }
-
     static func detect(for url: URL, under root: URL) -> GamePlatform? {
-        let folderNames: [String: GamePlatform] = [
-            "gba": .gba,
-            "gb": .gb,
-            "gbc": .gbc,
-            "nds": .nds,
-            "3ds": .threeDS,
-            "3dsx": .threeDS,
-            "psp": .psp,
-            "famicom": .famicom,
-            "fc": .famicom,
-            "nes": .famicom,
-            "superfamicom": .superFamicom,
-            "sfc": .superFamicom,
-            "snes": .superFamicom,
-            "n64": .n64,
-            "md": .megaDrive,
-            "megadrive": .megaDrive,
-            "mega drive": .megaDrive,
-            "ps1": .ps1,
-            "psx": .ps1,
-            "vita": .psv, "psvita": .psv, "ps vita": .psv,
-            "gc": .gamecube, "ngc": .gamecube, "dc": .dreamcast, "wii u": .wiiu,
-            "mac": .macOS,
-            "macos": .macOS,
-            "switch": .switchConsole
-        ]
         let rootComponents = root.standardizedFileURL.pathComponents
         let fileComponents = url.deletingLastPathComponent().standardizedFileURL.pathComponents
         guard fileComponents.starts(with: rootComponents) else { return nil }
-        let relativeDirectories = Array(fileComponents.dropFirst(rootComponents.count))
+        let relativeDirectories = fileComponents.dropFirst(rootComponents.count)
         func platform(for name: String) -> GamePlatform? {
             let key = name.lowercased()
             return folderNames[key] ?? GamePlatform(rawValue: key)
@@ -205,40 +198,28 @@ enum GamePlatform: String, Codable, CaseIterable, Identifiable {
         }
         if let system = macSystems[platformFolder] {
             if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
-                let marker: String
                 switch platformFolder {
                 case .wiiu:
                     return MobileLibraryFormat.isGameFolder(url, runtime: "cemu") ? .wiiu : nil
                 case .ps3:
-                    return MobileLibraryFormat.isGameFolder(url, runtime: "rpcs3") ? .ps3 : nil
-                case .ps4: marker = "eboot.bin"
-                case .psv: return MobileLibraryFormat.isVitaGameFolder(url) ? .psv : nil
-                default: return nil
+                    let fm = FileManager.default
+                    let hasPS3Game = fm.fileExists(atPath: url.appendingPathComponent("PS3_GAME/USRDIR/EBOOT.BIN").path)
+                        || fm.fileExists(atPath: url.appendingPathComponent("USRDIR/EBOOT.BIN").path)
+                    return hasPS3Game ? .ps3 : nil
+                case .ps4:
+                    return FileManager.default.fileExists(atPath: url.appendingPathComponent("eboot.bin").path) ? .ps4 : nil
+                case .psv:
+                    return MobileLibraryFormat.isVitaGameFolder(url) ? .psv : nil
+                default:
+                    return nil
                 }
-                guard FileManager.default.fileExists(atPath: url.appendingPathComponent(marker).path) else { return nil }
-                return platformFolder
             }
             // Installed PS3 digital titles can also be launched via their USRDIR executable.
             if platformFolder == .ps3, url.lastPathComponent.uppercased() == "EBOOT.BIN",
                url.deletingLastPathComponent().lastPathComponent.uppercased() == "USRDIR" { return .ps3 }
             return system.extensions.contains(fileExtension) ? platformFolder : nil
         }
-        switch platformFolder {
-        case .gba where fileExtension == "gba": return .gba
-        case .gb where ["gb", "zip"].contains(fileExtension): return .gb
-        case .gbc where ["gbc", "zip"].contains(fileExtension): return .gbc
-        case .nds where fileExtension == "nds": return .nds
-        case .threeDS where ["3ds", "3dsx", "cci", "cxi", "app"].contains(fileExtension): return .threeDS
-        case .psp where ["iso", "cso", "pbp", "chd"].contains(fileExtension): return .psp
-        case .famicom where ["nes", "unf", "unif", "fds", "zip"].contains(fileExtension): return .famicom
-        case .superFamicom where ["sfc", "smc", "fig", "swc", "zip"].contains(fileExtension): return .superFamicom
-        case .n64 where ["n64", "v64", "z64", "ndd", "zip"].contains(fileExtension): return .n64
-        case .megaDrive where ["md", "gen", "smd", "bin", "zip"].contains(fileExtension): return .megaDrive
-        case .ps1 where ["cue", "ccd", "img", "chd", "m3u", "pbp", "iso", "bin"].contains(fileExtension): return .ps1
-        case .macOS where fileExtension == "app": return .macOS
-        case .switchConsole where ["app", "nsp", "xci", "nsz", "xcz", "nup", "nro", "nso", "nca"].contains(fileExtension): return .switchConsole
-        default: return nil
-        }
+        return platformExtensions[platformFolder]?.contains(fileExtension) == true ? platformFolder : nil
     }
 
     static func isSwitch2DumpFolder(_ url: URL) -> Bool {
@@ -283,6 +264,64 @@ enum GamePlatform: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+private final class GameBookmarkCache: @unchecked Sendable {
+    struct Entry {
+        let url: URL
+        let displayTitle: String
+        let isAppBundle: Bool
+    }
+
+    static let shared = GameBookmarkCache()
+    private let lock = NSLock()
+    private var entries: [Data: Entry] = [:]
+
+    func entry(for bookmark: Data) throws -> Entry {
+        lock.lock()
+        if let cached = entries[bookmark] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        var isStale = false
+        let url: URL
+        do {
+            url = try URL(
+                resolvingBookmarkData: bookmark,
+                options: [.withSecurityScope],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            )
+        } catch {
+            // SwiftPM Debug runs are not sandboxed. Bookmarks created by the
+            // library picker may therefore resolve without a security scope.
+            url = try URL(
+                resolvingBookmarkData: bookmark,
+                options: [],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            )
+        }
+        let ext = url.pathExtension.lowercased()
+        let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+        let derived: String
+        if isDir && ext != "app" {
+            derived = url.lastPathComponent
+        } else {
+            derived = url.deletingPathExtension().lastPathComponent
+        }
+        let resolved = Entry(url: url, displayTitle: derived, isAppBundle: ext == "app")
+
+        lock.lock()
+        if entries.count > 2048 {
+            entries.removeAll(keepingCapacity: true)
+        }
+        entries[bookmark] = resolved
+        lock.unlock()
+        return resolved
+    }
+}
+
 struct Game: Identifiable, Codable, Hashable {
     var id: UUID
     var title: String
@@ -303,21 +342,13 @@ struct Game: Identifiable, Codable, Hashable {
     var isFavorite: Bool
 
     var isDirectlyLaunchable: Bool {
-        platform != .switchConsole || ((try? resolvedURL().pathExtension.lowercased()) == "app")
+        platform != .switchConsole || ((try? GameBookmarkCache.shared.entry(for: bookmark).isAppBundle) == true)
     }
 
     /// Always derives the user-visible title from the game's file/folder name (never online metadata).
     var displayTitle: String {
-        if let url = try? resolvedURL() {
-            let ext = url.pathExtension.lowercased()
-            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-            if isDir && ext != "app" {
-                let name = url.lastPathComponent
-                if !name.isEmpty { return name }
-            } else {
-                let name = url.deletingPathExtension().lastPathComponent
-                if !name.isEmpty { return name }
-            }
+        if let cached = try? GameBookmarkCache.shared.entry(for: bookmark), !cached.displayTitle.isEmpty {
+            return cached.displayTitle
         }
         return title
     }
@@ -361,24 +392,7 @@ struct Game: Identifiable, Codable, Hashable {
     }
 
     func resolvedURL() throws -> URL {
-        var isStale = false
-        do {
-            return try URL(
-                resolvingBookmarkData: bookmark,
-                options: [.withSecurityScope],
-                relativeTo: nil,
-                bookmarkDataIsStale: &isStale
-            )
-        } catch {
-            // SwiftPM Debug runs are not sandboxed. Bookmarks created by the
-            // library picker may therefore resolve without a security scope.
-            return try URL(
-                resolvingBookmarkData: bookmark,
-                options: [],
-                relativeTo: nil,
-                bookmarkDataIsStale: &isStale
-            )
-        }
+        try GameBookmarkCache.shared.entry(for: bookmark).url
     }
 }
 
@@ -403,15 +417,6 @@ enum LibraryFilter: Hashable, Identifiable {
         case .recent: AppLanguage.localized("最近游玩")
         case .favorites: AppLanguage.localized("收藏")
         case .platform(let platform): platform.title
-        }
-    }
-
-    var symbol: String {
-        switch self {
-        case .all: "square.grid.2x2"
-        case .recent: "clock"
-        case .favorites: "heart"
-        case .platform(let platform): platform.symbol
         }
     }
 }

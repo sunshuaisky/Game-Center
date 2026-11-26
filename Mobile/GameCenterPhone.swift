@@ -17,7 +17,6 @@ private enum PhoneTheme {
     static let action = Color(white: 0.94)
     static let inverseText = Color(white: 0.06)
     static let surface = Color.white.opacity(0.055)
-    static let surfaceElevated = Color.white.opacity(0.10)
     static let border = Color.white.opacity(0.11)
     static let favoriteForeground = Color(red: 1.0, green: 0.52, blue: 0.58)
     static let favoriteBackground = Color.red.opacity(0.20)
@@ -26,6 +25,13 @@ private enum PhoneTheme {
     static let destructiveBackground = Color.red.opacity(0.14)
     static let destructiveBorder = Color.red.opacity(0.28)
     static let ready = Color(red: 0.28, green: 0.84, blue: 0.50)
+}
+
+@MainActor
+private enum PhoneHaptics {
+    static let light = UIImpactFeedbackGenerator(style: .light)
+    static let medium = UIImpactFeedbackGenerator(style: .medium)
+    static let selection = UISelectionFeedbackGenerator()
 }
 
 private enum PhoneFilter: Hashable, Identifiable {
@@ -67,6 +73,8 @@ private struct LibraryView: View {
     @AppStorage("phone.library.favorites") private var favoriteData = Data()
     @AppStorage("museum.recent") private var recentData = Data()
     @AppStorage("phone.library.hideEmptyPlatforms") private var hideEmptyPlatforms = true
+    @State private var cachedFavorites: Set<String> = []
+    @State private var cachedRecentIDs: [String] = []
     @Namespace private var filterPillNamespace
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -131,20 +139,28 @@ private struct LibraryView: View {
         func hash(into hasher: inout Hasher) { hasher.combine(id) }
     }
 
-    private var allEntries: [Entry] {
-        switchGames.map(Entry.console) + roms.map { rom in
-            let path = rom.url.pathComponents.dropFirst(library?.root.pathComponents.count ?? 0).joined(separator: "/")
-            return .rom(rom, path)
+    private struct LibrarySnapshot {
+        let allEntries: [Entry]
+        let entriesByID: [String: Entry]
+        let favorites: Set<String>
+        let recentCount: Int
+        let favoritesCount: Int
+        let platformCounts: [String: Int]
+        let visibleFilters: [PhoneFilter]
+        let visibleEntries: [Entry]
+        let selectedEntry: Entry?
+
+        func count(for filter: PhoneFilter) -> Int {
+            switch filter {
+            case .recent: recentCount
+            case .favorites: favoritesCount
+            case let .platform(id): platformCounts[id] ?? 0
+            }
         }
     }
 
-    private var favorites: Set<String> {
-        (try? JSONDecoder().decode(Set<String>.self, from: favoriteData)) ?? []
-    }
-
-    private var recentIDs: [String] {
-        (try? JSONDecoder().decode([String].self, from: recentData)) ?? []
-    }
+    private var favorites: Set<String> { cachedFavorites }
+    private var recentIDs: [String] { cachedRecentIDs }
 
     private var allPlatforms: [(id: String, name: String, short: String)] {
         [("switch", "Nintendo Switch", "Switch")] + (library?.platforms.map {
@@ -152,48 +168,86 @@ private struct LibraryView: View {
         } ?? [])
     }
 
-    private var visibleFilters: [PhoneFilter] {
-        let base: [PhoneFilter] = [.recent, .favorites]
-        let nonEmpty = allPlatforms.filter { count(for: .platform($0.id)) > 0 }
-        let platformsToShow = (hideEmptyPlatforms && !nonEmpty.isEmpty) ? nonEmpty : allPlatforms
-        return base + platformsToShow.map { .platform($0.id) }
+    private func makeSnapshot() -> LibrarySnapshot {
+        let rootComponentCount = library?.root.pathComponents.count ?? 0
+        var entries: [Entry] = []
+        entries.reserveCapacity(switchGames.count + roms.count)
+        for game in switchGames {
+            entries.append(.console(game))
+        }
+        for rom in roms {
+            let path = rom.url.pathComponents.dropFirst(rootComponentCount).joined(separator: "/")
+            entries.append(.rom(rom, path))
+        }
+
+        var entriesByID: [String: Entry] = Dictionary(minimumCapacity: entries.count)
+        var platformCounts: [String: Int] = [:]
+        var favoritesCount = 0
+        let favs = cachedFavorites
+        for entry in entries {
+            entriesByID[entry.id] = entry
+            platformCounts[entry.platformID, default: 0] += 1
+            if favs.contains(entry.id) { favoritesCount += 1 }
+        }
+        let recentMatches = cachedRecentIDs.compactMap { entriesByID[$0] }
+
+        let platforms = allPlatforms
+        let nonEmpty = platforms.filter { (platformCounts[$0.id] ?? 0) > 0 }
+        let platformsToShow = (hideEmptyPlatforms && !nonEmpty.isEmpty) ? nonEmpty : platforms
+        let filters: [PhoneFilter] = [.recent, .favorites] + platformsToShow.map { .platform($0.id) }
+
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseList: [Entry]
+        switch activeFilter {
+        case .recent:
+            baseList = recentMatches
+        case .favorites:
+            baseList = entries
+                .filter { favs.contains($0.id) }
+                .sorted { displayTitle($0).localizedStandardCompare(displayTitle($1)) == .orderedAscending }
+        case let .platform(id):
+            baseList = entries
+                .filter { $0.platformID == id }
+                .sorted { displayTitle($0).localizedStandardCompare(displayTitle($1)) == .orderedAscending }
+        }
+        let visible: [Entry]
+        if query.isEmpty {
+            visible = baseList
+        } else {
+            visible = baseList.filter { entry in
+                displayTitle(entry).localizedCaseInsensitiveContains(query)
+                    || entry.title.localizedCaseInsensitiveContains(query)
+                    || entry.platformTitle.localizedCaseInsensitiveContains(query)
+                    || entry.shortLabel.localizedCaseInsensitiveContains(query)
+            }
+        }
+        let selected = visible.first(where: { $0.id == selectedEntryID }) ?? visible.first
+        return LibrarySnapshot(
+            allEntries: entries,
+            entriesByID: entriesByID,
+            favorites: favs,
+            recentCount: recentMatches.count,
+            favoritesCount: favoritesCount,
+            platformCounts: platformCounts,
+            visibleFilters: filters,
+            visibleEntries: visible,
+            selectedEntry: selected
+        )
     }
+
+    private var visibleFilters: [PhoneFilter] { makeSnapshot().visibleFilters }
 
     private var activeImportPlatform: PhoneLibrary.Format.Platform? {
         guard case let .platform(id) = activeFilter else { return nil }
         return library?.platforms.first { $0.id == id }
     }
 
-    private var visibleEntries: [Entry] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseList: [Entry]
-        switch activeFilter {
-        case .recent:
-            let recentMatches = recentIDs.compactMap { id in allEntries.first { $0.id == id } }
-            baseList = recentMatches
-        case .favorites:
-            baseList = allEntries
-                .filter { favorites.contains($0.id) }
-                .sorted { displayTitle($0).localizedStandardCompare(displayTitle($1)) == .orderedAscending }
-        case let .platform(id):
-            baseList = allEntries
-                .filter { $0.platformID == id }
-                .sorted { displayTitle($0).localizedStandardCompare(displayTitle($1)) == .orderedAscending }
-        }
-        guard !query.isEmpty else { return baseList }
-        return baseList.filter { entry in
-            displayTitle(entry).localizedCaseInsensitiveContains(query)
-                || entry.title.localizedCaseInsensitiveContains(query)
-                || entry.platformTitle.localizedCaseInsensitiveContains(query)
-                || entry.shortLabel.localizedCaseInsensitiveContains(query)
-        }
-    }
+    private var visibleEntries: [Entry] { makeSnapshot().visibleEntries }
 
-    private var selectedEntry: Entry? {
-        visibleEntries.first(where: { $0.id == selectedEntryID }) ?? visibleEntries.first
-    }
+    private var selectedEntry: Entry? { makeSnapshot().selectedEntry }
 
     var body: some View {
+        let snapshot = makeSnapshot()
         GeometryReader { geometry in
             let isLandscape = geometry.size.width > geometry.size.height
             let gridColumnsCount = isLandscape
@@ -201,7 +255,7 @@ private struct LibraryView: View {
                 : (geometry.size.width >= 600 ? 5 : 3)
 
             ZStack {
-                backdrop(size: geometry.size, isLandscape: isLandscape)
+                backdrop(size: geometry.size, isLandscape: isLandscape, selectedEntry: snapshot.selectedEntry)
 
                 VStack(spacing: 0) {
                     topBar(isLandscape: isLandscape)
@@ -212,11 +266,11 @@ private struct LibraryView: View {
                     }
 
                     if isLandscape {
-                        landscapeHero(entry: selectedEntry)
+                        landscapeHero(entry: snapshot.selectedEntry)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                             .padding(.horizontal, 24)
                     } else {
-                        portraitHero(entry: selectedEntry)
+                        portraitHero(entry: snapshot.selectedEntry)
                             .padding(.horizontal, 20)
                             .padding(.top, 10)
                             .padding(.bottom, 14)
@@ -225,34 +279,46 @@ private struct LibraryView: View {
                     bottomDock(
                         isLandscape: isLandscape,
                         dockHeight: isLandscape ? max(geometry.size.height * 0.60, 210) : nil,
-                        columnsCount: gridColumnsCount
+                        columnsCount: gridColumnsCount,
+                        snapshot: snapshot
                     )
                 }
             }
-            .onChange(of: selectedEntry?.id) { _, _ in
-                if let entry = selectedEntry {
+            .onChange(of: snapshot.selectedEntry?.id) { _, _ in
+                if let entry = snapshot.selectedEntry {
                     Task { await lookupMetadata(entry) }
                 }
             }
-            .onChange(of: visibleEntries.map(\.id)) { _, ids in
+            .onChange(of: snapshot.visibleEntries.map(\.id)) { _, ids in
                 if !(selectedEntryID.map(ids.contains) ?? false) {
                     selectedEntryID = ids.first
                 }
             }
             .onChange(of: activeFilter) { _, _ in
-                selectedEntryID = visibleEntries.first?.id
+                selectedEntryID = makeSnapshot().visibleEntries.first?.id
             }
             .onChange(of: hideEmptyPlatforms) { _, _ in
-                if !visibleFilters.contains(activeFilter) {
+                if !makeSnapshot().visibleFilters.contains(activeFilter) {
                     activeFilter = .recent
                 }
             }
             .onChange(of: gamepad.connectionVersion) { _, _ in
                 bindGamepad(columnsCount: gridColumnsCount)
             }
+            .onChange(of: gridColumnsCount) { _, count in
+                bindGamepad(columnsCount: count)
+            }
             .onAppear {
+                cachedFavorites = (try? JSONDecoder().decode(Set<String>.self, from: favoriteData)) ?? []
+                cachedRecentIDs = (try? JSONDecoder().decode([String].self, from: recentData)) ?? []
                 gamepad.refresh()
                 bindGamepad(columnsCount: gridColumnsCount)
+            }
+            .onChange(of: favoriteData) { _, data in
+                cachedFavorites = (try? JSONDecoder().decode(Set<String>.self, from: data)) ?? []
+            }
+            .onChange(of: recentData) { _, data in
+                cachedRecentIDs = (try? JSONDecoder().decode([String].self, from: data)) ?? []
             }
         }
         .background(Color(white: 0.045).ignoresSafeArea())
@@ -335,7 +401,7 @@ private struct LibraryView: View {
 
     // MARK: - Backdrop
 
-    private func backdrop(size: CGSize, isLandscape: Bool) -> some View {
+    private func backdrop(size: CGSize, isLandscape: Bool, selectedEntry: Entry?) -> some View {
         ZStack {
             Color(white: 0.045)
             if let entry = selectedEntry, let image = backdropImage(for: entry) {
@@ -744,7 +810,7 @@ private struct LibraryView: View {
 
     // MARK: - Bottom Glass Dock (Platform Tabs + Pure Multi-Row Grid)
 
-    private func bottomDock(isLandscape: Bool, dockHeight: CGFloat?, columnsCount: Int) -> some View {
+    private func bottomDock(isLandscape: Bool, dockHeight: CGFloat?, columnsCount: Int, snapshot: LibrarySnapshot) -> some View {
         let horizontalInset: CGFloat = isLandscape ? 24 : 20
         let columns = Array(repeating: GridItem(.flexible(), spacing: isLandscape ? 14 : 12, alignment: .top), count: columnsCount)
 
@@ -753,10 +819,10 @@ private struct LibraryView: View {
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        ForEach(visibleFilters) { filter in
+                        ForEach(snapshot.visibleFilters) { filter in
                             let isSelected = activeFilter == filter
                             Button {
-                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                PhoneHaptics.light.impactOccurred()
                                 withAnimation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.86)) {
                                     activeFilter = filter
                                 }
@@ -764,7 +830,7 @@ private struct LibraryView: View {
                                 HStack(spacing: 5) {
                                     Text(filterTitle(filter))
                                         .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
-                                    Text("\(count(for: filter))")
+                                    Text("\(snapshot.count(for: filter))")
                                         .font(.system(size: 11, design: .monospaced))
                                         .foregroundStyle(isSelected ? Color.black.opacity(0.52) : Color.white.opacity(0.42))
                                 }
@@ -801,7 +867,7 @@ private struct LibraryView: View {
             .padding(.bottom, 6)
 
             // Multi-row Pure Cover Grid (no redundant header row, no top-left platform badge)
-            if visibleEntries.isEmpty {
+            if snapshot.visibleEntries.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "square.stack.3d.up")
                         .font(.system(size: 22, weight: .light))
@@ -815,9 +881,13 @@ private struct LibraryView: View {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: false) {
                         LazyVGrid(columns: columns, spacing: isLandscape ? 14 : 16) {
-                            ForEach(visibleEntries) { entry in
-                                coverTile(entry: entry, isSelected: entry.id == selectedEntry?.id)
-                                    .id(entry.id)
+                            ForEach(snapshot.visibleEntries) { entry in
+                                coverTile(
+                                    entry: entry,
+                                    isSelected: entry.id == snapshot.selectedEntry?.id,
+                                    isFavorite: snapshot.favorites.contains(entry.id)
+                                )
+                                .id(entry.id)
                             }
                         }
                         .padding(.horizontal, horizontalInset)
@@ -825,7 +895,7 @@ private struct LibraryView: View {
                         .padding(.bottom, isLandscape ? 16 : 28)
                     }
                     .mask(bottomFadeMask)
-                    .onChange(of: selectedEntry?.id) { _, id in
+                    .onChange(of: snapshot.selectedEntry?.id) { _, id in
                         guard let id else { return }
                         withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
                             proxy.scrollTo(id, anchor: .center)
@@ -881,9 +951,8 @@ private struct LibraryView: View {
         }
     }
 
-    private func coverTile(entry: Entry, isSelected: Bool) -> some View {
-        let isFav = favorites.contains(entry.id)
-        return VStack(alignment: .leading, spacing: 6) {
+    private func coverTile(entry: Entry, isSelected: Bool, isFavorite isFav: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
             ZStack(alignment: .topTrailing) {
                 coverArtView(entry: entry, cornerRadius: 11)
                     .aspectRatio(0.8, contentMode: .fit)
@@ -906,10 +975,10 @@ private struct LibraryView: View {
             }
             .contentShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
             .onTapGesture {
-                if selectedEntry?.id == entry.id {
+                if isSelected {
                     launchOrInspect(entry)
                 } else {
-                    UISelectionFeedbackGenerator().selectionChanged()
+                    PhoneHaptics.selection.selectionChanged()
                     withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
                         selectedEntryID = entry.id
                     }
@@ -944,29 +1013,29 @@ private struct LibraryView: View {
     }
 
     private func coverArtView(entry: Entry, cornerRadius: CGFloat) -> some View {
-        GeometryReader { bounds in
-            ZStack {
-                if let image = coverImage(for: entry) {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: bounds.size.width, height: bounds.size.height)
-                        .clipped()
-                } else {
-                    LinearGradient(colors: placeholderPalette(for: entry), startPoint: .topLeading, endPoint: .bottomTrailing)
-                    Circle()
-                        .fill(.white.opacity(0.14))
-                        .frame(width: bounds.size.width * 0.9, height: bounds.size.width * 0.9)
-                        .blur(radius: 20)
-                        .offset(x: bounds.size.width * 0.35, y: -bounds.size.height * 0.35)
-                    Image(systemName: platformSymbol(for: entry.platformID))
-                        .font(.system(size: max(22, bounds.size.width * 0.28), weight: .light))
-                        .foregroundStyle(.white.opacity(0.84))
-                }
+        ZStack {
+            if let image = coverImage(for: entry) {
+                Color.clear
+                    .overlay {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFill()
+                    }
+            } else {
+                LinearGradient(colors: placeholderPalette(for: entry), startPoint: .topLeading, endPoint: .bottomTrailing)
+                RadialGradient(
+                    colors: [.white.opacity(0.18), .clear],
+                    center: .topTrailing,
+                    startRadius: 2,
+                    endRadius: 90
+                )
+                Image(systemName: platformSymbol(for: entry.platformID))
+                    .font(.system(size: 28, weight: .light))
+                    .foregroundStyle(.white.opacity(0.84))
             }
-            .frame(width: bounds.size.width, height: bounds.size.height)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         }
+        .clipped()
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 
     // MARK: - Unified Dark Detail Sheet
@@ -1174,14 +1243,7 @@ private struct LibraryView: View {
     }
 
     private func count(for filter: PhoneFilter) -> Int {
-        switch filter {
-        case .recent:
-            return recentIDs.filter { id in allEntries.contains { $0.id == id } }.count
-        case .favorites:
-            return allEntries.filter { favorites.contains($0.id) }.count
-        case let .platform(id):
-            return allEntries.filter { $0.platformID == id }.count
-        }
+        makeSnapshot().count(for: filter)
     }
 
     private func shortPlatformName(for id: String, fallback: String) -> String {
@@ -1239,19 +1301,21 @@ private struct LibraryView: View {
     }
 
     private func remember(_ entry: Entry) {
-        let updated = Array(([entry.id] + recentIDs.filter { $0 != entry.id }).prefix(100))
+        let updated = Array(([entry.id] + cachedRecentIDs.filter { $0 != entry.id }).prefix(100))
+        cachedRecentIDs = updated
         recentData = (try? JSONEncoder().encode(updated)) ?? Data()
     }
 
     private func toggleFavorite(_ entry: Entry) {
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        var updated = favorites
+        PhoneHaptics.light.impactOccurred()
+        var updated = cachedFavorites
         if !updated.insert(entry.id).inserted { updated.remove(entry.id) }
+        cachedFavorites = updated
         if let data = try? JSONEncoder().encode(updated) { favoriteData = data }
     }
 
     private func launchOrInspect(_ entry: Entry) {
-        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        PhoneHaptics.medium.impactOccurred()
         switch entry {
         case let .rom(rom, _):
             remember(entry)
@@ -1280,16 +1344,20 @@ private struct LibraryView: View {
 
     private func deleteEntry(_ entry: Entry) {
         guard let library else { return }
-        do {
-            switch entry {
-            case let .rom(rom, _):
-                try library.deleteROM(rom)
-            case let .console(game):
-                try library.deleteSwitchBuilds(for: game)
+        Task {
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    switch entry {
+                    case let .rom(rom, _):
+                        try library.deleteROM(rom)
+                    case let .console(game):
+                        try library.deleteSwitchBuilds(for: game)
+                    }
+                }.value
+                await refresh()
+            } catch {
+                notice = "删除失败：" + error.localizedDescription
             }
-            Task { await refresh() }
-        } catch {
-            notice = "删除失败：" + error.localizedDescription
         }
     }
 

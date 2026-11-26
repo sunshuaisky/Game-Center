@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import SwiftUI
 
 private final class GameArtworkCache: @unchecked Sendable {
@@ -14,9 +15,16 @@ private final class GameArtworkCache: @unchecked Sendable {
         cache.object(forKey: key as NSString)
     }
 
-    func store(_ image: NSImage, for key: String) {
-        let pixels = Int(image.size.width * image.size.height)
-        cache.setObject(image, forKey: key as NSString, cost: max(1, pixels * 4))
+    func store(_ image: NSImage, for key: String, pixelCost: Int? = nil) {
+        let cost: Int
+        if let pixelCost {
+            cost = max(1, pixelCost)
+        } else if let rep = image.representations.first, rep.pixelsWide > 0, rep.pixelsHigh > 0 {
+            cost = max(1, rep.pixelsWide * rep.pixelsHigh * 4)
+        } else {
+            cost = max(1, Int(image.size.width * image.size.height) * 4)
+        }
+        cache.setObject(image, forKey: key as NSString, cost: cost)
     }
 }
 
@@ -62,15 +70,19 @@ struct GameArtwork: View {
     }
 
     var body: some View {
+        let key = loadKey
+        let displayedImage = coverImage ?? GameArtworkCache.shared.image(for: key)
+        let displayedBlurred = displayedImage.map { compact && !Self.isWide($0) } ?? isBlurredFallbackBackdrop
+
         GeometryReader { geometry in
             ZStack(alignment: .topLeading) {
-                if let coverImage {
-                    Image(nsImage: coverImage)
+                if let displayedImage {
+                    Image(nsImage: displayedImage)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
                         .frame(width: geometry.size.width, height: geometry.size.height)
-                        .scaleEffect(isBlurredFallbackBackdrop ? 1.12 : 1.0)
-                        .blur(radius: isBlurredFallbackBackdrop ? 18 : 0)
+                        .scaleEffect(displayedBlurred ? 1.12 : 1.0)
+                        .blur(radius: displayedBlurred ? 18 : 0)
                         .clipped()
                 } else {
                     LinearGradient(colors: palette, startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -104,7 +116,7 @@ struct GameArtwork: View {
 
                 // Only render inner title on generated placeholder covers so real cover art stays clean
                 // and does not duplicate the title below the card or collide with the bottom-right menu button.
-                if !compact && coverImage == nil {
+                if !compact && displayedImage == nil {
                     LinearGradient(colors: [.clear, .black.opacity(0.56)], startPoint: .center, endPoint: .bottom)
                         .allowsHitTesting(false)
 
@@ -123,13 +135,12 @@ struct GameArtwork: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityHidden(true)
-        .task(id: loadKey) {
-            await loadCoverAsync()
+        .task(id: key) {
+            await loadCoverAsync(key: key)
         }
     }
 
-    private func loadCoverAsync() async {
-        let key = loadKey
+    private func loadCoverAsync(key: String) async {
         if let cached = GameArtworkCache.shared.image(for: key) {
             coverImage = cached
             isBlurredFallbackBackdrop = compact && !Self.isWide(cached)
@@ -141,46 +152,73 @@ struct GameArtwork: View {
         let artworkPath = game.metadataArtworkPath
         let platform = game.platform
         let isCompact = compact
-        let resolvedAppURL: URL? = (!isCompact && (platform == .macOS || platform == .switchConsole))
-            ? (try? game.resolvedURL())
-            : nil
+        let maxPixels = isCompact ? 1920 : 512
+        let gameSnapshot = game
 
-        let loaded: (NSImage, Bool)? = await Task.detached(priority: .userInitiated) {
+        let loaded: (NSImage, Bool, Int)? = await Task.detached(priority: .userInitiated) {
             if let bookmark, let url = Self.resolvedBookmark(bookmark) {
                 let hasAccess = url.startAccessingSecurityScopedResource()
                 defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
-                if let image = NSImage(contentsOf: url) {
-                    return (image, isCompact && !Self.isWide(image))
+                if let decoded = Self.decodeImage(at: url, maxPixelSize: maxPixels) {
+                    return (decoded.0, isCompact && !Self.isWide(decoded.0), decoded.1)
                 }
             }
 
-            if isCompact, let path = backdropPath, let image = NSImage(contentsOfFile: path) {
-                return (image, !Self.isWide(image))
+            if isCompact, let path = backdropPath {
+                if let decoded = Self.decodeImage(at: URL(fileURLWithPath: path), maxPixelSize: maxPixels) {
+                    return (decoded.0, !Self.isWide(decoded.0), decoded.1)
+                }
             }
 
-            if let path = artworkPath, let image = NSImage(contentsOfFile: path) {
-                return (image, isCompact && !Self.isWide(image))
-            }
-
-            if let url = resolvedAppURL, url.pathExtension.lowercased() == "app" {
-                let hasAccess = url.startAccessingSecurityScopedResource()
-                defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
-                let icon = NSWorkspace.shared.icon(forFile: url.path)
-                return (icon, false)
+            if let path = artworkPath {
+                if let decoded = Self.decodeImage(at: URL(fileURLWithPath: path), maxPixelSize: maxPixels) {
+                    return (decoded.0, isCompact && !Self.isWide(decoded.0), decoded.1)
+                }
             }
 
             return nil
         }.value
 
         guard !Task.isCancelled else { return }
-        if let (image, blurred) = loaded {
-            GameArtworkCache.shared.store(image, for: key)
+        if let (image, blurred, cost) = loaded {
+            GameArtworkCache.shared.store(image, for: key, pixelCost: cost)
             coverImage = image
             isBlurredFallbackBackdrop = blurred
-        } else {
-            coverImage = nil
-            isBlurredFallbackBackdrop = false
+            return
         }
+
+        if !isCompact && (platform == .macOS || platform == .switchConsole),
+           let url = try? gameSnapshot.resolvedURL(),
+           url.pathExtension.lowercased() == "app" {
+            let hasAccess = url.startAccessingSecurityScopedResource()
+            defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
+            let icon = NSWorkspace.shared.icon(forFile: url.path)
+            GameArtworkCache.shared.store(icon, for: key)
+            coverImage = icon
+            isBlurredFallbackBackdrop = false
+            return
+        }
+
+        coverImage = nil
+        isBlurredFallbackBackdrop = false
+    }
+
+    nonisolated private static func decodeImage(at url: URL, maxPixelSize: Int) -> (NSImage, Int)? {
+        let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions as CFDictionary) else {
+            return nil
+        }
+        let thumbOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary) else {
+            return nil
+        }
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        return (image, cgImage.width * cgImage.height * 4)
     }
 
     nonisolated private static func isWide(_ image: NSImage) -> Bool {
@@ -189,9 +227,17 @@ struct GameArtwork: View {
 
     nonisolated private static func resolvedBookmark(_ bookmark: Data) -> URL? {
         var isStale = false
-        return try? URL(
+        if let scoped = try? URL(
             resolvingBookmarkData: bookmark,
             options: [.withSecurityScope],
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        ) {
+            return scoped
+        }
+        return try? URL(
+            resolvingBookmarkData: bookmark,
+            options: [],
             relativeTo: nil,
             bookmarkDataIsStale: &isStale
         )

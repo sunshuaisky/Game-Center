@@ -1,4 +1,5 @@
 import CryptoKit
+import ImageIO
 import SwiftUI
 import UIKit
 
@@ -17,6 +18,7 @@ final class PhoneGameMetadata: ObservableObject {
     @Published private(set) var records: [String: Record] = [:]
     @Published private(set) var searching: Set<String> = []
     @Published private(set) var messages: [String: String] = [:]
+    @Published private(set) var imageRevision: UInt64 = 0
 
     private let service: GameMetadataService
     private let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -27,50 +29,82 @@ final class PhoneGameMetadata: ObservableObject {
         cache.totalCostLimit = 96 * 1024 * 1024
         return cache
     }()
+    private var inFlightImages: Set<String> = []
 
     init(service: GameMetadataService = GameMetadataService()) {
         self.service = service
-        if let data = try? Data(contentsOf: root.appendingPathComponent("index.json")),
+        let indexURL = root.appendingPathComponent("index.json")
+        if let data = try? Data(contentsOf: indexURL),
            let saved = try? JSONDecoder().decode([String: Record].self, from: data) {
             records = saved
         }
     }
 
     func image(for id: String, backdrop: Bool = false) -> UIImage? {
+        _ = imageRevision
         guard let record = records[id],
               let file = backdrop ? (record.backdrop ?? record.cover) : record.cover else { return nil }
-        let cacheKey = file as NSString
-        if let cached = imageCache.object(forKey: cacheKey) {
+        let variantKey = (backdrop ? "bg:" : "cv:") + file
+        if let cached = imageCache.object(forKey: variantKey as NSString) {
             return cached
         }
-        let path = root.appendingPathComponent(file).path
-        guard let loaded = UIImage(contentsOfFile: path) else { return nil }
-        let cost = Int(loaded.size.width * loaded.size.height * loaded.scale * loaded.scale * 4)
-        imageCache.setObject(loaded, forKey: cacheKey, cost: max(1, cost))
-        return loaded
+        preloadImage(file: file, variantKey: variantKey, maxPixelSize: backdrop ? 1280 : 480)
+        return nil
+    }
+
+    private func preloadImage(file: String, variantKey: String, maxPixelSize: Int) {
+        guard inFlightImages.insert(variantKey).inserted else { return }
+        let url = root.appendingPathComponent(file)
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let decoded = Self.downsampleImage(at: url, maxPixelSize: maxPixelSize)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.inFlightImages.remove(variantKey)
+                if let (image, cost) = decoded {
+                    self.imageCache.setObject(image, forKey: variantKey as NSString, cost: max(1, cost))
+                    self.imageRevision &+= 1
+                }
+            }
+        }
+    }
+
+    nonisolated private static func downsampleImage(at url: URL, maxPixelSize: Int) -> (UIImage, Int)? {
+        let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions as CFDictionary) else {
+            return nil
+        }
+        let thumbOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary) else {
+            return nil
+        }
+        return (UIImage(cgImage: cgImage), cgImage.width * cgImage.height * 4)
     }
 
     func bundledImage(named name: String?) -> UIImage? {
         guard let name else { return nil }
-        let cacheKey = ("bundle:" + name) as NSString
-        if let cached = imageCache.object(forKey: cacheKey) { return cached }
-        guard let loaded = UIImage(named: name) else { return nil }
-        let cost = Int(loaded.size.width * loaded.size.height * loaded.scale * loaded.scale * 4)
-        imageCache.setObject(loaded, forKey: cacheKey, cost: max(1, cost))
-        return loaded
+        return UIImage(named: name)
     }
 
-    private func applyText(_ result: GameMetadataResult, id: String, language: String) {
+    private func applyText(_ result: GameMetadataResult, id: String, language: String) async {
+        var record = records[id] ?? Record(language: language, updated: .distantPast)
+        if let title = result.title { record.title = title }
+        if let synopsis = result.synopsis { record.synopsis = synopsis }
+        if let source = result.metadataSourceURL { record.source = source }
+        var updated = records
+        updated[id] = record
+        records = updated
+        let rootDir = root
+        let snapshot = updated
         do {
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            var record = records[id] ?? Record(language: language, updated: .distantPast)
-            if let title = result.title { record.title = title }
-            if let synopsis = result.synopsis { record.synopsis = synopsis }
-            if let source = result.metadataSourceURL { record.source = source }
-            var updated = records
-            updated[id] = record
-            try JSONEncoder().encode(updated).write(to: root.appendingPathComponent("index.json"), options: .atomic)
-            records = updated
+            try await Task.detached(priority: .utility) {
+                try FileManager.default.createDirectory(at: rootDir, withIntermediateDirectories: true)
+                try JSONEncoder().encode(snapshot).write(to: rootDir.appendingPathComponent("index.json"), options: .atomic)
+            }.value
         } catch {
             messages[id] = "保存游戏信息失败：" + error.localizedDescription
         }
@@ -100,34 +134,51 @@ final class PhoneGameMetadata: ObservableObject {
             messages[id] = "暂未查到游戏信息，请检查网络或稍后重试。已有信息会保留。"
             return
         }
+        let rootDir = root
+        let existingRecord = records[id]
         do {
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            var record = records[id] ?? Record(language: language, updated: .now)
+            let (newCover, newBackdrop) = try await Task.detached(priority: .utility) { () throws -> (String?, String?) in
+                try FileManager.default.createDirectory(at: rootDir, withIntermediateDirectories: true)
+                let stem = SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined() + "-" + UUID().uuidString
+                var coverFile: String?
+                var backdropFile: String?
+                if let image = result.artworkData, CGImageSourceCreateWithData(image as CFData, nil) != nil {
+                    let file = stem + "-cover.image"
+                    try image.write(to: rootDir.appendingPathComponent(file), options: .atomic)
+                    coverFile = file
+                }
+                if let image = result.backdropData, CGImageSourceCreateWithData(image as CFData, nil) != nil {
+                    let file = stem + "-backdrop.image"
+                    try image.write(to: rootDir.appendingPathComponent(file), options: .atomic)
+                    backdropFile = file
+                }
+                return (coverFile, backdropFile)
+            }.value
+
+            var record = existingRecord ?? Record(language: language, updated: .now)
             if let title = result.title { record.title = title }
             if let synopsis = result.synopsis { record.synopsis = synopsis }
             if let source = result.metadataSourceURL { record.source = source }
-            let stem = SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined() + "-" + UUID().uuidString
-            if let image = result.artworkData, UIImage(data: image) != nil {
-                let file = stem + "-cover.image"
-                try image.write(to: root.appendingPathComponent(file), options: .atomic)
-                record.cover = file
-            }
-            if let image = result.backdropData, UIImage(data: image) != nil {
-                let file = stem + "-backdrop.image"
-                try image.write(to: root.appendingPathComponent(file), options: .atomic)
-                record.backdrop = file
-            }
+            if let newCover { record.cover = newCover }
+            if let newBackdrop { record.backdrop = newBackdrop }
             record.language = language
             record.updated = .now
+            let old = records[id]
             var updated = records
             updated[id] = record
-            try JSONEncoder().encode(updated).write(to: root.appendingPathComponent("index.json"), options: .atomic)
-            let old = records[id]
             records = updated
-            for file in [old?.cover, old?.backdrop].compactMap({ $0 }) where file != record.cover && file != record.backdrop {
-                imageCache.removeObject(forKey: file as NSString)
-                try? FileManager.default.removeItem(at: root.appendingPathComponent(file))
+            let snapshot = updated
+            let staleFiles = [old?.cover, old?.backdrop].compactMap { $0 }.filter { $0 != record.cover && $0 != record.backdrop }
+            for file in staleFiles {
+                imageCache.removeObject(forKey: ("cv:" + file) as NSString)
+                imageCache.removeObject(forKey: ("bg:" + file) as NSString)
             }
+            try await Task.detached(priority: .utility) {
+                try JSONEncoder().encode(snapshot).write(to: rootDir.appendingPathComponent("index.json"), options: .atomic)
+                for file in staleFiles {
+                    try? FileManager.default.removeItem(at: rootDir.appendingPathComponent(file))
+                }
+            }.value
             messages[id] = "游戏信息已更新"
         } catch {
             messages[id] = "保存游戏信息失败：" + error.localizedDescription

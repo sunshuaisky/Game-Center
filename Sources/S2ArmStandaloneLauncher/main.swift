@@ -25,6 +25,7 @@ private final class Launcher: NSObject, NSApplicationDelegate {
     private var detailLabel: NSTextField?
     private var progressBar: NSProgressIndicator?
     private var runner: Process?
+    private var showingFailure = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
@@ -38,7 +39,7 @@ private final class Launcher: NSObject, NSApplicationDelegate {
                 .appendingPathComponent("cheat", isDirectory: true)
                 .appendingPathComponent(manifest.gameID.uppercased(), isDirectory: true)
                 .appendingPathComponent("cheats", isDirectory: true)
-            let support = supportDirectory(for: manifest.gameID, switchDirectory: switchDirectory)
+            let support = supportDirectory(for: manifest.gameID)
             try migrateLegacySupportDirectory(for: manifest.gameID, switchDirectory: switchDirectory, destination: support)
             let library = support.appendingPathComponent("Library", isDirectory: true)
             let privateRoot = support.appendingPathComponent("Private", isDirectory: true)
@@ -58,8 +59,13 @@ private final class Launcher: NSObject, NSApplicationDelegate {
                 showProgress(title: installedVersion == nil ? "正在准备独立游戏" : "正在更新游戏文件", detail: "正在准备日志、缓存和存档目录；游戏镜像直接从应用内读取。")
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     do {
+                        var lastUpdate = DispatchTime.now().uptimeNanoseconds
                         try StandaloneInstaller.install(from: libraryPayload, to: library, manifest: manifest, version: currentVersion) { copied, total, path in
-                            DispatchQueue.main.async { [weak self] in self?.updateProgress(copied: copied, total: total, path: path) }
+                            let now = DispatchTime.now().uptimeNanoseconds
+                            if copied >= total || now &- lastUpdate >= 50_000_000 {
+                                lastUpdate = now
+                                DispatchQueue.main.async { [weak self] in self?.updateProgress(copied: copied, total: total, path: path) }
+                            }
                         }
                         DispatchQueue.main.async { [weak self] in self?.launchGame(manifest: manifest, resources: resources, engine: engine, library: library, privateRoot: privateRoot, cheatsDirectory: cheatsDirectory, retryBusErrorOnce: true) }
                     } catch {
@@ -155,10 +161,11 @@ private final class Launcher: NSObject, NSApplicationDelegate {
                 }
                 try? log.synchronize()
                 try? log.close()
+                let logText = process.terminationStatus != 0 ? (try? String(contentsOf: logURL, encoding: .utf8)) : nil
                 let shouldRetryBusError = retryBusErrorOnce
                     && process.terminationStatus != 0
                     && saveError == nil
-                    && ((try? String(contentsOf: logURL, encoding: .utf8))?.contains(#""exitCode": 138"#) == true)
+                    && (logText?.contains(#""exitCode": 138"#) == true)
                 Task { @MainActor in
                     self?.runner = nil
                     if let saveError {
@@ -174,7 +181,7 @@ private final class Launcher: NSObject, NSApplicationDelegate {
                     } else if process.terminationStatus == 0 {
                         NSApp.terminate(nil)
                     } else {
-                        self?.showFailure(Self.failureMessage(from: logURL, processStatus: process.terminationStatus))
+                        self?.showFailure(Self.failureMessage(from: logURL, logText: logText, processStatus: process.terminationStatus))
                     }
                 }
             }
@@ -187,7 +194,7 @@ private final class Launcher: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { showingFailure }
 
     private func disableUnstableFrameRate(library: URL, folderName: String) throws {
         let launchURL = library.appendingPathComponent("games", isDirectory: true)
@@ -207,8 +214,8 @@ private final class Launcher: NSObject, NSApplicationDelegate {
             .write(to: launchURL, options: .atomic)
     }
 
-    private static func failureMessage(from logURL: URL, processStatus: Int32) -> String {
-        if let text = try? String(contentsOf: logURL, encoding: .utf8) {
+    private static func failureMessage(from logURL: URL, logText: String?, processStatus: Int32) -> String {
+        if let text = logText ?? (try? String(contentsOf: logURL, encoding: .utf8)) {
             for line in text.split(whereSeparator: \.isNewline).reversed() {
                 guard let data = String(line).data(using: .utf8),
                       let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -258,10 +265,8 @@ private final class Launcher: NSObject, NSApplicationDelegate {
     }
 
     private func updateProgress(copied: Int64, total: Int64, path: String) {
-        DispatchQueue.main.async {
-            self.progressBar?.doubleValue = Double(copied) / Double(total)
-            self.detailLabel?.stringValue = "已准备 \(ByteCountFormatter.string(fromByteCount: copied, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: total, countStyle: .file)) · \(path)"
-        }
+        progressBar?.doubleValue = Double(copied) / Double(total)
+        detailLabel?.stringValue = "已准备 \(ByteCountFormatter.string(fromByteCount: copied, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: total, countStyle: .file)) · \(path)"
     }
 
     private func hideProgress() {
@@ -270,7 +275,9 @@ private final class Launcher: NSObject, NSApplicationDelegate {
     }
 
     private func showFailure(_ message: String) {
+        showingFailure = true
         if window == nil { showProgress(title: "无法启动游戏", detail: message) }
+        window?.styleMask.insert(.closable)
         titleLabel?.stringValue = "无法启动游戏"
         detailLabel?.stringValue = message
         progressBar?.isHidden = true
@@ -283,7 +290,7 @@ private final class Launcher: NSObject, NSApplicationDelegate {
         return url
     }
 
-    private func supportDirectory(for gameID: String, switchDirectory: URL) -> URL {
+    private func supportDirectory(for gameID: String) -> URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Game Center/SwitchEngines/S2ArmData", isDirectory: true)
             .appendingPathComponent("runtime", isDirectory: true)
@@ -438,8 +445,10 @@ private enum StandaloneInstaller {
         guard let enumerator = fm.enumerator(at: source, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey], options: [], errorHandler: { _, _ in false }) else {
             throw LauncherError.invalidBundle("无法读取应用内游戏文件。")
         }
+        let prefix = source.path.hasSuffix("/") ? source.path : source.path + "/"
         for case let item as URL in enumerator {
-            let relative = item.path.replacingOccurrences(of: source.path + "/", with: "")
+            guard item.path.hasPrefix(prefix) else { continue }
+            let relative = String(item.path.dropFirst(prefix.count))
             if excluding.contains(relative) { enumerator.skipDescendants(); continue }
             let values = try item.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey])
             let target = destination.appendingPathComponent(relative)

@@ -1,4 +1,3 @@
-import CoreGraphics
 import Foundation
 
 /// All libretro calls share one serial queue because the ABI uses global callbacks.
@@ -6,6 +5,7 @@ final class RetroCoreWorker: @unchecked Sendable {
     static let queue = DispatchQueue(label: "GameCenter.RetroCore", qos: .userInitiated)
     private var core: OpaquePointer?
     private var sequence: UInt64 = 0
+    private var audioScratch = [Int16](repeating: 0, count: 32768)
 
     struct Output: Sendable {
         let pixels: Data?
@@ -34,9 +34,8 @@ final class RetroCoreWorker: @unchecked Sendable {
         gc_retro_set_pointer(core, pointer.0, pointer.1, pointer.2)
         for _ in 0..<count { gc_retro_run(core, buttons) }
         if save { gc_retro_save(core) }
-        var samples = [Int16](repeating: 0, count: 32768)
-        let frames = samples.withUnsafeMutableBufferPointer { gc_retro_audio(core, $0.baseAddress, $0.count / 2) }
-        samples.removeLast(samples.count - frames * 2)
+        let frames = audioScratch.withUnsafeMutableBufferPointer { gc_retro_audio(core, $0.baseAddress, $0.count / 2) }
+        let samples = frames > 0 ? Array(audioScratch.prefix(frames * 2)) : []
         var width: Int32 = 0, height: Int32 = 0
         var serial: UInt64 = 0
         let frame = gc_retro_frame(core, &width, &height, &serial)

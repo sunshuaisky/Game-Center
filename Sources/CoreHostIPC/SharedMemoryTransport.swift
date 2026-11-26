@@ -23,7 +23,6 @@ public final class AnonymousSharedMemory: @unchecked Sendable {
     public let fileDescriptor: Int32
     public let size: Int
     public let basePointer: UnsafeMutableRawPointer
-    private let ownsDescriptor: Bool
     private var closed = false
 
     public init(size: Int) throws {
@@ -51,7 +50,6 @@ public final class AnonymousSharedMemory: @unchecked Sendable {
         self.fileDescriptor = fd
         self.size = size
         self.basePointer = mapped
-        self.ownsDescriptor = true
     }
 
     public init(inheritedFileDescriptor fd: Int32, size: Int) throws {
@@ -62,7 +60,6 @@ public final class AnonymousSharedMemory: @unchecked Sendable {
         self.fileDescriptor = fd
         self.size = size
         self.basePointer = mapped
-        self.ownsDescriptor = true
     }
 
     deinit {
@@ -73,7 +70,7 @@ public final class AnonymousSharedMemory: @unchecked Sendable {
         guard !closed else { return }
         closed = true
         munmap(basePointer, size)
-        if ownsDescriptor && fileDescriptor >= 0 {
+        if fileDescriptor >= 0 {
             Darwin.close(fileDescriptor)
         }
     }
@@ -81,6 +78,7 @@ public final class AnonymousSharedMemory: @unchecked Sendable {
 
 public final class SharedInputRegion: @unchecked Sendable {
     public let memory: AnonymousSharedMemory
+    private var lastSnapshot = GCSharedInputState()
     public var pointer: UnsafeMutablePointer<GCSharedInputState> {
         memory.basePointer.assumingMemoryBound(to: GCSharedInputState.self)
     }
@@ -97,6 +95,35 @@ public final class SharedInputRegion: @unchecked Sendable {
     }
 
     public func write(
+        buttonsPointer: UnsafePointer<UInt16>,
+        axesPointer: UnsafePointer<Int16>,
+        pointerX: Int16,
+        pointerY: Int16,
+        pointerPressed: Bool,
+        mouseButtons: UInt8,
+        mouseDXDelta: Int32 = 0,
+        mouseDYDelta: Int32 = 0,
+        mouseWheelDelta: Int32 = 0,
+        fastForward: UInt8 = 1,
+        paused: Bool = false
+    ) {
+        gc_shm_input_write(
+            pointer,
+            buttonsPointer,
+            axesPointer,
+            pointerX,
+            pointerY,
+            pointerPressed ? 1 : 0,
+            mouseButtons,
+            mouseDXDelta,
+            mouseDYDelta,
+            mouseWheelDelta,
+            fastForward,
+            paused ? 1 : 0
+        )
+    }
+
+    public func write(
         buttons: [UInt16],
         axes: [Int16],
         pointerX: Int16,
@@ -109,36 +136,41 @@ public final class SharedInputRegion: @unchecked Sendable {
         fastForward: UInt8 = 1,
         paused: Bool = false
     ) {
-        var paddedButtons = [UInt16](repeating: 0, count: Int(GC_MAX_PLAYERS))
-        for i in 0..<min(buttons.count, paddedButtons.count) { paddedButtons[i] = buttons[i] }
-        var paddedAxes = [Int16](repeating: 0, count: Int(GC_MAX_PLAYERS) * 4)
-        for i in 0..<min(axes.count, paddedAxes.count) { paddedAxes[i] = axes[i] }
-        paddedButtons.withUnsafeBufferPointer { bPtr in
-            paddedAxes.withUnsafeBufferPointer { aPtr in
-                gc_shm_input_write(
-                    pointer,
-                    bPtr.baseAddress,
-                    aPtr.baseAddress,
-                    pointerX,
-                    pointerY,
-                    pointerPressed ? 1 : 0,
-                    mouseButtons,
-                    mouseDXDelta,
-                    mouseDYDelta,
-                    mouseWheelDelta,
-                    fastForward,
-                    paused ? 1 : 0
-                )
+        var paddedButtons: (UInt16, UInt16, UInt16, UInt16) = (0, 0, 0, 0)
+        var paddedAxes: (Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16, Int16) =
+            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        withUnsafeMutablePointer(to: &paddedButtons) { bRaw in
+            bRaw.withMemoryRebound(to: UInt16.self, capacity: Int(GC_MAX_PLAYERS)) { bPtr in
+                for i in 0..<min(buttons.count, Int(GC_MAX_PLAYERS)) { bPtr[i] = buttons[i] }
+                withUnsafeMutablePointer(to: &paddedAxes) { aRaw in
+                    aRaw.withMemoryRebound(to: Int16.self, capacity: Int(GC_MAX_PLAYERS) * 4) { aPtr in
+                        for i in 0..<min(axes.count, Int(GC_MAX_PLAYERS) * 4) { aPtr[i] = axes[i] }
+                        write(
+                            buttonsPointer: bPtr,
+                            axesPointer: aPtr,
+                            pointerX: pointerX,
+                            pointerY: pointerY,
+                            pointerPressed: pointerPressed,
+                            mouseButtons: mouseButtons,
+                            mouseDXDelta: mouseDXDelta,
+                            mouseDYDelta: mouseDYDelta,
+                            mouseWheelDelta: mouseWheelDelta,
+                            fastForward: fastForward,
+                            paused: paused
+                        )
+                    }
+                }
             }
         }
     }
 
     public func read() -> (snapshot: GCSharedInputState, mouseDX: Int32, mouseDY: Int32, mouseWheelY: Int32) {
-        var snap = GCSharedInputState()
+        var snap = lastSnapshot
         var dx: Int32 = 0
         var dy: Int32 = 0
         var wy: Int32 = 0
         gc_shm_input_read(pointer, &snap, &dx, &dy, &wy)
+        lastSnapshot = snap
         return (snap, dx, dy, wy)
     }
 }

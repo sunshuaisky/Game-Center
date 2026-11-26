@@ -3,6 +3,7 @@
 #include "GCVulkanHost.h"
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +31,6 @@
 #define RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE 43
 #define RETRO_ENVIRONMENT_SET_HW_SHARED_CONTEXT 44
 #define RETRO_ENVIRONMENT_GET_VFS_INTERFACE 45
-#define RETRO_ENVIRONMENT_GET_LED_INTERFACE 46
 #define RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER 56
 #define RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION 59
 #define RETRO_ENVIRONMENT_GET_INPUT_BITMASKS (51 | RETRO_ENVIRONMENT_EXPERIMENTAL)
@@ -228,6 +228,10 @@ struct GCRetroHost {
     GCOptionEntry *options;
     size_t option_count;
     size_t option_capacity;
+
+    /* Batch buffer for cores emitting single audio samples via retro_audio_sample_t. */
+    int16_t audio_sample_buf[512 * 2];
+    size_t audio_sample_frames;
 
     void (*retro_init)(void);
     void (*retro_deinit)(void);
@@ -632,6 +636,36 @@ static float effective_aspect(const GCRetroHost *h, unsigned width, unsigned hei
     return height > 0 ? ((float)width / (float)height) : (4.0f / 3.0f);
 }
 
+static uint32_t g_rgb565_lut[65536];
+static uint32_t g_xrgb1555_lut[65536];
+static pthread_once_t g_lut_once = PTHREAD_ONCE_INIT;
+
+static void init_pixel_luts(void) {
+    for (uint32_t p = 0; p < 65536u; ++p) {
+        uint32_t r5 = (p >> 11) & 31u;
+        uint32_t g6 = (p >> 5) & 63u;
+        uint32_t b5 = p & 31u;
+        uint32_t r8 = (r5 << 3) | (r5 >> 2);
+        uint32_t g8 = (g6 << 2) | (g6 >> 4);
+        uint32_t b8 = (b5 << 3) | (b5 >> 2);
+        g_rgb565_lut[p] = 0xFF000000u | (r8 << 16) | (g8 << 8) | b8;
+
+        uint32_t r15 = (p >> 10) & 31u;
+        uint32_t g15 = (p >> 5) & 31u;
+        uint32_t r15_8 = (r15 << 3) | (r15 >> 2);
+        uint32_t g15_8 = (g15 << 3) | (g15 >> 2);
+        g_xrgb1555_lut[p] = 0xFF000000u | (r15_8 << 16) | (g15_8 << 8) | b8;
+    }
+}
+
+static void flush_single_audio_samples(GCRetroHost *h) {
+    if (!h || h->audio_sample_frames == 0) return;
+    if (h->callbacks.audio_batch) {
+        h->callbacks.audio_batch(h->callbacks.context, h->audio_sample_buf, h->audio_sample_frames);
+    }
+    h->audio_sample_frames = 0;
+}
+
 static void video_callback(const void *data, unsigned width, unsigned height, size_t pitch) {
     GCRetroHost *h = g_active;
     if (!h || !data) return;
@@ -673,43 +707,31 @@ static void video_callback(const void *data, unsigned width, unsigned height, si
 
     uint32_t dst_pixels_per_row = out_stride / 4u;
     if (h->pixel_format == RETRO_PIXEL_FORMAT_XRGB8888) {
-        for (unsigned y = 0; y < height; ++y) {
-            const uint32_t *src_row = (const uint32_t *)((const uint8_t *)data + (size_t)y * pitch);
-            uint32_t *dst_row = dst + (size_t)y * dst_pixels_per_row;
-            for (unsigned x = 0; x < width; ++x) {
-                /* XRGB8888 in little-endian memory is [B, G, R, X] -> BGRA8 with A=0xFF. */
-                dst_row[x] = src_row[x] | 0xFF000000u;
+        size_t row_bytes = (size_t)width * 4u;
+        if (pitch == out_stride && pitch == row_bytes) {
+            memcpy(dst, data, row_bytes * (size_t)height);
+        } else {
+            for (unsigned y = 0; y < height; ++y) {
+                memcpy(dst + (size_t)y * dst_pixels_per_row, (const uint8_t *)data + (size_t)y * pitch, row_bytes);
             }
         }
     } else if (h->pixel_format == RETRO_PIXEL_FORMAT_RGB565) {
+        pthread_once(&g_lut_once, init_pixel_luts);
         for (unsigned y = 0; y < height; ++y) {
             const uint16_t *src_row = (const uint16_t *)((const uint8_t *)data + (size_t)y * pitch);
             uint32_t *dst_row = dst + (size_t)y * dst_pixels_per_row;
             for (unsigned x = 0; x < width; ++x) {
-                uint32_t p = src_row[x];
-                uint32_t r = ((p >> 11) & 31u);
-                uint32_t g = ((p >> 5) & 63u);
-                uint32_t b = (p & 31u);
-                r = (r << 3) | (r >> 2);
-                g = (g << 2) | (g >> 4);
-                b = (b << 3) | (b >> 2);
-                dst_row[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                dst_row[x] = g_rgb565_lut[src_row[x]];
             }
         }
     } else {
         /* 0RGB1555 */
+        pthread_once(&g_lut_once, init_pixel_luts);
         for (unsigned y = 0; y < height; ++y) {
             const uint16_t *src_row = (const uint16_t *)((const uint8_t *)data + (size_t)y * pitch);
             uint32_t *dst_row = dst + (size_t)y * dst_pixels_per_row;
             for (unsigned x = 0; x < width; ++x) {
-                uint32_t p = src_row[x];
-                uint32_t r = ((p >> 10) & 31u);
-                uint32_t g = ((p >> 5) & 31u);
-                uint32_t b = (p & 31u);
-                r = (r << 3) | (r >> 2);
-                g = (g << 3) | (g >> 2);
-                b = (b << 3) | (b >> 2);
-                dst_row[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                dst_row[x] = g_xrgb1555_lut[src_row[x]];
             }
         }
     }
@@ -727,6 +749,9 @@ static void video_callback(const void *data, unsigned width, unsigned height, si
 static size_t audio_batch_callback(const int16_t *data, size_t frames) {
     GCRetroHost *h = g_active;
     if (!h || !data || frames == 0) return frames;
+    if (h->audio_sample_frames > 0) {
+        flush_single_audio_samples(h);
+    }
     if (h->callbacks.audio_batch) {
         h->callbacks.audio_batch(h->callbacks.context, data, frames);
     }
@@ -734,8 +759,15 @@ static size_t audio_batch_callback(const int16_t *data, size_t frames) {
 }
 
 static void audio_sample_callback(int16_t left, int16_t right) {
-    int16_t pair[2] = {left, right};
-    audio_batch_callback(pair, 1);
+    GCRetroHost *h = g_active;
+    if (!h) return;
+    size_t idx = h->audio_sample_frames * 2u;
+    h->audio_sample_buf[idx] = left;
+    h->audio_sample_buf[idx + 1u] = right;
+    h->audio_sample_frames += 1u;
+    if (h->audio_sample_frames >= 512u) {
+        flush_single_audio_samples(h);
+    }
 }
 
 static void input_poll_callback(void) {
@@ -953,11 +985,7 @@ GCRetroHost *gc_host_open(
 
     h->loaded = ((bool (*)(const struct retro_game_info *))fn[12])(&game_info);
     if (!h->loaded) {
-        if (h->hardware_requested) {
-            set_error("该核心请求硬件渲染上下文，尚未在当前阶段启用");
-        } else {
-            set_error("核心无法加载该游戏，请检查 ROM 格式或 BIOS 文件");
-        }
+        set_error("核心无法加载该游戏，请检查 ROM 格式或 BIOS 文件");
         goto fail;
     }
 
@@ -1098,10 +1126,14 @@ void gc_host_run_frame(
     h->mouse_dy = mouse_dy;
     h->mouse_wheel_y = mouse_wheel_y;
     h->retro_run();
+    if (h->audio_sample_frames > 0) {
+        flush_single_audio_samples(h);
+    }
 }
 
 void gc_host_reset(GCRetroHost *h) {
     if (!h || !h->loaded || !h->retro_reset) return;
+    h->audio_sample_frames = 0;
     h->retro_reset();
 }
 
@@ -1124,6 +1156,10 @@ uint32_t gc_host_base_width(const GCRetroHost *h) {
 
 uint32_t gc_host_base_height(const GCRetroHost *h) {
     return h ? h->av_info.geometry.base_height : 0;
+}
+
+bool gc_host_is_vulkan(const GCRetroHost *h) {
+    return h && h->vk_host != NULL;
 }
 
 bool gc_host_save_battery(GCRetroHost *h, bool force) {

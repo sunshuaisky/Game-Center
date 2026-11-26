@@ -21,6 +21,14 @@ cores=(
 
 mkdir -p -- "$output_directory"
 
+cleanup_dirs=()
+cleanup() {
+  for dir in "${cleanup_dirs[@]}"; do
+    [[ -n "$dir" ]] && rm -rf -- "$dir"
+  done
+}
+trap cleanup EXIT INT TERM
+
 missing=()
 for core in $cores; do
   if [[ ! -f "$output_directory/$core" ]]; then
@@ -40,7 +48,7 @@ if (( ${#missing} > 0 )); then
     done
   else
     temporary_directory=$(mktemp -d "${TMPDIR:-/tmp}/game-center-mac-cores.XXXXXX")
-    trap 'rm -rf -- "$temporary_directory"' EXIT INT TERM
+    cleanup_dirs+=("$temporary_directory")
     mkdir -p -- "$temporary_directory/cores"
 
     for core in $missing; do
@@ -90,7 +98,7 @@ fi
 # Stage Dolphin Sys directory required by dolphin_libretro.dylib.
 if [[ ! -f "$output_directory/System/Wii/dolphin-emu/Sys/codehandler.bin" ]]; then
   tmp_wii=$(mktemp -d "${TMPDIR:-/tmp}/game-center-dolphin-sys.XXXXXX")
-  trap 'rm -rf -- "$tmp_wii"' EXIT INT TERM
+  cleanup_dirs+=("$tmp_wii")
   curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
     --output "$tmp_wii/dolphin-source.tar.gz" \
     "https://codeload.github.com/libretro/dolphin/tar.gz/0863ee3"
@@ -103,7 +111,7 @@ fi
 # Stage PPSSPP assets directory required by ppsspp_libretro.dylib.
 if [[ ! -d "$output_directory/System/PSP/PPSSPP/flash0" ]]; then
   tmp_psp=$(mktemp -d "${TMPDIR:-/tmp}/game-center-ppsspp-assets.XXXXXX")
-  trap 'rm -rf -- "$tmp_psp"' EXIT INT TERM
+  cleanup_dirs+=("$tmp_psp")
   curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
     --output "$tmp_psp/ppsspp-source.tar.gz" \
     "https://codeload.github.com/hrydgard/ppsspp/tar.gz/refs/tags/v1.20.4"

@@ -105,26 +105,6 @@ struct GameLaunchService {
 
     private func launchExternalEmulator(
         game: Game,
-        libraryRoot: URL?,
-        completion: @escaping (Result<Void, Error>) -> Void
-    ) {
-        do {
-            let gameURL = try game.resolvedURL()
-            let hasAccess = gameURL.startAccessingSecurityScopedResource()
-            launchExternalEmulator(
-                game: game,
-                gameURL: gameURL,
-                hasAccess: hasAccess,
-                libraryRoot: libraryRoot,
-                completion: completion
-            )
-        } catch {
-            completion(.failure(error))
-        }
-    }
-
-    private func launchExternalEmulator(
-        game: Game,
         gameURL: URL,
         hasAccess: Bool,
         libraryRoot: URL?,

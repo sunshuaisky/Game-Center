@@ -33,6 +33,11 @@ struct SwitchCheatManagerView: View {
     private var controllerActionCount: Int { toggleItems.count + 2 }
 
     var body: some View {
+        let groups = buildGroups
+        let toggles = groups.flatMap(\.items).filter { !$0.isMaster }
+        let toggleIndexByID = Dictionary(uniqueKeysWithValues: toggles.enumerated().map { ($0.element.id, $0.offset) })
+        let actionCount = toggles.count + 2
+
         VStack(spacing: 0) {
             HStack(alignment: .center, spacing: 10) {
                 VStack(alignment: .leading, spacing: 4) {
@@ -77,10 +82,10 @@ struct SwitchCheatManagerView: View {
                             .font(.system(size: 12))
                             .foregroundStyle(.orange)
                             .fixedSize(horizontal: false, vertical: true)
-                    } else if buildGroups.isEmpty {
+                    } else if groups.isEmpty {
                         emptyState
                     } else {
-                        ForEach(buildGroups) { group in
+                        ForEach(groups) { group in
                             let buildID = group.buildID
                             let items = group.items
                             VStack(alignment: .leading, spacing: 0) {
@@ -128,7 +133,7 @@ struct SwitchCheatManagerView: View {
                                     .frame(height: 42)
                                     .background {
                                         if !item.isMaster,
-                                           toggleItems.firstIndex(where: { $0.id == item.id }).map({ controllerSelection == $0 + 1 }) == true {
+                                           toggleIndexByID[item.id].map({ controllerSelection == $0 + 1 }) == true {
                                             RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.white.opacity(0.16))
                                         }
                                     }
@@ -160,7 +165,7 @@ struct SwitchCheatManagerView: View {
                     .truncationMode(.middle)
                 Spacer()
                 Button("完成") { dismiss() }
-                    .buttonStyle(TactileActionButtonStyle(appearance: .primary, cornerRadius: 9, minHeight: 34, horizontalPadding: 16, fontSize: 12, isControllerFocused: controllerSelection == controllerActionCount - 1))
+                    .buttonStyle(TactileActionButtonStyle(appearance: .primary, cornerRadius: 9, minHeight: 34, horizontalPadding: 16, fontSize: 12, isControllerFocused: controllerSelection == actionCount - 1))
                     .keyboardShortcut(.defaultAction)
             }
             .padding(.horizontal, 20)
@@ -208,20 +213,33 @@ struct SwitchCheatManagerView: View {
     }
 
     private func refresh() {
-        do {
-            catalog = try SwitchCheatService.load(titleID: titleID, directory: directory)
-            errorMessage = nil
-        } catch {
-            errorMessage = "读取金手指目录失败：\(error.localizedDescription)"
+        let titleID = self.titleID
+        let directory = self.directory
+        Task {
+            do {
+                let loaded = try await Task.detached(priority: .userInitiated) {
+                    try SwitchCheatService.load(titleID: titleID, directory: directory)
+                }.value
+                catalog = loaded
+                errorMessage = nil
+            } catch {
+                errorMessage = AppLanguage.format("读取金手指目录失败：%@", error.localizedDescription)
+            }
         }
     }
 
     private func update(_ item: SwitchCheatItem, enabled: Bool) {
-        guard let catalog else { return }
-        do {
-            self.catalog = try SwitchCheatService.setEnabled(enabled, item: item, catalog: catalog)
-        } catch {
-            errorMessage = "保存金手指开关失败：\(error.localizedDescription)"
+        guard let currentCatalog = catalog else { return }
+        Task {
+            do {
+                let updated = try await Task.detached(priority: .userInitiated) {
+                    try SwitchCheatService.setEnabled(enabled, item: item, catalog: currentCatalog)
+                }.value
+                catalog = updated
+                errorMessage = nil
+            } catch {
+                errorMessage = AppLanguage.format("保存金手指开关失败：%@", error.localizedDescription)
+            }
         }
     }
 

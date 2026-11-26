@@ -223,16 +223,20 @@ final class CloudSaveDirectorySync {
         guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: Array(keys), errorHandler: { _, failure in error = failure; return false }) else {
             throw Failure("无法读取存档目录：\(root.lastPathComponent)")
         }
+        let rootComponentsCount = root.pathComponents.count
+        let resolvedRootComponentsCount = root.resolvingSymlinksInPath().pathComponents.count
+        let skippedNames: Set<String> = ["MigrationBackups", "SyncBackups", ".DS_Store"]
+        let allowedSwitchFolders: Set<String> = ["save", "save_device", "user", commitName]
         for case let url as URL in enumerator {
-            if ["MigrationBackups", "SyncBackups", ".DS_Store"].contains(url.lastPathComponent) || url.lastPathComponent.hasPrefix(".gcsync-") {
+            if skippedNames.contains(url.lastPathComponent) || url.lastPathComponent.hasPrefix(".gcsync-") {
                 enumerator.skipDescendants(); continue
             }
-            let components = url.pathComponents.dropFirst(root.pathComponents.count)
+            let components = url.pathComponents.dropFirst(rootComponentsCount)
             // Only committed account/device saves and account identity belong
             // in the Switch interchange tree. Never hydrate shader caches or
             // an engine's in-progress .work/.new transaction from iCloud.
             if components.first == "switch", components.count >= 3,
-               !["save", "save_device", "user", commitName].contains(Array(components)[2]) {
+               !allowedSwitchFolders.contains(components[components.index(components.startIndex, offsetBy: 2)]) {
                 enumerator.skipDescendants(); continue
             }
             let values = try url.resourceValues(forKeys: keys)
@@ -246,7 +250,7 @@ final class CloudSaveDirectorySync {
                 continue
             }
             if url.lastPathComponent == commitName { continue }
-            let relative = url.resolvingSymlinksInPath().pathComponents.dropFirst(root.resolvingSymlinksInPath().pathComponents.count).joined(separator: "/")
+            let relative = url.resolvingSymlinksInPath().pathComponents.dropFirst(resolvedRootComponentsCount).joined(separator: "/")
             let path = cloudPath(relative, macBatteryNames: macBatteryNames)
             guard result[path] == nil else { throw Failure("同一游戏出现两份对应的电池存档：\(path)") }
             guard let date = values.contentModificationDate, let size = values.fileSize else { throw Failure("无法读取存档更新时间：\(relative)") }

@@ -1,27 +1,25 @@
 import AudioToolbox
+import CRetroHost
 import Foundation
-import os
 
-/// Low-latency stereo Int16 audio output backed by CoreAudio's DefaultOutput AudioUnit.
+/// Low-latency stereo Int16 audio output backed by CoreAudio's DefaultOutput AudioUnit
+/// and a lock-free SPSC ring buffer so the real-time HAL render thread never blocks.
 final class CoreAudioOutput: @unchecked Sendable {
     private var audioUnit: AudioComponentInstance?
-    private let capacityFrames: Int
-    private var ringBuffer: [Int16]
-    private var readIndex: Int = 0
-    private var writeIndex: Int = 0
-    private var availableFrames: Int = 0
-    private var lock = os_unfair_lock_s()
+    private let ring: OpaquePointer?
     private var volume: Float = 1.0
     private var muted: Bool = false
     private var running: Bool = false
 
-    init(capacityFrames: Int = 16384) {
-        self.capacityFrames = capacityFrames
-        self.ringBuffer = [Int16](repeating: 0, count: capacityFrames * 2)
+    init(capacityFrames: UInt32 = 16384) {
+        self.ring = gc_audio_ring_create(capacityFrames)
     }
 
     deinit {
         stop()
+        if let ring {
+            gc_audio_ring_destroy(ring)
+        }
     }
 
     func start(sampleRate: Double) {
@@ -85,6 +83,7 @@ final class CoreAudioOutput: @unchecked Sendable {
             AudioComponentInstanceDispose(unit)
             return
         }
+        AudioUnitSetParameter(unit, kHALOutputParam_Volume, kAudioUnitScope_Output, 0, muted ? 0.0 : volume, 0)
         guard AudioOutputUnitStart(unit) == noErr else {
             AudioUnitUninitialize(unit)
             AudioComponentInstanceDispose(unit)
@@ -107,48 +106,31 @@ final class CoreAudioOutput: @unchecked Sendable {
     }
 
     func clear() {
-        os_unfair_lock_lock(&lock)
-        readIndex = 0
-        writeIndex = 0
-        availableFrames = 0
-        os_unfair_lock_unlock(&lock)
+        if let ring {
+            gc_audio_ring_clear(ring)
+        }
     }
 
     func setAudio(volume: Float, muted: Bool) {
-        os_unfair_lock_lock(&lock)
         self.volume = min(max(volume, 0), 1)
         self.muted = muted
-        os_unfair_lock_unlock(&lock)
+        if let ring {
+            gc_audio_ring_set_muted(ring, muted || self.volume <= 0.0001)
+        }
+        if let unit = audioUnit {
+            AudioUnitSetParameter(unit, kHALOutputParam_Volume, kAudioUnitScope_Output, 0, muted ? 0.0 : self.volume, 0)
+        }
     }
 
-    /// Fraction of the target buffer (~64 ms) currently filled, used for gentle frame pacing adjustment.
+    /// Fraction of the target buffer (~55 ms) currently filled, used for gentle frame pacing adjustment.
     func fillRatio(targetFrames: Int) -> Double {
-        os_unfair_lock_lock(&lock)
-        let avail = availableFrames
-        os_unfair_lock_unlock(&lock)
+        let avail = ring.map { Int(gc_audio_ring_available($0)) } ?? 0
         return Double(avail) / Double(max(targetFrames, 1))
     }
 
     func enqueue(samples: UnsafePointer<Int16>, frameCount: Int) {
-        guard running, frameCount > 0 else { return }
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
-
-        let freeFrames = capacityFrames - availableFrames
-        let toWrite = min(frameCount, freeFrames)
-        guard toWrite > 0 else { return }
-
-        let firstChunk = min(toWrite, capacityFrames - writeIndex)
-        ringBuffer.withUnsafeMutableBufferPointer { dst in
-            guard let base = dst.baseAddress else { return }
-            base.advanced(by: writeIndex * 2).update(from: samples, count: firstChunk * 2)
-            let remaining = toWrite - firstChunk
-            if remaining > 0 {
-                base.update(from: samples.advanced(by: firstChunk * 2), count: remaining * 2)
-            }
-        }
-        writeIndex = (writeIndex + toWrite) % capacityFrames
-        availableFrames += toWrite
+        guard running, frameCount > 0, let ring else { return }
+        _ = gc_audio_ring_write(ring, samples, UInt32(frameCount))
     }
 
     private func render(ioData: UnsafeMutablePointer<AudioBufferList>, frameCount: Int) {
@@ -156,38 +138,9 @@ final class CoreAudioOutput: @unchecked Sendable {
         guard let first = buffers.first, let mData = first.mData else { return }
         let outPtr = mData.assumingMemoryBound(to: Int16.self)
 
-        os_unfair_lock_lock(&lock)
-        let toRead = min(frameCount, availableFrames)
-        let gain = muted ? 0.0 : volume
-        if toRead > 0 {
-            let firstChunk = min(toRead, capacityFrames - readIndex)
-            ringBuffer.withUnsafeBufferPointer { src in
-                guard let base = src.baseAddress else { return }
-                if gain == 1.0 {
-                    outPtr.update(from: base.advanced(by: readIndex * 2), count: firstChunk * 2)
-                    let rem = toRead - firstChunk
-                    if rem > 0 {
-                        outPtr.advanced(by: firstChunk * 2).update(from: base, count: rem * 2)
-                    }
-                } else if gain <= 0.0001 {
-                    memset(outPtr, 0, toRead * 4)
-                } else {
-                    for i in 0..<(firstChunk * 2) {
-                        outPtr[i] = Int16(max(-32768, min(32767, Int(Float(base[readIndex * 2 + i]) * gain))))
-                    }
-                    let rem = toRead - firstChunk
-                    for i in 0..<(rem * 2) {
-                        outPtr[firstChunk * 2 + i] = Int16(max(-32768, min(32767, Int(Float(base[i]) * gain))))
-                    }
-                }
-            }
-            readIndex = (readIndex + toRead) % capacityFrames
-            availableFrames -= toRead
-        }
-        os_unfair_lock_unlock(&lock)
-
-        if toRead < frameCount {
-            memset(outPtr.advanced(by: toRead * 2), 0, (frameCount - toRead) * 4)
+        let read = ring.map { Int(gc_audio_ring_read($0, outPtr, UInt32(frameCount))) } ?? 0
+        if read < frameCount {
+            memset(outPtr.advanced(by: read * 2), 0, (frameCount - read) * 4)
         }
     }
 

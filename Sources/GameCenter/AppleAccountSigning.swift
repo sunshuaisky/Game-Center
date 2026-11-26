@@ -89,6 +89,7 @@ private final class SigningLogin: ObservableObject {
     private var process: Process?
     private var input: FileHandle?
     private var timeout: Task<Void, Never>?
+    private var readerTask: Task<Void, Never>?
 
     func start(email: String, password: String, logout: Bool = false) {
         guard !busy else { return }
@@ -115,7 +116,8 @@ private final class SigningLogin: ObservableObject {
                 cancel()
                 message = "操作超时，请重新登录。"
             }
-            Task {
+            let readHandle = output.fileHandleForReading
+            readerTask = Task.detached(priority: .userInitiated) { [weak self] in
                 // Only recognise prompts. Raw authentication output never reaches the UI or logs.
                 var text = ""
                 var reason: String?
@@ -135,32 +137,47 @@ private final class SigningLogin: ObservableObject {
                         reason = "无法连接登录服务，请检查 Mac 的网络连接。"
                     }
                 }
-                do {
-                    for try await byte in output.fileHandleForReading.bytes {
-                        guard process === child else { break }
-                        if byte == 10 { recognizeFailure(text); text = ""; continue }
-                        text.append(Character(UnicodeScalar(byte)))
-                        text = String(text.suffix(600))
-                        if text.localizedCaseInsensitiveContains("enter the code sent") || text.localizedCaseInsensitiveContains("enter 2fa code") {
-                            needsCode = true
-                            message = "请输入 Apple 发到受信任设备或手机的六位验证码。"
+                defer { try? readHandle.close() }
+                while !Task.isCancelled {
+                    let chunk = (try? readHandle.read(upToCount: 4096)) ?? Data()
+                    if chunk.isEmpty { break }
+                    let str = String(decoding: chunk, as: UTF8.self)
+                    for ch in str {
+                        if ch == "\n" {
+                            recognizeFailure(text)
                             text = ""
+                        } else {
+                            text.append(ch)
+                            if text.count > 800 { text = String(text.suffix(600)) }
+                            if text.localizedCaseInsensitiveContains("enter the code sent") || text.localizedCaseInsensitiveContains("enter 2fa code") {
+                                text = ""
+                                await MainActor.run { [weak self] in
+                                    guard let self, self.process === child else { return }
+                                    self.needsCode = true
+                                    self.message = "请输入 Apple 发到受信任设备或手机的六位验证码。"
+                                }
+                            }
                         }
                     }
-                } catch {}
-                guard process === child else { return }
+                }
+                guard !Task.isCancelled else { return }
                 recognizeFailure(text)
                 child.waitUntilExit()
-                let ok = child.terminationStatus == 0
-                finish()
-                current = AppleAccountSigning.account
-                if ok && (logout || current?.email.caseInsensitiveCompare(email) == .orderedSame) {
-                    UserDefaults.standard.set(!logout, forKey: AppleAccountSigning.preference)
-                    message = logout ? "已退出 Apple ID。" : "已启用 Apple ID 签名。"
-                } else if ok {
-                    message = "账号验证已完成，但签名工具还没有选定可用的开发团队。"
-                } else {
-                    message = reason ?? "签名工具未完成登录（退出码 \(child.terminationStatus)）。"
+                let status = child.terminationStatus
+                let finalReason = reason
+                await MainActor.run { [weak self] in
+                    guard let self, self.process === child else { return }
+                    let ok = status == 0
+                    self.finish()
+                    self.current = AppleAccountSigning.account
+                    if ok && (logout || self.current?.email.caseInsensitiveCompare(email) == .orderedSame) {
+                        UserDefaults.standard.set(!logout, forKey: AppleAccountSigning.preference)
+                        self.message = logout ? "已退出 Apple ID。" : "已启用 Apple ID 签名。"
+                    } else if ok {
+                        self.message = "账号验证已完成，但签名工具还没有选定可用的开发团队。"
+                    } else {
+                        self.message = finalReason ?? "签名工具未完成登录（退出码 \(status)）。"
+                    }
                 }
             }
         } catch {
@@ -171,7 +188,7 @@ private final class SigningLogin: ObservableObject {
     }
 
     func verify(_ code: String) {
-        guard needsCode, code.range(of: "^[0-9]{6}$", options: .regularExpression) != nil else { return }
+        guard needsCode, code.count == 6, code.allSatisfy(\.isNumber) else { return }
         do {
             try input?.write(contentsOf: Data((code + "\n").utf8))
             needsCode = false
@@ -187,6 +204,8 @@ private final class SigningLogin: ObservableObject {
     private func finish() {
         timeout?.cancel()
         timeout = nil
+        readerTask?.cancel()
+        readerTask = nil
         try? input?.close()
         input = nil
         process = nil

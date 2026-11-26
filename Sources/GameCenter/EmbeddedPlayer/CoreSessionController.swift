@@ -3,6 +3,7 @@ import CoreGraphics
 import CoreHostIPC
 import Darwin
 import Foundation
+import ImageIO
 
 struct EmbeddedSaveSlotInfo: Identifiable, Hashable {
     let slot: Int
@@ -34,9 +35,9 @@ final class CoreSessionController: ObservableObject {
     let inputCapture: GameInputCapture
 
     @Published private(set) var status: EmbeddedSessionStatus = .starting
-    @Published private(set) var fps: Double = 60.0
     @Published private(set) var coreOptions: [CoreOptionDTO] = []
     @Published private(set) var saveSlots: [EmbeddedSaveSlotInfo] = []
+    @Published private(set) var slotThumbnails: [Int: NSImage] = [:]
     @Published var crispPixels: Bool
     @Published var isMuted: Bool = false
     @Published var volume: Float = 1.0
@@ -90,7 +91,7 @@ final class CoreSessionController: ObservableObject {
             refreshSaveSlots()
 
             let (parentChannel, childControlFD) = try ControlSocketChannel.makePair()
-            controlChannel = parentChannel
+            defer { Darwin.close(childControlFD) }
 
             let pid = try spawnHelper(
                 executableURL: helperURL,
@@ -98,7 +99,7 @@ final class CoreSessionController: ObservableObject {
                 inputFD: inputRegion.memory.fileDescriptor,
                 frameFD: frameRing.memory.fileDescriptor
             )
-            Darwin.close(childControlFD)
+            controlChannel = parentChannel
             helperPID = pid
 
             let exitSource = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
@@ -225,7 +226,7 @@ final class CoreSessionController: ObservableObject {
         pendingActions[reqID] = { [weak self] ok, message in
             guard let self else { return }
             if ok {
-                self.captureCurrentFrameThumbnail(to: info.thumbnailURL)
+                self.captureCurrentFrameThumbnail(slot: info.slot, to: info.thumbnailURL)
                 self.refreshSaveSlots()
                 self.showToast("已保存到即时存档槽位 \(slot)")
             } else {
@@ -319,7 +320,6 @@ final class CoreSessionController: ObservableObject {
             try? channel.send(HostCommand.load(loadRequest))
 
         case .loaded(let info):
-            fps = info.fps
             coreOptions = info.options
             status = .running
             inputCapture.setPaused(false)
@@ -351,38 +351,91 @@ final class CoreSessionController: ObservableObject {
     private func refreshSaveSlots() {
         guard let dir = saveContext?.statesDir else { return }
         let fm = FileManager.default
-        saveSlots = (1...5).map { slot in
+        let slots = (1...5).map { slot in
             let stateURL = dir.appendingPathComponent("slot-\(slot).state")
             let thumbURL = dir.appendingPathComponent("slot-\(slot).png")
             let attrs = try? fm.attributesOfItem(atPath: stateURL.path)
             let modified = attrs?[.modificationDate] as? Date
             return EmbeddedSaveSlotInfo(slot: slot, stateURL: stateURL, thumbnailURL: thumbURL, modifiedAt: modified)
         }
+        saveSlots = slots
+        let existingURLs = slots.filter(\.exists).map { ($0.slot, $0.thumbnailURL) }
+        Task { [weak self] in
+            let loaded = await Task.detached(priority: .utility) { () -> [Int: CGImage] in
+                var images: [Int: CGImage] = [:]
+                for (slot, url) in existingURLs {
+                    if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                       let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) {
+                        images[slot] = cgImage
+                    }
+                }
+                return images
+            }.value
+            self?.slotThumbnails = loaded.mapValues {
+                NSImage(cgImage: $0, size: NSSize(width: $0.width, height: $0.height))
+            }
+        }
     }
 
-    private func captureCurrentFrameThumbnail(to url: URL) {
+    private func captureCurrentFrameThumbnail(slot: Int, to url: URL) {
         guard let latest = frameRing.latestFrame(after: 0),
               let ptr = frameRing.pixelBufferPointer(slotIndex: latest.slotIndex) else { return }
-        let byteCount = latest.bytesPerRow * latest.height
-        let data = Data(bytes: ptr, count: byteCount)
-        guard let provider = CGDataProvider(data: data as CFData) else { return }
-        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
-        guard let cgImage = CGImage(
-            width: latest.width,
-            height: latest.height,
-            bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            bytesPerRow: latest.bytesPerRow,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: bitmapInfo,
-            provider: provider,
-            decode: nil,
-            shouldInterpolate: true,
-            intent: .defaultIntent
-        ) else { return }
-        let rep = NSBitmapImageRep(cgImage: cgImage)
-        if let png = rep.representation(using: .png, properties: [:]) {
-            try? png.write(to: url, options: .atomic)
+        let width = latest.width
+        let height = latest.height
+        let bytesPerRow = latest.bytesPerRow
+        let data = Data(bytes: ptr, count: bytesPerRow * height)
+        Task { [weak self] in
+            let outputImage = await Task.detached(priority: .utility) { () -> CGImage? in
+                guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+                let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+                guard let cgImage = CGImage(
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 32,
+                    bytesPerRow: bytesPerRow,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: bitmapInfo,
+                    provider: provider,
+                    decode: nil,
+                    shouldInterpolate: true,
+                    intent: .defaultIntent
+                ) else { return nil }
+                let finalImage: CGImage
+                if width > 320 {
+                    let scale = 320.0 / Double(width)
+                    let dstW = 320
+                    let dstH = max(1, Int((Double(height) * scale).rounded()))
+                    if let ctx = CGContext(
+                        data: nil,
+                        width: dstW,
+                        height: dstH,
+                        bitsPerComponent: 8,
+                        bytesPerRow: dstW * 4,
+                        space: CGColorSpaceCreateDeviceRGB(),
+                        bitmapInfo: bitmapInfo.rawValue
+                    ) {
+                        ctx.interpolationQuality = .medium
+                        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: dstW, height: dstH))
+                        finalImage = ctx.makeImage() ?? cgImage
+                    } else {
+                        finalImage = cgImage
+                    }
+                } else {
+                    finalImage = cgImage
+                }
+                let rep = NSBitmapImageRep(cgImage: finalImage)
+                if let png = rep.representation(using: .png, properties: [:]) {
+                    try? png.write(to: url, options: .atomic)
+                }
+                return finalImage
+            }.value
+            if let outputImage {
+                self?.slotThumbnails[slot] = NSImage(
+                    cgImage: outputImage,
+                    size: NSSize(width: outputImage.width, height: outputImage.height)
+                )
+            }
         }
     }
 

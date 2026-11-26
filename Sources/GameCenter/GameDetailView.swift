@@ -15,6 +15,7 @@ struct GameDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var controllerSelection = 2
     @State private var isFavoriteHovered = false
+    @State private var existingFileURL: URL?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var modalWidth: CGFloat { min(560, max(440, availableSize.width - 32)) }
@@ -62,6 +63,13 @@ struct GameDetailView: View {
             OutsideClickDismissMonitor { dismiss() }
                 .allowsHitTesting(false)
         }
+        .task(id: game.id) {
+            if let url = try? game.resolvedURL(), FileManager.default.fileExists(atPath: url.path) {
+                existingFileURL = url
+            } else {
+                existingFileURL = nil
+            }
+        }
         .onReceive(controllerNavigation.$event.compactMap { $0 }) { event in
             switch event.action {
             case .moveHorizontal(let direction), .moveVertical(let direction):
@@ -103,9 +111,9 @@ struct GameDetailView: View {
                     }
                 }
 
-                Text(AppLanguage.localized(game.lastPlayedAt.map {
+                Text(game.lastPlayedAt.map {
                     AppLanguage.format("上次游玩 %@", $0.formatted(date: .abbreviated, time: .shortened))
-                } ?? "尚未游玩"))
+                } ?? AppLanguage.localized("尚未游玩"))
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
 
@@ -138,7 +146,7 @@ struct GameDetailView: View {
                     .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: isFavoriteHovered)
                     .help(AppLanguage.localized(game.isFavorite ? "取消收藏" : "加入收藏"))
 
-                    if let fileURL = try? game.resolvedURL(), FileManager.default.fileExists(atPath: fileURL.path) {
+                    if let fileURL = existingFileURL {
                         Button("在访达中显示", systemImage: "folder") {
                             NSWorkspace.shared.activateFileViewerSelecting([fileURL])
                         }

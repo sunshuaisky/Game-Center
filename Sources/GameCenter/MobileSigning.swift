@@ -24,6 +24,10 @@ enum MobileSigning {
             $0.count == 40 && $0.allSatisfy(\.isHexDigit)
         })
         let certificates = String(decoding: try command("/usr/bin/security", ["find-certificate", "-a", "-p"]), as: UTF8.self)
+        let expiryFormatter = DateFormatter()
+        expiryFormatter.locale = Locale(identifier: "en_US_POSIX")
+        expiryFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        expiryFormatter.dateFormat = "MMM d HH:mm:ss yyyy zzz"
         var candidates: [Identity] = []
         for part in certificates.components(separatedBy: "-----END CERTIFICATE-----") {
             guard let start = part.range(of: "-----BEGIN CERTIFICATE-----") else { continue }
@@ -40,11 +44,7 @@ enum MobileSigning {
             guard subject.contains("CN=Apple Development:") || subject.contains("CN=iPhone Developer:") else { continue }
             guard let team = subject.components(separatedBy: ",").map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }).first(where: { $0.hasPrefix("OU=") }).map({ String($0.dropFirst(3)) }), !team.isEmpty else { continue }
             let expiry = subject.components(separatedBy: "notAfter=").last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.timeZone = TimeZone(secondsFromGMT: 0)
-            formatter.dateFormat = "MMM d HH:mm:ss yyyy zzz"
-            candidates.append(.init(fingerprint: fingerprint, team: team, expires: formatter.date(from: expiry) ?? .distantPast))
+            candidates.append(.init(fingerprint: fingerprint, team: team, expires: expiryFormatter.date(from: expiry) ?? .distantPast))
         }
         let authorized = try candidates.filter { identity in
             let matching = targets.filter { $0.team == identity.team }

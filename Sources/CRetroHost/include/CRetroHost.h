@@ -87,6 +87,7 @@ double gc_host_sample_rate(const GCRetroHost *host);
 float gc_host_aspect_ratio(const GCRetroHost *host);
 uint32_t gc_host_base_width(const GCRetroHost *host);
 uint32_t gc_host_base_height(const GCRetroHost *host);
+bool gc_host_is_vulkan(const GCRetroHost *host);
 
 bool gc_host_save_battery(GCRetroHost *host, bool force);
 bool gc_host_save_state(GCRetroHost *host, const char *path);

@@ -1,6 +1,8 @@
 #include "GCOpenGLHost.h"
 
+#ifndef GL_SILENCE_DEPRECATION
 #define GL_SILENCE_DEPRECATION
+#endif
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl3.h>
 #include <dlfcn.h>
@@ -167,32 +169,39 @@ bool gc_gl_readback_frame(
     if (!gl || !gl->context || !dst_bgra || width == 0 || height == 0) return false;
     CGLSetCurrentContext(gl->context);
     if (width > gl->fbo_width || height > gl->fbo_height) {
-        ensure_fbo(gl, width, height);
-    }
-
-    size_t needed = (size_t)width * (size_t)height;
-    if (needed > gl->readback_scratch_cap) {
-        uint32_t *grown = realloc(gl->readback_scratch, needed * sizeof(uint32_t));
-        if (!grown) return false;
-        gl->readback_scratch = grown;
-        gl->readback_scratch_cap = needed;
+        if (!ensure_fbo(gl, width, height)) return false;
     }
 
     GLint prev_fbo = 0;
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_fbo);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, gl->fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+
+    if (!gl->bottom_left_origin && dst_stride_bytes == width * 4u) {
+        glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, dst_bgra);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_fbo);
+        return true;
+    }
+
+    size_t needed = (size_t)width * (size_t)height;
+    if (needed > gl->readback_scratch_cap) {
+        uint32_t *grown = realloc(gl->readback_scratch, needed * sizeof(uint32_t));
+        if (!grown) {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_fbo);
+            return false;
+        }
+        gl->readback_scratch = grown;
+        gl->readback_scratch_cap = needed;
+    }
+
     glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, gl->readback_scratch);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_fbo);
 
+    size_t row_bytes = (size_t)width * 4u;
     uint32_t dst_stride_px = dst_stride_bytes / 4u;
     for (uint32_t y = 0; y < height; ++y) {
         uint32_t src_y = gl->bottom_left_origin ? (height - 1u - y) : y;
-        const uint32_t *srow = gl->readback_scratch + (size_t)src_y * width;
-        uint32_t *drow = dst_bgra + (size_t)y * dst_stride_px;
-        for (uint32_t x = 0; x < width; ++x) {
-            drow[x] = srow[x] | 0xFF000000u;
-        }
+        memcpy(dst_bgra + (size_t)y * dst_stride_px, gl->readback_scratch + (size_t)src_y * width, row_bytes);
     }
     return true;
 }

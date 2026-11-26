@@ -28,12 +28,15 @@ private struct PointingHandCursor: NSViewRepresentable {
     }
 
     func updateNSView(_ view: CursorView, context: Context) {
-        view.isEnabled = isEnabled
-        view.window?.invalidateCursorRects(for: view)
+        if view.isEnabled != isEnabled {
+            view.isEnabled = isEnabled
+            view.window?.invalidateCursorRects(for: view)
+        }
     }
 
     final class CursorView: NSView {
         var isEnabled = true
+        private var lastBoundsSize: NSSize = .zero
 
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
@@ -46,7 +49,10 @@ private struct PointingHandCursor: NSViewRepresentable {
 
         override func layout() {
             super.layout()
-            window?.invalidateCursorRects(for: self)
+            if bounds.size != lastBoundsSize {
+                lastBoundsSize = bounds.size
+                window?.invalidateCursorRects(for: self)
+            }
         }
     }
 }

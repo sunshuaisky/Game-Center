@@ -14,7 +14,6 @@ CACHE = ROOT / "build/mac-platforms"
 STAGE = ROOT / "build/emulators"
 ARM = platform.machine() == "arm64"
 RELEASE = "https://github.com/{}/releases/download/{}/{}"
-vita_arch = "arm64" if ARM else "intel"
 # The arm64 and x64 binaries repositories release on their own schedules and
 # use different asset naming since 0.0.42.
 if ARM:
@@ -44,17 +43,27 @@ systems = [
      "3a920c8f1df46795abaa89de857af6a8c1b9567ba24c516b3afdca11e53f3d89", "jhaizhou-ops/S2Arm", "v0.6.10"),
 ]
 
-systems = [entry for entry in systems if entry[0] in {"Vita3K", "RPCS3", "Cemu", "S2Arm"}]
+def sha256_file(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 def download(url, path, digest=None):
-    if path.is_file() and (not digest or hashlib.sha256(path.read_bytes()).hexdigest() == digest):
+    if path.is_file() and (not digest or sha256_file(path) == digest):
         return
-    with tempfile.NamedTemporaryFile(dir=path.parent) as tmp:
-        subprocess.run(["curl", "-fsSL", "--retry", "3", "--retry-all-errors", "--connect-timeout", "12", url, "-o", tmp.name], check=True)
-        if digest and hashlib.sha256(Path(tmp.name).read_bytes()).hexdigest() != digest:
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent)
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        subprocess.run(["curl", "-fsSL", "--retry", "3", "--retry-all-errors", "--connect-timeout", "12", url, "-o", str(tmp_path)], check=True)
+        if digest and sha256_file(tmp_path) != digest:
             raise ValueError(f"Checksum mismatch for {url}")
-        shutil.copyfile(tmp.name, tmp.name + ".ready")
-        os.replace(tmp.name + ".ready", path)
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 def stage(entry):
     name, cache, url, sha, repo, revision = entry

@@ -252,6 +252,10 @@ struct SwitchBuildView: View {
     @State private var deviceChoices: S2ArmDeviceChoices?
     @State private var deviceChoicesError: String?
     @State private var isLoadingDevices = false
+    @State private var cachedEngineInfo: [SwitchBuildMethod: SwitchEngineInstallInfo] = [:]
+    @State private var cachedSourceIsSwitch2 = false
+    @State private var cachedSourceIsDirectory = false
+    @State private var cachedDefaultSwitchDir: URL?
 
     private var selectedDevice: S2ArmDeviceTarget? {
         deviceChoices?.models.first { $0.id == s2ArmDeviceID }
@@ -264,19 +268,13 @@ struct SwitchBuildView: View {
         }
     }
 
-    private var isSwitch2: Bool {
-        guard let sourceURL else { return false }
-        return sourceURL.pathExtension.lowercased() == "nup" || GamePlatform.isSwitch2DumpFolder(sourceURL)
-    }
+    private var isSwitch2: Bool { cachedSourceIsSwitch2 }
 
-    private var sourceIsDirectory: Bool {
-        guard let sourceURL else { return false }
-        return (try? sourceURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-    }
+    private var sourceIsDirectory: Bool { cachedSourceIsDirectory }
 
     private var supportsSeparateExtras: Bool {
         guard let sourceURL else { return true }
-        return !sourceIsDirectory && sourceURL.pathExtension.lowercased() != "nup"
+        return !cachedSourceIsDirectory && sourceURL.pathExtension.lowercased() != "nup"
     }
 
     private var selectedFolderPath: String {
@@ -285,7 +283,7 @@ struct SwitchBuildView: View {
 
     private var sourceDescription: String {
         guard let sourceURL else { return sourceRecoveryMessage ?? "选择 NSP、XCI、NSZ、XCZ、NUP 或文件夹" }
-        if (try? sourceURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+        if cachedSourceIsDirectory {
             return "自动扫描文件夹中的游戏文件"
         }
         return sourceURL.lastPathComponent
@@ -407,8 +405,20 @@ struct SwitchBuildView: View {
                 targets = Set(session.targets)
                 showingProgress = true
             }
+            refreshEngineInfoCache()
+            updateCachedSourceAttributes()
             refreshDependencies()
             resolveGameTitle(for: sourceURL)
+        }
+        .onChange(of: sourceURL) { _, _ in
+            updateCachedSourceAttributes()
+        }
+        .onChange(of: gameFolderURL) { _, _ in
+            updateCachedSourceAttributes()
+        }
+        .onDisappear {
+            titleLookupTask?.cancel()
+            titleLookupTask = nil
         }
         .onReceive(controllerNavigation.$event.compactMap { $0 }) { event in
             switch event.action {
@@ -571,7 +581,7 @@ struct SwitchBuildView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 14) {
                 ForEach(SwitchBuildMethod.allCases) { option in
-                    let optionInfo = SwitchEngineInstaller.installInfo(for: option)
+                    let optionInfo = cachedEngineInfo[option]
                     Button {
                         method = option
                         UserDefaults.standard.set(option.rawValue, forKey: Self.preferredBuildMethodKey)
@@ -750,17 +760,60 @@ struct SwitchBuildView: View {
         }
     }
 
+    private func refreshEngineInfoCache() {
+        Task.detached(priority: .utility) {
+            var info: [SwitchBuildMethod: SwitchEngineInstallInfo] = [:]
+            for option in SwitchBuildMethod.allCases {
+                if let installed = SwitchEngineInstaller.installInfo(for: option) {
+                    info[option] = installed
+                }
+            }
+            let snapshot = info
+            await MainActor.run {
+                cachedEngineInfo = snapshot
+            }
+        }
+    }
+
+    private func updateCachedSourceAttributes() {
+        let currentSource = sourceURL
+        let currentFolder = gameFolderURL
+        let libraryPath = gameLibraryPath
+        if let currentSource {
+            let isDir = (try? currentSource.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            cachedSourceIsDirectory = isDir
+            cachedSourceIsSwitch2 = currentSource.pathExtension.lowercased() == "nup"
+                || (isDir && GamePlatform.isSwitch2DumpFolder(currentSource))
+        } else {
+            cachedSourceIsDirectory = false
+            cachedSourceIsSwitch2 = false
+        }
+        cachedDefaultSwitchDir = computeDefaultSwitchDirectory(gameFolderURL: currentFolder, sourceURL: currentSource, gameLibraryPath: libraryPath)
+    }
+
     private func refreshDependencies() {
         let selectedMethod = method
         let refreshID = UUID()
         dependencyRefreshID = refreshID
         isCheckingDependencies = true
+        refreshEngineInfoCache()
         Task {
             let selectedTargets = SwitchBuildTarget.allCases.filter { targets.contains($0) }
+            let checksByTarget = await withTaskGroup(of: (SwitchBuildTarget, [SwitchBuildDependency]).self) { group in
+                for selectedTarget in selectedTargets {
+                    group.addTask {
+                        (selectedTarget, await SwitchBuildService.detectBuildDependencies(for: selectedMethod, target: selectedTarget))
+                    }
+                }
+                var collected: [SwitchBuildTarget: [SwitchBuildDependency]] = [:]
+                for await (target, deps) in group {
+                    collected[target] = deps
+                }
+                return collected
+            }
             var result: [SwitchBuildDependency] = []
             for selectedTarget in selectedTargets {
-                let checks = await SwitchBuildService.detectBuildDependencies(for: selectedMethod, target: selectedTarget)
-                for dependency in checks {
+                for dependency in checksByTarget[selectedTarget] ?? [] {
                     if let existing = result.firstIndex(where: { $0.id == dependency.id }) {
                         if !dependency.isReady { result[existing] = dependency }
                     } else {
@@ -865,9 +918,14 @@ struct SwitchBuildView: View {
                     Spacer()
                     VStack(alignment: .trailing, spacing: 2) {
                         Text("总用时").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-                        TimelineView(.periodic(from: session.startedAt, by: 1)) { context in
-                            Text(elapsed(session.startedAt, until: session.finishedAt ?? context.date))
+                        if let finishedAt = session.finishedAt {
+                            Text(elapsed(session.startedAt, until: finishedAt))
                                 .font(.system(size: 18, weight: .semibold, design: .monospaced)).monospacedDigit()
+                        } else {
+                            TimelineView(.periodic(from: session.startedAt, by: 1)) { context in
+                                Text(elapsed(session.startedAt, until: context.date))
+                                    .font(.system(size: 18, weight: .semibold, design: .monospaced)).monospacedDigit()
+                            }
                         }
                     }
                 }
@@ -1206,6 +1264,10 @@ struct SwitchBuildView: View {
     }
 
     private var defaultSwitchDirectory: URL {
+        cachedDefaultSwitchDir ?? computeDefaultSwitchDirectory(gameFolderURL: gameFolderURL, sourceURL: sourceURL, gameLibraryPath: gameLibraryPath)
+    }
+
+    private func computeDefaultSwitchDirectory(gameFolderURL: URL?, sourceURL: URL?, gameLibraryPath: String?) -> URL {
         if let gameFolderURL, let match = switchFolder(containing: gameFolderURL) { return match }
         if let sourceURL, let match = switchFolder(containing: sourceURL) { return match }
         if let gameLibraryPath {
@@ -1214,7 +1276,7 @@ struct SwitchBuildView: View {
             return root.appendingPathComponent("switch", isDirectory: true)
         }
         if let gameFolderURL { return gameFolderURL }
-        if let sourceURL { return sourceIsDirectory ? sourceURL : sourceURL.deletingLastPathComponent() }
+        if let sourceURL { return cachedSourceIsDirectory ? sourceURL : sourceURL.deletingLastPathComponent() }
         return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Documents/Game/switch", isDirectory: true)
     }
@@ -1249,31 +1311,49 @@ struct SwitchBuildView: View {
            FileManager.default.fileExists(atPath: resolved.path) {
             sourceURL = resolved
             gameFolderURL = inputFolder(for: resolved)
-        } else if let recovered = recoverGameSource() {
-            sourceURL = recovered
-            gameFolderURL = inputFolder(for: recovered)
-            sourceRecoveryMessage = nil
-        } else if let gameLibraryPath {
+            return
+        }
+        if let gameLibraryPath {
             let root = URL(fileURLWithPath: gameLibraryPath, isDirectory: true)
             gameFolderURL = existingPlatformFolder(named: "switch", under: root)
                 ?? root.appendingPathComponent("switch", isDirectory: true)
-            sourceRecoveryMessage = "请选择游戏本体文件或原始游戏文件夹，以构建其他平台版本。"
+        }
+        let targetGame = game
+        let libraryPath = gameLibraryPath
+        let initial = initialSourceURL
+        Task.detached(priority: .userInitiated) {
+            let recovered = Self.recoverGameSourceOffMain(game: targetGame, gameLibraryPath: libraryPath, initialSourceURL: initial)
+            await MainActor.run {
+                guard sourceURL == nil else { return }
+                if let recovered {
+                    sourceURL = recovered
+                    gameFolderURL = inputFolder(for: recovered)
+                    sourceRecoveryMessage = nil
+                    resolveGameTitle(for: recovered)
+                } else if libraryPath != nil {
+                    sourceRecoveryMessage = "请选择游戏本体文件或原始游戏文件夹，以构建其他平台版本。"
+                }
+            }
         }
     }
 
-    private func recoverGameSource() -> URL? {
+    nonisolated private static func recoverGameSourceOffMain(game: Game, gameLibraryPath: String?, initialSourceURL: URL?) -> URL? {
         guard let gameLibraryPath else { return nil }
         let fileManager = FileManager.default
         let libraryRoot = URL(fileURLWithPath: gameLibraryPath, isDirectory: true)
+        let existingSwitch = (try? fileManager.contentsOfDirectory(at: libraryRoot, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]))?
+            .first { $0.lastPathComponent.lowercased() == "switch" && (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
         let switchRoot = libraryRoot.lastPathComponent.lowercased() == "switch"
             ? libraryRoot
-            : (existingPlatformFolder(named: "switch", under: libraryRoot)
-                ?? libraryRoot.appendingPathComponent("switch", isDirectory: true))
+            : (existingSwitch ?? libraryRoot.appendingPathComponent("switch", isDirectory: true))
         let packageExtensions: Set<String> = ["nsp", "xci", "nsz", "xcz", "nup"]
         let buildRoot = switchRoot.appendingPathComponent("build", isDirectory: true)
+        let invalid = CharacterSet(charactersIn: "/:\0")
+        let safeName = game.title.components(separatedBy: invalid).filter { !$0.isEmpty }.joined(separator: "-")
+        let folderName = safeName.isEmpty ? "Switch Game" : safeName
         let inputDirectories = [
-            buildRoot.appendingPathComponent("nxnative", isDirectory: true).appendingPathComponent(safeBuildName(game.title), isDirectory: true),
-            buildRoot.appendingPathComponent("S2Arm/inputs", isDirectory: true).appendingPathComponent(safeBuildName(game.title), isDirectory: true)
+            buildRoot.appendingPathComponent("nxnative", isDirectory: true).appendingPathComponent(folderName, isDirectory: true),
+            buildRoot.appendingPathComponent("S2Arm/inputs", isDirectory: true).appendingPathComponent(folderName, isDirectory: true)
         ]
         for inputDirectory in inputDirectories {
             if let staged = try? fileManager.contentsOfDirectory(at: inputDirectory, includingPropertiesForKeys: nil),
@@ -1308,12 +1388,6 @@ struct SwitchBuildView: View {
             if matches(candidate) { return candidate }
         }
         return nil
-    }
-
-    private func safeBuildName(_ value: String) -> String {
-        let invalid = CharacterSet(charactersIn: "/:\0")
-        let name = value.components(separatedBy: invalid).filter { !$0.isEmpty }.joined(separator: "-")
-        return name.isEmpty ? "Switch Game" : name
     }
 
     private func restoreSavedKeys() {

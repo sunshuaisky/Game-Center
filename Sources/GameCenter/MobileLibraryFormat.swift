@@ -70,6 +70,8 @@ enum MobileLibraryFormat {
         return !["gp", "ac"].contains(sfoString("CATEGORY", at: sfo) ?? "")
     }
 
+    private static let cueFileRegex = try! NSRegularExpression(pattern: #"(?im)^\s*FILE\s+(?:"([^"]+)"|(\S+))\s+\S+"#)
+
     /// Disc descriptors and playlists own their referenced files in the library.
     static func playableEntries(_ urls: [URL]) -> [URL] {
         let paths = Set(urls.map { $0.standardizedFileURL.path })
@@ -85,10 +87,8 @@ enum MobileLibraryFormat {
                   let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
             let names: [String]
             if ext == "cue" {
-                let pattern = #"(?im)^\s*FILE\s+(?:"([^"]+)"|(\S+))\s+\S+"#
-                let regex = try! NSRegularExpression(pattern: pattern)
                 let ns = text as NSString
-                names = regex.matches(in: text, range: NSRange(location: 0, length: ns.length)).compactMap { match in
+                names = cueFileRegex.matches(in: text, range: NSRange(location: 0, length: ns.length)).compactMap { match in
                     let range = match.range(at: match.range(at: 1).location == NSNotFound ? 2 : 1)
                     return ns.substring(with: range)
                 }

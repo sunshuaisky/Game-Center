@@ -36,10 +36,6 @@ enum IOSCoreCatalog {
         .init(platform: .ps1, displayName: "PCSX-ReARMed", moduleName: "pcsx_rearmed_libretro_ios.dylib", requiresJIT: false, sourceURL: URL(string: "https://github.com/libretro/pcsx_rearmed")!)
     ].filter { supportedPlatforms.contains($0.platform) }
 
-    static func descriptor(for platform: GamePlatform) -> IOSCoreDescriptor? {
-        descriptors.first { $0.platform == platform }
-    }
-
     static let mobilePlatforms: [MobileLibraryFormat.Platform] = descriptors.map { core in
         let folder: String
         let extensions: [String]
@@ -71,21 +67,5 @@ enum IOSCoreCatalog {
                         .wiiu: "Cemu 原生 Metal 渲染（附带 MoltenVK）。无 JIT 时自动使用解释执行。"
                      ][core.platform],
                      runtime: [.wiiu: "cemu"][core.platform])
-    }
-
-    static func summary(for platform: GamePlatform) -> String? {
-        guard let descriptor = descriptor(for: platform) else {
-            switch platform {
-            case .ps3, .psv:
-                return "仅支持 macOS 端（iOS 端已移除需 JIT 的核心）"
-            default: return nil
-            }
-        }
-        if [.threeDS, .psp, .ps1].contains(platform) {
-            return "iOS 核心：\(descriptor.displayName) · 软件渲染 / 解释执行，速度取决于设备和游戏"
-        }
-        return descriptor.requiresJIT
-            ? "iOS 核心：\(descriptor.displayName) · 建议侧载并启用 JIT"
-            : "iOS 核心：\(descriptor.displayName)"
     }
 }
