@@ -21,6 +21,8 @@ HOST_NAME = _cache_module.HOST_NAME
 prune_host_caches = _cache_module.prune_host_caches
 
 RELEASES = {
+    '39d35671a57ee30d5f528c13d206fd6309a84b8f': (
+        's2arm-session-exit-39d3567.patch', 'd94c7faa9375918d8223ca51a34dc0ea926cdd7b4c2c2c75e4dc5650ce7caf64'),
     'ebd3ef57de0f1ee5c69c2227956172a391119101': (
         's2arm-session-exit-ebd3ef5.patch', '6eb1f695c87438e1ce6d9e65dabf3eeb767667f0ce4f8fd3ba1e8e1f0456fe0f'),
     'b1d568d0e85afdec91f8cbc08bd33909a0c0e465': (

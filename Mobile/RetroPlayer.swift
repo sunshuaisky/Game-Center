@@ -365,6 +365,13 @@ private final class RetroSession: NSObject, ObservableObject {
             self?.setPointer(x: x, y: y, pressed: pressed)
         }
         do {
+            if ["ps2", "wii", "threeDS", "psp"].contains(rom.platform.id) {
+                let vaStatus = gc_s2arm_release_va_window()
+                if vaStatus != 0 && rom.platform.id == "ps2" {
+                    error = "当前进程已运行过 Switch 游戏并占用虚拟地址空间，请重启 Game Center 后再启动 PS2 游戏。"
+                    return
+                }
+            }
             let name = String(rom.platform.module.dropLast(".dylib".count))
             let path = Bundle.main.bundleURL.appendingPathComponent("Frameworks/\(name).framework/\(name)")
             guard FileManager.default.fileExists(atPath: path.path) else {
@@ -403,8 +410,8 @@ private final class RetroSession: NSObject, ObservableObject {
             startAudio(sampleRate: rate)
         } catch {
             let instructions: [String: String] = [
-                "ps1": "应用已内置标准 PS1 BIOS（scph5500/5501/5502）；如仍无法启动，请检查光盘镜像（.cue/.bin/.chd）是否完整。",
-                "ps2": "应用已内置 PS2 BIOS 并启用软件渲染/解释器；如仍无法启动，请确认 ISO/CHD 文件完整。"
+                "ps1": "应用已内置标准 PS1 BIOS（scph5500/5501/5502）；如仍无法启动，请检查光盘镜像（.cue/.bin/.chd/.pbp）是否完整。",
+                "ps2": "应用已内置 PS2 BIOS 并启用 Metal 渲染/解释器；如仍无法启动，请确认 ISO/CHD 文件完整。"
             ]
             self.error = instructions[rom.platform.id].map { error.localizedDescription + "\n" + $0 } ?? error.localizedDescription
         }

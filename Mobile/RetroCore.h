@@ -6,6 +6,7 @@ typedef struct GCRetro GCRetro;
 
 GCRetro *gc_retro_open(const char *core, const char *rom, const char *system, const char *save);
 const char *gc_retro_error(void);
+const char *gc_retro_last_log_error(void);
 double gc_retro_fps(GCRetro *core);
 double gc_retro_sample_rate(GCRetro *core);
 void gc_retro_set_analog(GCRetro *core, int16_t lx, int16_t ly, int16_t rx, int16_t ry);

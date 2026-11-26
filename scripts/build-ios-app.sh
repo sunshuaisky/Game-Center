@@ -92,6 +92,8 @@ xcrun --sdk "$sdk" swiftc -target "$target" -sdk "$sdk_path" -O -parse-as-librar
 printf 'GC_MOBILE_STAGE\t4\t正在准备 iOS 模拟器核心，首次生成需要下载\n'
 if [[ "$sdk" == iphoneos ]]; then
   core_dir="${GAME_CENTER_IOS_CORE_DIR:-${XDG_CACHE_HOME:-$HOME/Library/Caches}/GameCenter/iOS-Cores}"
+  bundled_core_dir="$root/build/ios-cores"
+  [[ -d "$bundled_core_dir" ]] || bundled_core_dir="$root/iOSCores"
   /usr/bin/python3 - "$request/platforms.json" <<'PYMODULES' > "$work/modules"
 import json, sys
 for name in sorted({item["module"] for item in json.load(open(sys.argv[1])) if not item.get("runtime")}):
@@ -101,7 +103,7 @@ for name in sorted({item["module"] for item in json.load(open(sys.argv[1])) if n
 PYMODULES
   missing_core=0
   while IFS= read -r module; do
-    if [[ ! -s "$core_dir/$module" ]]; then missing_core=1; fi
+    if [[ ! -s "$bundled_core_dir/$module" && ! -s "$core_dir/$module" ]]; then missing_core=1; fi
     if [[ "$module" == dolphin_libretro.dylib && ! -f "$core_dir/System/Wii/dolphin-emu/Sys/codehandler.bin" ]]; then missing_core=1; fi
     if [[ "$module" == ppsspp_libretro.dylib && ! -d "$core_dir/System/PSP/PPSSPP/flash0" ]]; then missing_core=1; fi
   done < "$work/modules"
@@ -110,7 +112,11 @@ PYMODULES
   fi
   while IFS= read -r module; do
     printf 'GC_MOBILE_DETAIL\t正在嵌入 %s\n' "$module"
-    source="$core_dir/$module"
+    if [[ -s "$bundled_core_dir/$module" ]]; then
+      source="$bundled_core_dir/$module"
+    else
+      source="$core_dir/$module"
+    fi
     platform="$(xcrun vtool -arch arm64 -show-build "$source")"
     if ! grep -Eq 'platform[[:space:]]+IOS$|LC_VERSION_MIN_IPHONEOS' <<< "$platform"; then
       echo "核心不是 iOS 真机二进制：$module" >&2
