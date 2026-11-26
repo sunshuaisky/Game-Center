@@ -198,6 +198,10 @@ static void showGameCenter(id scene, SEL selector) {
 
 int gc_s2arm_available(void) { return originalShowLibrary && playGame && launchContext; }
 int gc_s2arm_active(void) { return gc_s2arm_available() && launchContext() != NULL && (!sessionState || sessionState() != 4); }
+int gc_s2arm_release_va_window(void) {
+    int (*releaseWindow)(void) = dlsym(RTLD_DEFAULT, "s2a_window_release_unused");
+    return releaseWindow ? releaseWindow() : 0;
+}
 const char *gc_s2arm_start_game(const char *title_id) {
     if (!gc_s2arm_available()) return "当前 IPA 未包含 S2Arm 真机宿主，请重新生成并安装 Game Center IPA。";
     if (sessionState && sessionState() == 4) {

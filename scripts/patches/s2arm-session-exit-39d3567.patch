@@ -554,9 +554,48 @@
  }
  static uint64_t need_from_npdm(void) {
      const char *e = getenv("S2A_WIN_NEED_MB");
-@@ -1985,6 +1990,10 @@
+@@ -1757,8 +1762,9 @@
+     { void (*gc)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "s2a_gc_limit_reapply"); if (gc) gc(); }   // 低区变了：GC 上限按现在的重选
+     return 1;
+ }
++static int g_ca_done;
+ static void cmd_arena_reserve(void) {   // 占窗口那一步在围栏前调；窗口没占到提前返回的路径由 vawin_boot 补调（只占一次）
+-    static int done; if (done++) return;
++    if (g_ca_done++) return;
+ #if !TARGET_OS_OSX
+     // 开关读数放在最前（11-22 0.6.8 候选冒烟 ③f）：下面「窗口外 / 宿主段底部」两条放法都提前返回，原先这行只在通用路径打，快照真开着的局反而没有读数
+     LOG("即时存档：开关 %s（依据 %s）", s2a_snap_mode() ? "开" : "关", s2a_snap_source());
+@@ -1985,6 +1991,38 @@
  #endif
  }
++// Release unused constructor VA reservations before launching non-Switch iOS cores (Wii U / PS2).
++int s2a_window_release_unused(void) {
++    if (s2a_launch_ctx_get()) return -1;
++    if (g_ok && (g_size != g_res || g_gextra || !window_all_none(g_base, g_res))) return -2;
++    if (g_ca_base && (g_ca_used || g_va_used)) return -3;
++    snap_guard_drop();
++    if (g_ok) {
++        munmap((void *)g_base, g_res);
++        g_ok = 0; g_base = g_size = g_res = 0;
++    }
++    g_need = 0; g_placeholder = 0; g_keep_lo = 0;
++    if (g_gfd >= 0) {
++        close(g_gfd); g_gfd = -1;
++        free(g_gchunk); g_gchunk = NULL;
++        free(g_gtouch); g_gtouch = NULL;
++        g_gchunk_n = 0; g_gwhole = 0;
++    }
++    if (g_ca_base) {
++        munmap((void *)g_ca_base, CMD_ARENA + g_va_cap);
++        g_ca_base = 0; g_ca_cut = 0; g_va_cap = 64ull << 30;
++    }
++    g_ca_done = 0;
++#if !TARGET_OS_OSX
++    g_snap_below = 0; g_snap_out = 0;
++#endif
++    LOG("地址窗口：已释放未使用的预留虚拟地址空间，供外部核心使用");
++    return 0;
++}
  void s2a_window_trim(uint64_t size) {
 +    // The constructor sized this one window for every imported title. Giving
 +    // its tail away after A would make B's larger layout impossible to rebuild.

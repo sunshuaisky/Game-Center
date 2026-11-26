@@ -34,6 +34,7 @@ private final class WiiUCore: @unchecked Sendable {
     typealias SetInt = @convention(c) (Int32) -> Void
     typealias SetBool = @convention(c) (Bool) -> Void
     typealias CountKeys = @convention(c) () -> Int32
+    typealias StatusText = @convention(c) () -> UnsafePointer<CChar>?
 
     private static var instance: WiiUCore?
     private let handle: UnsafeMutableRawPointer
@@ -54,10 +55,12 @@ private final class WiiUCore: @unchecked Sendable {
     let setGraphicsAPI: SetInt?
     let setRecompiler: SetBool?
     let refreshInputDevices: Action?
+    let statusText: StatusText?
     let queue = DispatchQueue(label: "GameCenter.WiiU", qos: .userInitiated)
     // Keep the render view alive across SwiftUI transitions and until the GPU stops.
     let view = NativeMetalView()
     private var root: URL?
+    private var surfaceRetained = false
 
     static func shared() throws -> WiiUCore {
         if let instance { return instance }
@@ -105,6 +108,7 @@ private final class WiiUCore: @unchecked Sendable {
             setGraphicsAPI = optionalSymbol("cemu_bridge_set_graphics_api", as: SetInt.self)
             setRecompiler = optionalSymbol("cemu_bridge_set_recompiler_enabled", as: SetBool.self)
             refreshInputDevices = optionalSymbol("cemu_bridge_refresh_input_devices", as: Action.self)
+            statusText = optionalSymbol("cemu_bridge_status_text", as: StatusText.self)
         } catch {
             dlclose(library)
             throw error
@@ -128,6 +132,23 @@ private final class WiiUCore: @unchecked Sendable {
             initialize(cPath)
         }
         _ = reloadKeys?()
+    }
+
+    func registerSurface(width: Int32, height: Int32, scale: Double) {
+        let pointer: UnsafeMutableRawPointer
+        if surfaceRetained {
+            pointer = Unmanaged.passUnretained(view).toOpaque()
+        } else {
+            surfaceRetained = true
+            pointer = Unmanaged.passRetained(view).toOpaque()
+        }
+        surface(pointer, width, height, scale)
+    }
+
+    func latestStatus() -> String? {
+        guard let raw = statusText?() else { return nil }
+        let text = String(cString: raw).trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 
     struct Failure: LocalizedError {
@@ -253,6 +274,11 @@ private final class WiiUSession: NSObject, ObservableObject {
         error = nil
         starting = true
         do {
+            // Release S2Arm's unused 60+ GiB constructor VA window before Cemu's MMU
+            // reserves 4 GiB via vm_allocate (otherwise Cemu MMU.cpp exits immediately).
+            if gc_s2arm_release_va_window() != 0 {
+                throw WiiUCore.Failure("当前进程已运行过 Switch 游戏并占用虚拟地址空间，请彻底关闭并重新打开 Game Center 后再启动 Wii U 游戏。")
+            }
             let core = try self.core ?? WiiUCore.shared()
             self.core = core
             library.seedSystemFiles(for: rom.platform)
@@ -287,7 +313,7 @@ private final class WiiUSession: NSObject, ObservableObject {
                     return
                 }
                 self.launched = true
-                core.surface(Unmanaged.passUnretained(surface).toOpaque(), width, height, scale)
+                core.registerSurface(width: width, height: height, scale: scale)
                 core.queue.async {
                     var failure: String?
                     do {
@@ -297,13 +323,14 @@ private final class WiiUSession: NSObject, ObservableObject {
                         core.setRecompiler?(true)
                         let status = bootPath.withCString(core.boot)
                         if status != 0 {
+                            let detail = core.latestStatus().map { "\n" + $0 } ?? ""
                             switch status {
                             case 3, 4, 9:
                                 failure = "缺少此加密 Wii U 游戏的密钥。请点击右上角「导入 keys.txt」或将 keys.txt 放入 BIOS/wiiu 后重试。"
                             case 6:
                                 failure = "选中的是更新或 DLC，请先导入并启动基础游戏。"
                             default:
-                                failure = "Wii U 核心无法载入此游戏，错误码 " + String(status)
+                                failure = "Wii U 核心无法载入此游戏，错误码 " + String(status) + detail
                             }
                         }
                     } catch {
@@ -423,13 +450,91 @@ struct WiiUPlayer: View {
                             .buttonStyle(.plain)
                     }
                     .padding(24)
-                } else if wide {
-                    ZStack {
-                        wiiUSurfaceView
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .ignoresSafeArea(edges: showVirtualPad ? [] : .all)
+                } else {
+                    // Keep WiiUSurface at one stable SwiftUI identity across portrait/landscape
+                    // rotations so UIKit never detaches the CAMetalLayer while Cemu renders.
+                    VStack(spacing: 0) {
+                        if !wide {
+                            HStack {
+                                Spacer()
+                                PlayerFloatingPill(title: rom.title, hasController: hasController) {
+                                    openPauseMenu()
+                                }
+                                Spacer()
+                            }
+                            .padding(.top, 6)
+                            .padding(.bottom, 8)
+                        }
 
-                        if showVirtualPad {
+                        wiiUSurfaceView
+                            .frame(maxWidth: .infinity, maxHeight: wide ? .infinity : nil)
+                            .padding(.horizontal, wide ? 0 : 10)
+                            .padding(.bottom, wide ? 0 : 10)
+                            .ignoresSafeArea(edges: (wide && !showVirtualPad) ? .all : [])
+
+                        if !wide {
+                            if showVirtualPad {
+                                VStack(spacing: 12) {
+                                    HStack {
+                                        HStack(spacing: 6) { padButton("L", 5); padButton("ZL", 7) }
+                                        Spacer()
+                                        HStack(spacing: 6) { padButton("ZR", 8); padButton("R", 6) }
+                                    }
+                                    HStack {
+                                        TouchDPad { state in
+                                            session.setTouchButton(11, pressed: state.up)
+                                            session.setTouchButton(12, pressed: state.down)
+                                            session.setTouchButton(13, pressed: state.left)
+                                            session.setTouchButton(14, pressed: state.right)
+                                        }
+                                        .frame(width: 124, height: 124)
+                                        Spacer()
+                                        TouchDiamondPad(labels: .init(top: "X", left: "Y", right: "A", bottom: "B")) { state in
+                                            session.setTouchButton(3, pressed: state.top)
+                                            session.setTouchButton(4, pressed: state.left)
+                                            session.setTouchButton(1, pressed: state.right)
+                                            session.setTouchButton(2, pressed: state.bottom)
+                                        }
+                                        .frame(width: 124, height: 124)
+                                    }
+                                    HStack {
+                                        TouchAnalogStick(invertY: true) { x, y in
+                                            session.setTouchStick(0, x: x, y: y)
+                                        }
+                                        .frame(width: 74, height: 74)
+                                        Spacer()
+                                        HStack(spacing: 12) { padButton("−", 10); padButton("+", 9) }
+                                        Spacer()
+                                        TouchAnalogStick(invertY: true) { x, y in
+                                            session.setTouchStick(1, x: x, y: y)
+                                        }
+                                        .frame(width: 74, height: 74)
+                                    }
+                                }
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 14)
+                                .background(Color.white.opacity(0.03))
+                                .overlay(alignment: .top) {
+                                    Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+                                }
+                                .opacity(padOpacity)
+                                .transition(.opacity)
+                            } else {
+                                VStack(spacing: 6) {
+                                    Image(systemName: "gamecontroller.fill")
+                                        .font(.system(size: 20))
+                                        .foregroundStyle(.white.opacity(0.45))
+                                    Text(hasController ? "已连接实体手柄 · 虚拟按键已自动隐藏" : "虚拟按键已隐藏")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(.white.opacity(0.6))
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 36)
+                            }
+                        }
+                    }
+                    .overlay {
+                        if wide && showVirtualPad {
                             HStack {
                                 leftWiiUControls
                                 Spacer()
@@ -442,84 +547,11 @@ struct WiiUPlayer: View {
                         }
                     }
                     .overlay(alignment: .top) {
-                        PlayerFloatingPill(title: rom.title, hasController: hasController) {
-                            openPauseMenu()
-                        }
-                        .padding(.top, 10)
-                    }
-                } else {
-                    VStack(spacing: 0) {
-                        HStack {
-                            Spacer()
+                        if wide {
                             PlayerFloatingPill(title: rom.title, hasController: hasController) {
                                 openPauseMenu()
                             }
-                            Spacer()
-                        }
-                        .padding(.top, 6)
-                        .padding(.bottom, 8)
-
-                        wiiUSurfaceView
-                            .padding(.horizontal, 10)
-                            .padding(.bottom, 10)
-
-                        if showVirtualPad {
-                            VStack(spacing: 12) {
-                                HStack {
-                                    HStack(spacing: 6) { padButton("L", 5); padButton("ZL", 7) }
-                                    Spacer()
-                                    HStack(spacing: 6) { padButton("ZR", 8); padButton("R", 6) }
-                                }
-                                HStack {
-                                    TouchDPad { state in
-                                        session.setTouchButton(11, pressed: state.up)
-                                        session.setTouchButton(12, pressed: state.down)
-                                        session.setTouchButton(13, pressed: state.left)
-                                        session.setTouchButton(14, pressed: state.right)
-                                    }
-                                    .frame(width: 124, height: 124)
-                                    Spacer()
-                                    TouchDiamondPad(labels: .init(top: "X", left: "Y", right: "A", bottom: "B")) { state in
-                                        session.setTouchButton(3, pressed: state.top)
-                                        session.setTouchButton(4, pressed: state.left)
-                                        session.setTouchButton(1, pressed: state.right)
-                                        session.setTouchButton(2, pressed: state.bottom)
-                                    }
-                                    .frame(width: 124, height: 124)
-                                }
-                                HStack {
-                                    TouchAnalogStick(invertY: true) { x, y in
-                                        session.setTouchStick(0, x: x, y: y)
-                                    }
-                                    .frame(width: 74, height: 74)
-                                    Spacer()
-                                    HStack(spacing: 12) { padButton("−", 10); padButton("+", 9) }
-                                    Spacer()
-                                    TouchAnalogStick(invertY: true) { x, y in
-                                        session.setTouchStick(1, x: x, y: y)
-                                    }
-                                    .frame(width: 74, height: 74)
-                                }
-                            }
-                            .padding(.horizontal, 18)
-                            .padding(.vertical, 14)
-                            .background(Color.white.opacity(0.03))
-                            .overlay(alignment: .top) {
-                                Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
-                            }
-                            .opacity(padOpacity)
-                            .transition(.opacity)
-                        } else {
-                            VStack(spacing: 6) {
-                                Image(systemName: "gamecontroller.fill")
-                                    .font(.system(size: 20))
-                                    .foregroundStyle(.white.opacity(0.45))
-                                Text(hasController ? "已连接实体手柄 · 虚拟按键已自动隐藏" : "虚拟按键已隐藏")
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(.white.opacity(0.6))
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 36)
+                            .padding(.top, 10)
                         }
                     }
                 }

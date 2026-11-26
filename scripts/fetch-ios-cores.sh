@@ -17,7 +17,7 @@ archives=(
   desmume_libretro_ios.dylib.zip
   azahar_libretro.dylib.zip
   ppsspp_libretro.dylib.zip
-  swanstation_libretro.dylib.zip
+  pcsx_rearmed_libretro_ios.dylib.zip
   dolphin_libretro.dylib.zip
   pcee2_libretro.dylib.zip
 )

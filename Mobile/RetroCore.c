@@ -35,11 +35,20 @@ struct GCRetro {
 
 static GCRetro *active;
 static char error[512];
+static char last_log_error[256];
 
 static void core_log(int level, const char *format, ...) {
     if (level < 3) return;
-    va_list args;
+    va_list args, copy;
     va_start(args, format);
+    va_copy(copy, args);
+    char buf[256];
+    int n = vsnprintf(buf, sizeof(buf), format, copy);
+    va_end(copy);
+    if (n > 0) {
+        while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
+        if (n > 0) snprintf(last_log_error, sizeof(last_log_error), "%s", buf);
+    }
     vfprintf(stderr, format, args);
     va_end(args);
 }
@@ -96,7 +105,7 @@ static bool environment(unsigned command, void *arg) {
                 {"dolphin_cpu_core", "5"},
                 {"dolphin_renderer", "Software"},
                 {"dolphin_main_cpu_thread", "disabled"},
-                {"pcsx2_renderer", "software"},
+                {"pcsx2_renderer", "metal"},
                 {"pcsx2_bios", "auto"},
                 {"pcsx2_fast_boot", "enabled"},
                 {"pcsx2_cpu_recompiler", "disabled"},
@@ -111,6 +120,8 @@ static bool environment(unsigned command, void *arg) {
                 {"ppsspp_cpu_core", "Interpreter"},
                 {"ppsspp_software_rendering", "enabled"},
                 {"ppsspp_backend", "Software"},
+                {"pcsx_rearmed_drc", "disabled"},
+                {"pcsx_rearmed_bios", "auto"},
                 {"swanstation_CPU_ExecutionMode", "Interpreter"},
                 {"swanstation_GPU_Renderer", "Software"},
                 {"swanstation_BIOS_PathNTSCJ", "scph5500.bin"},
@@ -231,9 +242,11 @@ static int16_t input(unsigned port, unsigned device, unsigned index, unsigned id
 }
 
 const char *gc_retro_error(void) { return error; }
+const char *gc_retro_last_log_error(void) { return last_log_error; }
 
 GCRetro *gc_retro_open(const char *core, const char *rom, const char *system, const char *save) {
     if (active) { snprintf(error, sizeof(error), "已有游戏正在运行"); return NULL; }
+    last_log_error[0] = '\0';
     GCRetro *s = calloc(1, sizeof(*s));
     if (!s) { snprintf(error, sizeof(error), "内存不足"); return NULL; }
     snprintf(error, sizeof(error), "无法读取 ROM 或存档目录");
@@ -283,9 +296,13 @@ GCRetro *gc_retro_open(const char *core, const char *rom, const char *system, co
     }
     s->loaded = ((bool (*)(const struct GameInfo *))fn[11])(&game);
     if (!s->loaded) {
-        snprintf(error, sizeof(error), "%s", s->hardware_requested
-            ? "该核心需要 Game Center 尚未接入的硬件渲染接口"
-            : "核心无法读取游戏，请检查 ROM 格式和 BIOS");
+        if (s->hardware_requested) {
+            snprintf(error, sizeof(error), "该核心需要 Game Center 尚未接入的硬件渲染接口");
+        } else if (last_log_error[0]) {
+            snprintf(error, sizeof(error), "核心无法读取游戏，请检查 ROM 格式和 BIOS（%s）", last_log_error);
+        } else {
+            snprintf(error, sizeof(error), "核心无法读取游戏，请检查 ROM 格式和 BIOS");
+        }
         goto fail;
     }
     ((void (*)(unsigned, unsigned))fn[16])(0, strstr(core, "dolphin_libretro") ? 0x301 : 1);

@@ -33,7 +33,7 @@ enum IOSCoreCatalog {
         .init(platform: .superFamicom, displayName: "Snes9x", moduleName: "snes9x_libretro_ios.dylib", requiresJIT: false, sourceURL: URL(string: "https://github.com/libretro/snes9x")!),
         .init(platform: .n64, displayName: "Mupen64Plus-Next", moduleName: "mupen64plus_next_libretro_ios.dylib", requiresJIT: false, sourceURL: URL(string: "https://github.com/libretro/mupen64plus-libretro-nx")!),
         .init(platform: .megaDrive, displayName: "Genesis Plus GX", moduleName: "genesis_plus_gx_libretro_ios.dylib", requiresJIT: false, sourceURL: URL(string: "https://github.com/libretro/Genesis-Plus-GX")!),
-        .init(platform: .ps1, displayName: "SwanStation", moduleName: "swanstation_libretro.dylib", requiresJIT: false, sourceURL: URL(string: "https://github.com/libretro/swanstation")!)
+        .init(platform: .ps1, displayName: "PCSX-ReARMed", moduleName: "pcsx_rearmed_libretro_ios.dylib", requiresJIT: false, sourceURL: URL(string: "https://github.com/libretro/pcsx_rearmed")!)
     ].filter { supportedPlatforms.contains($0.platform) }
 
     static func descriptor(for platform: GamePlatform) -> IOSCoreDescriptor? {
@@ -67,7 +67,7 @@ enum IOSCoreCatalog {
                         .psp: "软件渲染与解释执行，系统字体与资源已随应用内置。",
                         .ps1: "软件渲染与解释执行，标准 BIOS 已随应用内置。",
                         .wii: "使用缓存解释器和软件渲染，性能取决于设备和游戏。",
-                        .ps2: "使用软件渲染与解释执行，BIOS 已随应用内置。",
+                        .ps2: "Metal 渲染与解释执行，BIOS 已随应用内置。",
                         .wiiu: "Cemu 原生 Metal 渲染（附带 MoltenVK）。无 JIT 时自动使用解释执行。"
                      ][core.platform],
                      runtime: [.wiiu: "cemu"][core.platform])

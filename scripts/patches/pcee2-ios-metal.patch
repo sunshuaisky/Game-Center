@@ -1,0 +1,448 @@
+diff --git a/cmake/BuildParameters.cmake b/cmake/BuildParameters.cmake
+index 36df25e..189485a 100644
+--- a/cmake/BuildParameters.cmake
++++ b/cmake/BuildParameters.cmake
+@@ -437,7 +437,11 @@ if(NOT CMAKE_GENERATOR MATCHES "Xcode")
+ 	# Assume Xcode builds aren't being used for distribution
+ 	# Helpful because Xcode builds don't build multiple metallibs for different macOS versions
+ 	# Also helpful because Xcode's interactive shader debugger requires apps be built for the latest macOS
+-	set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0)
++	if(APPLE_EMBEDDED)
++		set(CMAKE_OSX_DEPLOYMENT_TARGET 16.0)
++	else()
++		set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0)
++	endif()
+ endif()
+ 
+ # CMake defaults the suffix for modules to .so on macOS but wx tells us that the
+diff --git a/common/Linux/LnxHostSys.cpp b/common/Linux/LnxHostSys.cpp
+index 056e50c..b55f72a 100644
+--- a/common/Linux/LnxHostSys.cpp
++++ b/common/Linux/LnxHostSys.cpp
+@@ -113,20 +113,52 @@ void* HostSys::CreateSharedMemory(const char* name, size_t size)
+ 
+ 	return reinterpret_cast<void*>(static_cast<intptr_t>(fd));
+ #else
+-	const int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+-	if (fd < 0)
++	int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
++	if (fd >= 0)
++	{
++		// we're not going to be opening this mapping in other processes, so remove the file
++		shm_unlink(name);
++	}
++#if defined(__APPLE__)
++	else
++	{
++		const int shm_err = errno;
++		const char* tmpdir = std::getenv("TMPDIR");
++		if (!tmpdir || !*tmpdir)
++			tmpdir = "/tmp";
++		const char* clean = name;
++		while (*clean == '/')
++			++clean;
++		char path[1024];
++		for (int attempt = 0; attempt < 32 && fd < 0; ++attempt)
++		{
++			std::snprintf(path, sizeof(path), "%s/pcsx2_shm_%s_%u_%d",
++				tmpdir, clean, static_cast<unsigned>(getpid()), attempt);
++			fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
++			if (fd >= 0)
++				unlink(path);
++			else if (errno != EEXIST)
++				break;
++		}
++		if (fd < 0)
++		{
++			std::fprintf(stderr, "shm_open failed: %d (tmp fallback failed: %d)\n", shm_err, errno);
++			return nullptr;
++		}
++	}
++#else
++	else
+ 	{
+ 		std::fprintf(stderr, "shm_open failed: %d\n", errno);
+ 		return nullptr;
+ 	}
+-
+-	// we're not going to be opening this mapping in other processes, so remove the file
+-	shm_unlink(name);
++#endif
+ 
+ 	// ensure it's the correct size
+ 	if (ftruncate(fd, static_cast<off_t>(size)) < 0)
+ 	{
+ 		std::fprintf(stderr, "ftruncate(%zu) failed: %d\n", size, errno);
++		close(fd);
+ 		return nullptr;
+ 	}
+ 
+diff --git a/pcee2-libretro/CMakeLists.txt b/pcee2-libretro/CMakeLists.txt
+index 6c89130..de35269 100644
+--- a/pcee2-libretro/CMakeLists.txt
++++ b/pcee2-libretro/CMakeLists.txt
+@@ -72,16 +72,23 @@ endif()
+ # shaders - so build one library (Metal 2.3, the macOS 11 deployment target)
+ # and link it into the core, where GSMTLDeviceInfo.mm reads it back from the
+ # __DATA,__pcsx2_mtllib section. The core stays a single file.
+-if(APPLE AND NOT APPLE_EMBEDDED)
++if(APPLE)
+ 	get_property(PCSX2_SOURCE_DIR GLOBAL PROPERTY PCSX2_SOURCE_DIR)
+ 	get_property(PCSX2_METAL_SHADERS GLOBAL PROPERTY PCSX2_METAL_SHADERS)
++	if(APPLE_EMBEDDED)
++		set(metal_sdk_args -sdk iphoneos)
++		set(metal_std_args -std=ios-metal2.3 -target air64-apple-ios14.0)
++	else()
++		set(metal_sdk_args)
++		set(metal_std_args -std=macos-metal2.3 -target air64-apple-macos11.0)
++	endif()
+ 	set(core_metal_air)
+ 	foreach(shader IN LISTS PCSX2_METAL_SHADERS)
+ 		set(air ${CMAKE_CURRENT_BINARY_DIR}/metal/${shader}.air)
+ 		get_filename_component(air_dir ${air} DIRECTORY)
+ 		add_custom_command(OUTPUT ${air}
+ 			COMMAND ${CMAKE_COMMAND} -E make_directory ${air_dir}
+-			COMMAND xcrun metal -ffast-math -std=macos-metal2.3 -target air64-apple-macos11.0
++			COMMAND xcrun ${metal_sdk_args} metal -ffast-math ${metal_std_args}
+ 				-o ${air} -c ${PCSX2_SOURCE_DIR}/${shader}
+ 			DEPENDS ${PCSX2_SOURCE_DIR}/${shader}
+ 				${PCSX2_SOURCE_DIR}/GS/Renderers/Metal/GSMTLSharedHeader.h
+@@ -91,7 +98,7 @@ if(APPLE AND NOT APPLE_EMBEDDED)
+ 	endforeach()
+ 	set(core_metallib ${CMAKE_CURRENT_BINARY_DIR}/pcsx2.metallib)
+ 	add_custom_command(OUTPUT ${core_metallib}
+-		COMMAND xcrun metallib -o ${core_metallib} ${core_metal_air}
++		COMMAND xcrun ${metal_sdk_args} metallib -o ${core_metallib} ${core_metal_air}
+ 		DEPENDS ${core_metal_air}
+ 	)
+ 	add_custom_target(pcee2_libretro_metallib DEPENDS ${core_metallib})
+diff --git a/pcee2-libretro/Libretro.cpp b/pcee2-libretro/Libretro.cpp
+index f641199..24a25ef 100644
+--- a/pcee2-libretro/Libretro.cpp
++++ b/pcee2-libretro/Libretro.cpp
+@@ -517,6 +517,8 @@ RenderAPI LibretroGetRenderAPI()
+ 	return RenderAPI::Vulkan;
+ #elif defined(ENABLE_OPENGL)
+ 	return RenderAPI::OpenGL;
++#elif defined(__APPLE__) && !defined(PCSX2_DISABLE_METAL)
++	return RenderAPI::Metal;
+ #else
+ 	return RenderAPI::None;
+ #endif
+@@ -1015,6 +1017,9 @@ void LibretroHost::ReadCoreOptions(bool startup)
+ #elif defined(ENABLE_OPENGL)
+ 	const char* renderer = get_option("pcsx2_renderer", "opengl");
+ 	GSRendererType renderer_type = GSRendererType::OGL;
++#elif defined(__APPLE__) && !defined(PCSX2_DISABLE_METAL)
++	const char* renderer = get_option("pcsx2_renderer", "metal");
++	GSRendererType renderer_type = GSRendererType::Metal;
+ #else
+ 	const char* renderer = get_option("pcsx2_renderer", "software");
+ 	GSRendererType renderer_type = GSRendererType::SW;
+@@ -2394,6 +2399,8 @@ bool retro_load_game(const struct retro_game_info* game)
+ 		const char* const fallback_renderer = "vulkan";
+ #elif defined(ENABLE_OPENGL)
+ 		const char* const fallback_renderer = "opengl";
++#elif defined(__APPLE__) && !defined(PCSX2_DISABLE_METAL)
++		const char* const fallback_renderer = "metal";
+ #else
+ 		const char* const fallback_renderer = "software";
+ #endif
+diff --git a/pcsx2/CMakeLists.txt b/pcsx2/CMakeLists.txt
+index de55c46..4201aec 100644
+--- a/pcsx2/CMakeLists.txt
++++ b/pcsx2/CMakeLists.txt
+@@ -961,7 +961,7 @@ set(pcsx2InputHeaders
+ # textures - AppKit and a storage mode that iOS and tvOS do not have - and
+ # nothing on those platforms would use it anyway: the core is handed a Vulkan
+ # surface by the frontend, through MoltenVK. Left out rather than ported.
+-if(APPLE AND NOT APPLE_EMBEDDED)
++if(APPLE)
+ 	list(APPEND pcsx2GSSources
+ 		GS/Renderers/Metal/GSDeviceMTL.mm
+ 		GS/Renderers/Metal/GSMTLDeviceInfo.mm
+@@ -1475,20 +1475,19 @@ fixup_file_properties(PCSX2)
+ force_include_last(PCSX2_FLAGS "/(usr|local)/include/?$")
+ 
+ if (APPLE_EMBEDDED)
+-	# AppKit and IOKit are macOS only, and the Metal backend above is not built
+-	# here, so neither Metal nor MetalFX is linked either. What is left is what
+-	# iOS and tvOS actually have.
++	find_library(METAL_LIBRARY Metal)
+ 	find_library(QUARTZCORE_LIBRARY QuartzCore)
+ 	find_library(AVFOUNDATION_LIBRARY AVFoundation)
+ 	find_library(COREMEDIA_LIBRARY CoreMedia)
++	find_library(UIKIT_LIBRARY UIKit)
+ 	target_link_libraries(PCSX2_FLAGS INTERFACE
++		${METAL_LIBRARY}
+ 		${QUARTZCORE_LIBRARY}
+ 		${AVFOUNDATION_LIBRARY}
+ 		${COREMEDIA_LIBRARY}
++		${UIKIT_LIBRARY}
+ 	)
+-	# Guards the four places that name the Metal device, the same way
+-	# PCSX2_DISABLE_D3D guards the Direct3D ones on a MinGW build.
+-	target_compile_definitions(PCSX2_FLAGS INTERFACE PCSX2_DISABLE_METAL)
++	target_link_options(PCSX2_FLAGS INTERFACE "SHELL:-weak_framework MetalFX")
+ elseif (APPLE)
+ 	find_library(APPKIT_LIBRARY AppKit)
+ 	find_library(IOKIT_LIBRARY IOKit)
+diff --git a/pcsx2/GS/GS.cpp b/pcsx2/GS/GS.cpp
+index 75c6770..3e1df84 100644
+--- a/pcsx2/GS/GS.cpp
++++ b/pcsx2/GS/GS.cpp
+@@ -1270,9 +1270,9 @@ void* GSAllocateWrappedMemory(size_t size, size_t repeat)
+ 	pxAssert(s_shm_fd == -1);
+ 
+ 	const char* file_name = "/GS.mem";
+-#if defined(__ANDROID__)
+-	// No shm_open in bionic: HostSys hands back an ashmem descriptor instead,
+-	// whose size is fixed when it is created rather than by ftruncate.
++#if defined(__ANDROID__) || defined(__APPLE__)
++	// Android has no shm_open and iOS sandbox blocks arbitrary shm_open names:
++	// HostSys::CreateSharedMemory handles ashmem on Android and TMPDIR fallback on Apple.
+ 	void* handle = HostSys::CreateSharedMemory(file_name, repeat * size);
+ 	if (!handle)
+ 	{
+diff --git a/pcsx2/GS/Renderers/Metal/GSDeviceMTL.h b/pcsx2/GS/Renderers/Metal/GSDeviceMTL.h
+index ea3ee84..43a4c2a 100644
+--- a/pcsx2/GS/Renderers/Metal/GSDeviceMTL.h
++++ b/pcsx2/GS/Renderers/Metal/GSDeviceMTL.h
+@@ -17,7 +17,12 @@
+ #include "GS/GS.h"
+ #include "GSMTLDeviceInfo.h"
+ #include "GSMTLSharedHeader.h"
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++#include <UIKit/UIKit.h>
++#else
+ #include <AppKit/AppKit.h>
++#endif
+ #include <Metal/Metal.h>
+ #include <MetalFX/MetalFX.h>
+ #include <QuartzCore/QuartzCore.h>
+@@ -225,7 +230,11 @@ public:
+ 	MTLResourceOptions m_resource_options_shared_wc;
+ 
+ 	// Previously in MetalHostDisplay.
++#if TARGET_OS_IPHONE
++	MRCOwned<UIView*> m_view;
++#else
+ 	MRCOwned<NSView*> m_view;
++#endif
+ 	MRCOwned<CAMetalLayer*> m_layer;
+ 	MRCOwned<id<CAMetalDrawable>> m_current_drawable;
+ 	MRCOwned<MTLRenderPassDescriptor*> m_pass_desc;
+@@ -253,7 +262,7 @@ public:
+ 
+ 	// MetalFX spatial upscaler. Creating the scaler is expensive, so it's cached and
+ 	// only rebuilt when the input/output size or format changes (the cache key below).
+-	API_AVAILABLE(macos(13.0)) MRCOwned<id<MTLFXSpatialScaler>> m_mfx_spatial;
++	API_AVAILABLE(macos(13.0), ios(16.0)) MRCOwned<id<MTLFXSpatialScaler>> m_mfx_spatial;
+ 	int m_mfx_in_w = 0, m_mfx_in_h = 0, m_mfx_out_w = 0, m_mfx_out_h = 0;
+ 	MTLPixelFormat m_mfx_in_fmt = MTLPixelFormatInvalid, m_mfx_out_fmt = MTLPixelFormatInvalid;
+ 	std::vector<MRCOwned<id<MTLRenderPipelineState>>> m_convert_pipeline;
+@@ -403,7 +412,7 @@ public:
+ 	bool DoCAS(GSTexture* sTex, GSTexture* dTex, bool sharpen_only, const std::array<u32, NUM_CAS_CONSTANTS>& constants) override;
+ 
+ 	/// (Re)builds m_mfx_spatial when the src/dst size or format changes. Returns false on failure.
+-	API_AVAILABLE(macos(13.0)) bool EnsureMetalFXSpatial(GSTexture* sTex, GSTexture* dTex);
++	API_AVAILABLE(macos(13.0), ios(16.0)) bool EnsureMetalFXSpatial(GSTexture* sTex, GSTexture* dTex);
+ 	bool DoMetalFXSpatial(GSTexture* sTex, GSTexture* dTex) override;
+ 
+ 	MRCOwned<id<MTLFunction>> LoadShader(NSString* name);
+diff --git a/pcsx2/GS/Renderers/Metal/GSDeviceMTL.mm b/pcsx2/GS/Renderers/Metal/GSDeviceMTL.mm
+index ee508da..fa54ed4 100644
+--- a/pcsx2/GS/Renderers/Metal/GSDeviceMTL.mm
++++ b/pcsx2/GS/Renderers/Metal/GSDeviceMTL.mm
+@@ -31,6 +31,17 @@
+ std::vector<GSAdapterInfo> GetMetalAdapterList()
+ { @autoreleasepool {
+ 	std::vector<GSAdapterInfo> list;
++#if TARGET_OS_IPHONE
++	auto dev = MRCTransfer(MTLCreateSystemDefaultDevice());
++	if (dev)
++	{
++		GSAdapterInfo ai;
++		ai.name = [[dev name] UTF8String];
++		ai.max_texture_size = GSMTLDevice::GetMaxTextureSize(dev);
++		ai.max_upscale_multiplier = GSGetMaxUpscaleMultiplier(ai.max_texture_size);
++		list.push_back(std::move(ai));
++	}
++#else
+ 	auto devs = MRCTransfer(MTLCopyAllDevices());
+ 	for (id<MTLDevice> dev in devs.Get())
+ 	{
+@@ -40,6 +51,7 @@
+ 		ai.max_upscale_multiplier = GSGetMaxUpscaleMultiplier(ai.max_texture_size);
+ 		list.push_back(std::move(ai));
+ 	}
++#endif
+ 	return list;
+ }}
+ 
+@@ -813,7 +825,7 @@ static constexpr MTLPixelFormat ConvertPixelFormat(GSTexture::Format format)
+ 
+ bool GSDeviceMTL::DoMetalFXSpatial(GSTexture* sTex, GSTexture* dTex)
+ { @autoreleasepool {
+-	if (@available(macOS 13.0, *))
++	if (@available(macOS 13.0, iOS 16.0, *))
+ 	{
+ 		if (!EnsureMetalFXSpatial(sTex, dTex))
+ 			return false;
+@@ -922,19 +934,31 @@ static void OnMainThread(Fn&& fn)
+ void GSDeviceMTL::AttachSurfaceOnMainThread()
+ {
+ 	pxAssert([NSThread isMainThread]);
++#if TARGET_OS_IPHONE
++	m_view = MRCRetain((__bridge UIView*)m_window_info.window_handle);
++	if (m_view && [[m_view layer] isKindOfClass:[CAMetalLayer class]])
++	{
++		m_layer = MRCRetain((CAMetalLayer*)[m_view layer]);
++		[m_layer setDrawableSize:CGSizeMake(m_window_info.surface_width, m_window_info.surface_height)];
++		[m_layer setDevice:m_dev.dev];
++	}
++#else
+ 	m_layer = MRCRetain([CAMetalLayer layer]);
+ 	[m_layer setDrawableSize:CGSizeMake(m_window_info.surface_width, m_window_info.surface_height)];
+ 	[m_layer setDevice:m_dev.dev];
+ 	m_view = MRCRetain((__bridge NSView*)m_window_info.window_handle);
+ 	[m_view setWantsLayer:YES];
+ 	[m_view setLayer:m_layer];
++#endif
+ }
+ 
+ void GSDeviceMTL::DetachSurfaceOnMainThread()
+ {
+ 	pxAssert([NSThread isMainThread]);
++#if !TARGET_OS_IPHONE
+ 	[m_view setLayer:nullptr];
+ 	[m_view setWantsLayer:NO];
++#endif
+ 	m_view = nullptr;
+ 	m_layer = nullptr;
+ }
+@@ -1044,6 +1068,7 @@ static bool ConvertShaderNotNeeded(ShaderConvert shader)
+ 	if (!GSDevice::Create(vsync_mode, allow_present_throttle))
+ 		return false;
+ 
++#if !TARGET_OS_IPHONE
+ 	NSString* ns_adapter_name = [NSString stringWithUTF8String:GSConfig.Adapter.c_str()];
+ 	auto devs = MRCTransfer(MTLCopyAllDevices());
+ 	for (id<MTLDevice> dev in devs.Get())
+@@ -1051,6 +1076,7 @@ static bool ConvertShaderNotNeeded(ShaderConvert shader)
+ 		if ([[dev name] isEqualToString:ns_adapter_name])
+ 			m_dev = GSMTLDevice(MRCRetain(dev));
+ 	}
++#endif
+ 	if (!m_dev.dev)
+ 	{
+ 		if (GSConfig.Adapter == GetDefaultAdapter())
+@@ -1075,7 +1101,7 @@ static bool ConvertShaderNotNeeded(ShaderConvert shader)
+ 
+ 	if (char* env = getenv("MTL_USE_PRESENT_DRAWABLE"))
+ 		m_use_present_drawable = static_cast<UsePresentDrawable>(atoi(env));
+-	else if (@available(macOS 13.0, *))
++	else if (@available(macOS 13.0, iOS 16.0, *))
+ 		m_use_present_drawable = UsePresentDrawable::Always;
+ 	else // Before Ventura, presentDrawable acts like vsync is on when windowed
+ 		m_use_present_drawable = UsePresentDrawable::IfVsync;
+@@ -1110,7 +1136,9 @@ static bool ConvertShaderNotNeeded(ShaderConvert shader)
+ 
+ 		// Metal does not support mailbox.
+ 		m_vsync_mode = (m_vsync_mode == GSVSyncMode::Mailbox) ? GSVSyncMode::FIFO : m_vsync_mode;
++#if !TARGET_OS_IPHONE
+ 		[m_layer setDisplaySyncEnabled:m_vsync_mode == GSVSyncMode::FIFO];
++#endif
+ 	}
+ 	else
+ 	{
+@@ -1124,21 +1152,27 @@ static bool ConvertShaderNotNeeded(ShaderConvert shader)
+ 	m_features.broken_point_sampler = false;
+ 	m_features.vs_expand = !GSConfig.DisableVertexShaderExpand;
+ 	m_features.primitive_id = m_dev.features.primid;
++#if TARGET_OS_IPHONE
++	m_features.texture_barrier = false;
++	m_features.dxt_textures = false;
++	m_features.bptc_textures = false;
++#else
+ 	m_features.texture_barrier = true;
++	m_features.dxt_textures = true;
++	m_features.bptc_textures = true;
++#endif
+ 	m_features.multidraw_fb_copy = false;
+ 	m_features.provoking_vertex_last = false;
+ 	m_features.point_expand = true;
+ 	m_features.line_expand = false;
+ 	m_features.prefer_new_textures = true;
+-	m_features.dxt_textures = true;
+-	m_features.bptc_textures = true;
+ 	m_features.framebuffer_fetch = m_dev.features.framebuffer_fetch && !GSConfig.DisableFramebufferFetch;
+ 	m_features.stencil_buffer = true;
+ 	m_features.cas_sharpening = true;
+ 	m_features.test_and_sample_depth = true;
+ 	m_features.depth_feedback = getDepthFeedback(m_dev, m_features.framebuffer_fetch);
+ 	m_features.aa1 = GSConfig.HWAA1 && m_features.vs_expand;
+-	if (@available(macOS 13.0, *))
++	if (@available(macOS 13.0, iOS 16.0, *))
+ 		m_features.metalfx_spatial = [MTLFXSpatialScalerDescriptor supportsDevice:m_dev.dev];
+ 	m_features.rov = m_dev.features.rov && !m_features.framebuffer_fetch;
+ 	m_features.copyless_ds_as_rt = m_features.framebuffer_fetch;
+@@ -1579,8 +1613,10 @@ static bool ConvertShaderNotNeeded(ShaderConvert shader)
+ 				{
+ 					[[MTLCaptureManager sharedCaptureManager] stopCapture];
+ 					Console.WriteLn("Metal Trace Capture to /tmp/PCSX2MTLCapture.gputrace finished");
++#if !TARGET_OS_IPHONE
+ 					[[NSWorkspace sharedWorkspace] selectFile:path
+ 					                 inFileViewerRootedAtPath:@"/tmp/"];
++#endif
+ 				}
+ 			}
+ 			else if (s_capture_next)
+@@ -1624,7 +1660,9 @@ static bool ConvertShaderNotNeeded(ShaderConvert shader)
+ 		return;
+ 
+ 	m_vsync_mode = (mode == GSVSyncMode::Mailbox) ? GSVSyncMode::FIFO : mode;
++#if !TARGET_OS_IPHONE
+ 	[m_layer setDisplaySyncEnabled:m_vsync_mode == GSVSyncMode::FIFO];
++#endif
+ }
+ 
+ bool GSDeviceMTL::SetGPUTimingEnabled(bool enabled)
+@@ -2216,9 +2254,13 @@ static MTLBlendOperation ConvertBlendOp(GSDevice::BlendOp generic)
+ 
+ static void textureBarrier(id<MTLRenderCommandEncoder> enc)
+ {
++#if !TARGET_OS_IPHONE
+ 	[enc memoryBarrierWithScope:MTLBarrierScopeRenderTargets
+ 	                afterStages:MTLRenderStageFragment
+ 	               beforeStages:MTLRenderStageFragment];
++#else
++	(void)enc;
++#endif
+ }
+ 
+ void GSDeviceMTL::MRESetTexture(GSTexture* tex, int pos)
+diff --git a/pcsx2/GS/Renderers/Metal/GSMTLDeviceInfo.mm b/pcsx2/GS/Renderers/Metal/GSMTLDeviceInfo.mm
+index 6949626..b4b32ae 100644
+--- a/pcsx2/GS/Renderers/Metal/GSMTLDeviceInfo.mm
++++ b/pcsx2/GS/Renderers/Metal/GSMTLDeviceInfo.mm
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-3.0+
+ 
+ #include "GSMTLDeviceInfo.h"
++#include <TargetConditionals.h>
+ #include "GS/GS.h"
+ #include "common/Console.h"
+ #include "common/Path.h"
+@@ -286,8 +287,10 @@ static DetectionResult detectIntelGPU(id<MTLDevice> dev, id<MTLLibrary> lib)
+ 		if ([dev supportsFamily:MTLGPUFamilyApple3])
+ 			return 16384;
+ 	}
++#if !TARGET_OS_IPHONE
+ 	if ([dev supportsFeatureSet:MTLFeatureSet_macOS_GPUFamily1_v1])
+ 		return 16384;
++#endif
+ 	return 8192;
+ }
+ 

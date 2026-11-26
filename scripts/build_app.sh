@@ -74,6 +74,9 @@ fi
 if [[ -d "$ROOT_DIR/build/mobile-host/versions" ]]; then
   ditto "$ROOT_DIR/build/mobile-host/versions" "$MOBILE_BUILD/S2ArmExitHosts"
 fi
+if [[ -d "$ROOT_DIR/build/ios-cores" ]]; then
+  ditto "$ROOT_DIR/build/ios-cores" "$MOBILE_BUILD/iOSCores"
+fi
 mkdir -p "$MOBILE_BUILD/Sources/GameCenterSaveSupport"
 cp "$ROOT_DIR/Sources/GameCenterSaveSupport/GameSaveLayout.swift" "$MOBILE_BUILD/Sources/GameCenterSaveSupport/"
 cp "$ROOT_DIR/Sources/GameCenter/MobileLibraryFormat.swift" "$MOBILE_BUILD/Sources/GameCenter/"
