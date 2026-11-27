@@ -39,7 +39,8 @@ struct GCRetro {
 
 static GCRetro *active;
 static char error[512];
-static char last_log_error[256];
+static char last_log_error[512];
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void core_log(int level, const char *format, ...) {
     if (level < 3) return;
@@ -51,7 +52,18 @@ static void core_log(int level, const char *format, ...) {
     va_end(copy);
     if (n > 0) {
         while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
-        if (n > 0) snprintf(last_log_error, sizeof(last_log_error), "%s", buf);
+        if (n > 0) {
+            pthread_mutex_lock(&log_mutex);
+            if (last_log_error[0] == '\0') {
+                snprintf(last_log_error, sizeof(last_log_error), "%s", buf);
+            } else if (strstr(last_log_error, buf) == NULL) {
+                size_t cur = strlen(last_log_error);
+                if (cur + 3 < sizeof(last_log_error)) {
+                    snprintf(last_log_error + cur, sizeof(last_log_error) - cur, " | %s", buf);
+                }
+            }
+            pthread_mutex_unlock(&log_mutex);
+        }
     }
     vfprintf(stderr, format, args);
     va_end(args);
@@ -296,12 +308,20 @@ static int16_t input(unsigned port, unsigned device, unsigned index, unsigned id
 }
 
 const char *gc_retro_error(void) { return error; }
-const char *gc_retro_last_log_error(void) { return last_log_error; }
+const char *gc_retro_last_log_error(void) {
+    static char snapshot[512];
+    pthread_mutex_lock(&log_mutex);
+    snprintf(snapshot, sizeof(snapshot), "%s", last_log_error);
+    pthread_mutex_unlock(&log_mutex);
+    return snapshot;
+}
 bool gc_retro_shutdown_requested(GCRetro *s) { return s ? s->shutdown_requested : false; }
 
 GCRetro *gc_retro_open(const char *core, const char *rom, const char *system, const char *save) {
     if (active) { snprintf(error, sizeof(error), "已有游戏正在运行"); return NULL; }
+    pthread_mutex_lock(&log_mutex);
     last_log_error[0] = '\0';
+    pthread_mutex_unlock(&log_mutex);
     GCRetro *s = calloc(1, sizeof(*s));
     if (!s) { snprintf(error, sizeof(error), "内存不足"); return NULL; }
     snprintf(error, sizeof(error), "无法读取 ROM 或存档目录");

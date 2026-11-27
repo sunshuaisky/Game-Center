@@ -204,10 +204,20 @@ index 6c89130..de35269 100644
  	)
  	add_custom_target(pcee2_libretro_metallib DEPENDS ${core_metallib})
 diff --git a/pcee2-libretro/Libretro.cpp b/pcee2-libretro/Libretro.cpp
-index f641199..86f6bc6 100644
+index f641199..a1bc53a 100644
 --- a/pcee2-libretro/Libretro.cpp
 +++ b/pcee2-libretro/Libretro.cpp
-@@ -118,6 +118,7 @@ namespace LibretroHost
+@@ -29,6 +29,9 @@
+ #include <mutex>
+ #include <thread>
+ #include <vector>
++#ifdef __APPLE__
++#include <TargetConditionals.h>
++#endif
+ 
+ #include "common/Assertions.h"
+ #include "common/Console.h"
+@@ -118,6 +121,7 @@ namespace LibretroHost
  	// COM init, ...). Games are booted in a request loop.
  	static std::thread s_cpu_thread;
  	static std::atomic_bool s_running{false};
@@ -215,7 +225,19 @@ index f641199..86f6bc6 100644
  	static VMBootParameters s_boot_params;
  	// the content is a Namco System 246/256 game (.acgame)
  	static bool s_arcade_content = false;
-@@ -517,6 +518,8 @@ RenderAPI LibretroGetRenderAPI()
+@@ -444,9 +448,9 @@ namespace LibretroHost
+ 		}
+ 
+ 		retro_log_level rl = RETRO_LOG_INFO;
+-		if (level == LOGLEVEL_ERROR)
++		if (level == LOGLEVEL_ERROR || color == Color_StrongRed)
+ 			rl = RETRO_LOG_ERROR;
+-		else if (level == LOGLEVEL_WARNING)
++		else if (level == LOGLEVEL_WARNING || color == Color_StrongOrange)
+ 			rl = RETRO_LOG_WARN;
+ 		else if (level >= LOGLEVEL_DEV)
+ 			rl = RETRO_LOG_DEBUG;
+@@ -517,6 +521,8 @@ RenderAPI LibretroGetRenderAPI()
  	return RenderAPI::Vulkan;
  #elif defined(ENABLE_OPENGL)
  	return RenderAPI::OpenGL;
@@ -224,7 +246,7 @@ index f641199..86f6bc6 100644
  #else
  	return RenderAPI::None;
  #endif
-@@ -1015,6 +1018,9 @@ void LibretroHost::ReadCoreOptions(bool startup)
+@@ -1015,6 +1021,9 @@ void LibretroHost::ReadCoreOptions(bool startup)
  #elif defined(ENABLE_OPENGL)
  	const char* renderer = get_option("pcsx2_renderer", "opengl");
  	GSRendererType renderer_type = GSRendererType::OGL;
@@ -234,12 +256,43 @@ index f641199..86f6bc6 100644
  #else
  	const char* renderer = get_option("pcsx2_renderer", "software");
  	GSRendererType renderer_type = GSRendererType::SW;
-@@ -1479,9 +1485,14 @@ void LibretroHost::CPUThreadMain()
+@@ -1363,6 +1372,9 @@ void LibretroHost::ReadCoreOptions(bool startup)
+ 		s_settings_interface.SetBoolValue("EmuCore/CPU/Recompiler", "EnableIOP", iop);
+ 		s_settings_interface.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU0", vu0);
+ 		s_settings_interface.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU1", vu1);
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++		s_settings_interface.SetBoolValue("EmuCore/CPU/Recompiler", "EnableFastmem", false);
++#endif
+ 		if (!(ee && iop && vu0 && vu1))
+ 			Console.WriteLnFmt("Recompiler state via core options: EE={} IOP={} VU0={} VU1={} (off = interpreter).",
+ 				ee, iop, vu0, vu1);
+@@ -1408,7 +1420,7 @@ void LibretroHost::CPUThreadMain()
+ 
+ 	const bool init_ok = VMManager::Internal::CPUThreadInitialize();
+ 	if (!init_ok)
+-		Console.Error("CPUThreadInitialize() failed.");
++		ERROR_LOG("CPUThreadInitialize() failed.");
+ 	s_cpu_thread_initialized.store(true, std::memory_order_release);
+ 
+ 	for (;;)
+@@ -1434,7 +1446,8 @@ void LibretroHost::CPUThreadMain()
+ 		{
+ 			VMManager::ApplySettings();
+ 
+-			if (VMManager::Initialize(s_boot_params) == VMBootResult::StartupSuccess)
++			Error init_error;
++			if (VMManager::Initialize(s_boot_params, &init_error) == VMBootResult::StartupSuccess)
+ 			{
+ 				VMManager::SetState(VMState::Running);
+ 				// Nominal means the VM throttles itself to the console's rate;
+@@ -1479,9 +1492,15 @@ void LibretroHost::CPUThreadMain()
  			}
  			else
  			{
+-				Console.Error("VMManager::Initialize() failed.");
++				const std::string err_desc = init_error.GetDescription();
++				ERROR_LOG("VMManager::Initialize() failed: {}", err_desc.empty() ? "unknown error" : err_desc);
 +				s_boot_failed.store(true, std::memory_order_release);
- 				Console.Error("VMManager::Initialize() failed.");
  			}
  		}
 +		else
@@ -249,7 +302,7 @@ index f641199..86f6bc6 100644
  
  		s_running.store(false, std::memory_order_release);
  
-@@ -2394,6 +2405,8 @@ bool retro_load_game(const struct retro_game_info* game)
+@@ -2394,6 +2413,8 @@ bool retro_load_game(const struct retro_game_info* game)
  		const char* const fallback_renderer = "vulkan";
  #elif defined(ENABLE_OPENGL)
  		const char* const fallback_renderer = "opengl";
@@ -258,7 +311,7 @@ index f641199..86f6bc6 100644
  #else
  		const char* const fallback_renderer = "software";
  #endif
-@@ -2630,6 +2643,7 @@ bool retro_load_game(const struct retro_game_info* game)
+@@ -2630,6 +2651,7 @@ bool retro_load_game(const struct retro_game_info* game)
  	if (s_environ_cb && s_environ_cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &can_dupe) && !can_dupe)
  		Console.Warning("PCSX2: Frontend reports RETRO_ENVIRONMENT_GET_CAN_DUPE = false; explicit frame duplication may not work.");
  
@@ -266,7 +319,7 @@ index f641199..86f6bc6 100644
  	s_running.store(true, std::memory_order_release);
  	{
  		std::unique_lock lock(s_session_mutex);
-@@ -3519,7 +3533,12 @@ void retro_run(void)
+@@ -3519,7 +3541,12 @@ void retro_run(void)
  
  	if (!s_running.load(std::memory_order_acquire))
  	{
@@ -320,10 +373,10 @@ index de55c46..4201aec 100644
  	find_library(APPKIT_LIBRARY AppKit)
  	find_library(IOKIT_LIBRARY IOKit)
 diff --git a/pcsx2/GS/GS.cpp b/pcsx2/GS/GS.cpp
-index 75c6770..3e1df84 100644
+index 75c6770..8e37226 100644
 --- a/pcsx2/GS/GS.cpp
 +++ b/pcsx2/GS/GS.cpp
-@@ -1270,9 +1270,9 @@ void* GSAllocateWrappedMemory(size_t size, size_t repeat)
+@@ -1270,13 +1270,13 @@ void* GSAllocateWrappedMemory(size_t size, size_t repeat)
  	pxAssert(s_shm_fd == -1);
  
  	const char* file_name = "/GS.mem";
@@ -336,6 +389,33 @@ index 75c6770..3e1df84 100644
  	void* handle = HostSys::CreateSharedMemory(file_name, repeat * size);
  	if (!handle)
  	{
+-		fprintf(stderr, "Failed to allocate %zu bytes of shared memory for %s\n", repeat * size, file_name);
++		ERROR_LOG("GSAllocateWrappedMemory: Failed to allocate {} bytes of shared memory for {}", repeat * size, file_name);
+ 		return nullptr;
+ 	}
+ 
+@@ -1298,13 +1298,20 @@ void* GSAllocateWrappedMemory(size_t size, size_t repeat)
+ #endif
+ 
+ 	void* fifo = mmap(nullptr, size * repeat, PROT_READ | PROT_WRITE, MAP_SHARED, s_shm_fd, 0);
++	if (fifo == MAP_FAILED)
++	{
++		ERROR_LOG("GSAllocateWrappedMemory: mmap({} bytes) failed: errno={}", size * repeat, errno);
++		close(s_shm_fd);
++		s_shm_fd = -1;
++		return nullptr;
++	}
+ 
+ 	for (size_t i = 1; i < repeat; i++)
+ 	{
+ 		void* base = (u8*)fifo + size * i;
+ 		u8* next = (u8*)mmap(base, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, s_shm_fd, 0);
+ 		if (next != base)
+-			fprintf(stderr, "Fail to mmap contiguous segment\n");
++			ERROR_LOG("GSAllocateWrappedMemory: fail to mmap contiguous segment {} (errno={})", i, errno);
+ 	}
+ 
+ 	return fifo;
 diff --git a/pcsx2/GS/Renderers/Metal/GSDeviceMTL.h b/pcsx2/GS/Renderers/Metal/GSDeviceMTL.h
 index ea3ee84..43a4c2a 100644
 --- a/pcsx2/GS/Renderers/Metal/GSDeviceMTL.h
@@ -578,3 +658,177 @@ index 6949626..b4b32ae 100644
  	return 8192;
  }
  
+diff --git a/pcsx2/Memory.cpp b/pcsx2/Memory.cpp
+index e9ec35a..8627029 100644
+--- a/pcsx2/Memory.cpp
++++ b/pcsx2/Memory.cpp
+@@ -38,6 +38,9 @@ BIOS
+ 
+ #include "common/AlignedMalloc.h"
+ #include "common/Error.h"
++#ifdef __APPLE__
++#include <TargetConditionals.h>
++#endif
+ 
+ #ifdef ENABLECACHE
+ #include "Cache.h"
+@@ -88,6 +91,30 @@ namespace HostMemoryMap
+ 
+ bool SysMemory::AllocateMemoryMap()
+ {
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++	// Fastmem aliasing is disabled on iOS, so main memory does not need a 159 MB shared file mapping.
++	s_data_memory_file_handle = nullptr;
++	if (!(s_memory_mapping_area = SharedMemoryMappingArea::Create(HostMemoryMap::MainSize + HostMemoryMap::CodeSize, false)))
++	{
++		Host::ReportErrorAsync("Error", "Failed to map main memory.");
++		ReleaseMemoryMap();
++		return false;
++	}
++
++	if ((s_data_memory = s_memory_mapping_area->Map(nullptr, 0, s_memory_mapping_area->BasePointer(), HostMemoryMap::MainSize, PageAccess_ReadWrite())) == nullptr)
++	{
++		Host::ReportErrorAsync("Error", "Failed to map data memory.");
++		ReleaseMemoryMap();
++		return false;
++	}
++
++	if ((s_code_memory = s_memory_mapping_area->Map(nullptr, 0, s_memory_mapping_area->OffsetPointer(HostMemoryMap::MainSize), HostMemoryMap::CodeSize, PageAccess_ReadWrite())) == nullptr)
++	{
++		Host::ReportErrorAsync("Error", "Failed to allocate code memory.");
++		ReleaseMemoryMap();
++		return false;
++	}
++#else
+ 	s_data_memory_file_handle = HostSys::CreateSharedMemory(HostSys::GetFileMappingName("pcsx2").c_str(), HostMemoryMap::MainSize);
+ 	if (!s_data_memory_file_handle)
+ 	{
+@@ -116,6 +143,7 @@ bool SysMemory::AllocateMemoryMap()
+ 		ReleaseMemoryMap();
+ 		return false;
+ 	}
++#endif
+ 
+ 	HostMemoryMap::EEmem = (uptr)(s_data_memory + HostMemoryMap::EEmemOffset);
+ 	HostMemoryMap::IOPmem = (uptr)(s_data_memory + HostMemoryMap::IOPmemOffset);
+@@ -160,7 +188,7 @@ void SysMemory::ReleaseMemoryMap()
+ 
+ 	if (s_data_memory)
+ 	{
+-		s_memory_mapping_area->Unmap(s_data_memory, HostMemoryMap::MainSize, true);
++		s_memory_mapping_area->Unmap(s_data_memory, HostMemoryMap::MainSize, s_data_memory_file_handle != nullptr);
+ 		s_data_memory = nullptr;
+ 	}
+ 
+diff --git a/pcsx2/vtlb.cpp b/pcsx2/vtlb.cpp
+index 51af0b4..c2be3c7 100644
+--- a/pcsx2/vtlb.cpp
++++ b/pcsx2/vtlb.cpp
+@@ -35,6 +35,9 @@
+ #include <map>
+ #include <unordered_set>
+ #include <unordered_map>
++#ifdef __APPLE__
++#include <TargetConditionals.h>
++#endif
+ 
+ #define FASTMEM_LOG(...)
+ //#define FASTMEM_LOG(...) Console.WriteLn(__VA_ARGS__)
+@@ -922,6 +925,9 @@ static bool vtlb_GetMainMemoryOffset(u32 paddr, u32* mainmem_offset, u32* mainme
+ 
+ static void vtlb_CreateFastmemMapping(u32 vaddr, u32 mainmem_offset, const PageProtectionMode& mode)
+ {
++	if (!s_fastmem_area || s_fastmem_virtual_mapping.empty())
++		return;
++
+ 	FASTMEM_LOG("Create fastmem mapping @ vaddr %08X mainmem %08X", vaddr, mainmem_offset);
+ 
+ 	const u32 page = vaddr / VTLB_PAGE_SIZE;
+@@ -971,6 +977,9 @@ static void vtlb_CreateFastmemMapping(u32 vaddr, u32 mainmem_offset, const PageP
+ 
+ static void vtlb_RemoveFastmemMapping(u32 vaddr)
+ {
++	if (!s_fastmem_area || s_fastmem_virtual_mapping.empty())
++		return;
++
+ 	const u32 page = vaddr / VTLB_PAGE_SIZE;
+ 	if (s_fastmem_virtual_mapping[page] == NO_FASTMEM_MAPPING)
+ 		return;
+@@ -995,6 +1004,9 @@ static void vtlb_RemoveFastmemMapping(u32 vaddr)
+ 
+ static void vtlb_RemoveFastmemMappings(u32 vaddr, u32 size)
+ {
++	if (!s_fastmem_area || s_fastmem_virtual_mapping.empty())
++		return;
++
+ 	pxAssert((vaddr & VTLB_PAGE_MASK) == 0);
+ 	pxAssert(size > 0 && (size & VTLB_PAGE_MASK) == 0);
+ 
+@@ -1030,6 +1042,9 @@ static void vtlb_RemoveFastmemMappings()
+ 
+ bool vtlb_ResolveFastmemMapping(uptr* addr)
+ {
++	if (!vtlbdata.fastmem_base || s_fastmem_virtual_mapping.empty())
++		return false;
++
+ 	uptr uaddr = *addr;
+ 	uptr fastmem_start = (uptr)vtlbdata.fastmem_base;
+ 	uptr fastmem_end = fastmem_start + 0xFFFFFFFFu;
+@@ -1054,6 +1069,9 @@ bool vtlb_ResolveFastmemMapping(uptr* addr)
+ 
+ bool vtlb_GetGuestAddress(uptr host_addr, u32* guest_addr)
+ {
++	if (!vtlbdata.fastmem_base)
++		return false;
++
+ 	uptr fastmem_start = (uptr)vtlbdata.fastmem_base;
+ 	uptr fastmem_end = fastmem_start + 0xFFFFFFFFu;
+ 	if (host_addr < fastmem_start || host_addr > fastmem_end)
+@@ -1065,7 +1083,7 @@ bool vtlb_GetGuestAddress(uptr host_addr, u32* guest_addr)
+ 
+ void vtlb_UpdateFastmemProtection(u32 paddr, u32 size, PageProtectionMode prot)
+ {
+-	if (!CHECK_FASTMEM)
++	if (!CHECK_FASTMEM || !s_fastmem_area)
+ 		return;
+ 
+ 	pxAssert((paddr & VTLB_PAGE_MASK) == 0);
+@@ -1114,6 +1132,9 @@ void vtlb_AddLoadStoreInfo(uptr code_address, u32 code_size, u32 guest_pc, u32 g
+ 
+ bool vtlb_BackpatchLoadStore(uptr code_address, uptr fault_address)
+ {
++	if (!vtlbdata.fastmem_base)
++		return false;
++
+ 	uptr fastmem_start = (uptr)vtlbdata.fastmem_base;
+ 	uptr fastmem_end = fastmem_start + 0xFFFFFFFFu;
+ 	if (fault_address < fastmem_start || fault_address > fastmem_end)
+@@ -1296,7 +1317,7 @@ void vtlb_ResetFastmem()
+ 	s_fastmem_backpatch_info.clear();
+ 	s_fastmem_faulting_pcs.clear();
+ 
+-	if (!CHECK_FASTMEM || !CHECK_EEREC || !vtlbdata.vmap)
++	if (!CHECK_FASTMEM || !CHECK_EEREC || !vtlbdata.vmap || !s_fastmem_area)
+ 		return;
+ 
+ 	// we need to go through and look at the vtlb pointers, to remap the host area
+@@ -1332,6 +1353,11 @@ bool vtlb_Core_Alloc()
+ 	vtlbdata.vmap = reinterpret_cast<VTLBVirtual*>(SysMemory::GetVTLBVirtualMap());
+ 
+ 	pxAssert(!s_fastmem_area);
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++	// Stock iOS without extended-virtual-addressing cannot reserve a contiguous 4 GiB fastmem region,
++	// and interpreter mode never uses fastmem. Leave fastmem unallocated cleanly.
++	vtlbdata.fastmem_base = 0;
++#else
+ 	s_fastmem_area = SharedMemoryMappingArea::Create(FASTMEM_AREA_SIZE);
+ 	if (!s_fastmem_area)
+ 	{
+@@ -1343,6 +1369,7 @@ bool vtlb_Core_Alloc()
+ 	vtlbdata.fastmem_base = (uptr)s_fastmem_area->BasePointer();
+ 	DevCon.WriteLn(Color_StrongGreen, "Fastmem area: %p - %p",
+ 		vtlbdata.fastmem_base, vtlbdata.fastmem_base + (FASTMEM_AREA_SIZE - 1));
++#endif
+ 
+ 	Error error;
+ 	if (!PageFaultHandler::Install(&error))
