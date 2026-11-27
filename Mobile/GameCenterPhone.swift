@@ -286,7 +286,7 @@ private struct LibraryView: View {
             }
             .onChange(of: snapshot.selectedEntry?.id) { _, _ in
                 if let entry = snapshot.selectedEntry {
-                    Task { await lookupMetadata(entry) }
+                    metadata.prioritize(lookupTarget(for: entry))
                 }
             }
             .onChange(of: snapshot.visibleEntries.map(\.id)) { _, ids in
@@ -405,12 +405,13 @@ private struct LibraryView: View {
         ZStack {
             Color(white: 0.045)
             if let entry = selectedEntry, let image = backdropImage(for: entry) {
+                let shouldBlur = !MetadataRefreshPolicy.isWideImage(width: image.size.width, height: image.size.height) && isLandscape
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
                     .frame(width: size.width, height: size.height)
-                    .blur(radius: image.size.width < image.size.height && isLandscape ? 18 : 2)
-                    .scaleEffect(1.06)
+                    .scaleEffect(shouldBlur ? 1.12 : 1.0)
+                    .blur(radius: shouldBlur ? 18 : 0)
                     .clipped()
                     .transition(.opacity)
             } else if let entry = selectedEntry {
@@ -529,6 +530,10 @@ private struct LibraryView: View {
                 Toggle("隐藏空平台", isOn: $hideEmptyPlatforms)
                 Button("刷新游戏库", systemImage: "arrow.clockwise") {
                     Task { await refresh() }
+                }
+                Button("刷新全部游戏资料", systemImage: "photo.on.rectangle.angled") {
+                    let targets = makeSnapshot().allEntries.map(lookupTarget)
+                    metadata.enqueueMissing(for: targets, force: true)
                 }
                 Button("同步存档 (iCloud)", systemImage: "arrow.triangle.2.circlepath.icloud") {
                     showingSaveSync = true
@@ -1361,7 +1366,7 @@ private struct LibraryView: View {
         }
     }
 
-    private func lookupMetadata(_ entry: Entry, force: Bool = false) async {
+    private func lookupTarget(for entry: Entry) -> PhoneGameMetadata.LookupTarget {
         let source: URL?
         let titleID: String?
         switch entry {
@@ -1370,9 +1375,27 @@ private struct LibraryView: View {
             titleID = nil
         case let .console(game):
             source = library?.switchRoot.appendingPathComponent(game.id)
-            titleID = game.id
+            titleID = MetadataRefreshPolicy.normalizedSwitchTitleID(game.id)
         }
-        await metadata.lookup(id: entry.id, title: entry.title, platformID: entry.platformID, source: source, titleID: titleID, force: force)
+        return PhoneGameMetadata.LookupTarget(
+            id: entry.id,
+            title: entry.title,
+            platformID: entry.platformID,
+            source: source,
+            titleID: titleID
+        )
+    }
+
+    private func lookupMetadata(_ entry: Entry, force: Bool = false) async {
+        let target = lookupTarget(for: entry)
+        await metadata.lookup(
+            id: target.id,
+            title: target.title,
+            platformID: target.platformID,
+            source: target.source,
+            titleID: target.titleID,
+            force: force
+        )
     }
 
     // MARK: - Gamepad Binding
@@ -1443,6 +1466,11 @@ private struct LibraryView: View {
                 activeFilter = .platform(firstPlatform.id)
             }
             if selectedEntryID == nil { selectedEntryID = visibleEntries.first?.id }
+            let snapshot = makeSnapshot()
+            if let selected = snapshot.selectedEntry {
+                metadata.prioritize(lookupTarget(for: selected))
+            }
+            metadata.enqueueMissing(for: snapshot.allEntries.map(lookupTarget))
             if let error = data.3 { notice = error }
         } catch {
             notice = error.localizedDescription

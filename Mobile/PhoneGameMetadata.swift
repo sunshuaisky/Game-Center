@@ -5,12 +5,21 @@ import UIKit
 
 @MainActor
 final class PhoneGameMetadata: ObservableObject {
+    struct LookupTarget: Sendable {
+        let id: String
+        let title: String
+        let platformID: String
+        let source: URL?
+        let titleID: String?
+    }
+
     struct Record: Codable {
         var title: String?
         var synopsis: String?
         var source: String?
         var cover: String?
         var backdrop: String?
+        var status: String?
         var language: String
         var updated: Date
     }
@@ -31,6 +40,15 @@ final class PhoneGameMetadata: ObservableObject {
     }()
     private var inFlightImages: Set<String> = []
 
+    private struct QueueJob {
+        let target: LookupTarget
+        let language: String
+        let force: Bool
+    }
+    private var queue: [QueueJob] = []
+    private var queuedIDs: Set<String> = []
+    private var activeWorkers = 0
+
     init(service: GameMetadataService = GameMetadataService()) {
         self.service = service
         let indexURL = root.appendingPathComponent("index.json")
@@ -48,7 +66,7 @@ final class PhoneGameMetadata: ObservableObject {
         if let cached = imageCache.object(forKey: variantKey as NSString) {
             return cached
         }
-        preloadImage(file: file, variantKey: variantKey, maxPixelSize: backdrop ? 1280 : 480)
+        preloadImage(file: file, variantKey: variantKey, maxPixelSize: backdrop ? 1920 : 512)
         return nil
     }
 
@@ -90,79 +108,231 @@ final class PhoneGameMetadata: ObservableObject {
         return UIImage(named: name)
     }
 
-    private func applyText(_ result: GameMetadataResult, id: String, language: String) async {
-        var record = records[id] ?? Record(language: language, updated: .distantPast)
-        if let title = result.title { record.title = title }
-        if let synopsis = result.synopsis { record.synopsis = synopsis }
-        if let source = result.metadataSourceURL { record.source = source }
-        var updated = records
-        updated[id] = record
-        records = updated
+    private func needsRefresh(id: String, language: String) -> Bool {
+        let fm = FileManager.default
+        guard let record = records[id] else { return true }
+        let hasCover = record.cover.map { fm.fileExists(atPath: root.appendingPathComponent($0).path) } ?? false
+        let hasBackdrop = record.backdrop.map { fm.fileExists(atPath: root.appendingPathComponent($0).path) } ?? false
+        let effectiveStatus = record.status ?? ((record.synopsis != nil || hasCover || hasBackdrop) ? "found" : nil)
+        return MetadataRefreshPolicy.needsRefresh(
+            status: effectiveStatus,
+            savedLanguage: record.language,
+            language: language,
+            hasSynopsis: record.synopsis?.isEmpty == false,
+            hasArtwork: hasCover,
+            hasBackdrop: hasBackdrop,
+            updated: record.updated
+        )
+    }
+
+    /// Enqueues missing or outdated metadata across all games using the exact same
+    /// refresh policy and bounded background workers as macOS.
+    func enqueueMissing(for targets: [LookupTarget], force: Bool = false) {
+        let language = MetadataRefreshPolicy.preferredLanguage()
+        var effectiveForce = force
+        if UserDefaults.standard.integer(forKey: MetadataRefreshPolicy.queryVersionDefaultsKey) < MetadataRefreshPolicy.currentQueryVersion {
+            UserDefaults.standard.set(MetadataRefreshPolicy.currentQueryVersion, forKey: MetadataRefreshPolicy.queryVersionDefaultsKey)
+            effectiveForce = true
+        }
+        for target in targets {
+            enqueue(target, language: language, force: effectiveForce, prioritize: false)
+        }
+        processQueue()
+    }
+
+    /// Prioritizes a specific game (e.g. currently selected or opened in detail sheet)
+    /// to the front of the background lookup queue.
+    func prioritize(_ target: LookupTarget, force: Bool = false) {
+        let language = MetadataRefreshPolicy.preferredLanguage()
+        enqueue(target, language: language, force: force, prioritize: true)
+        processQueue()
+    }
+
+    private func enqueue(_ target: LookupTarget, language: String, force: Bool, prioritize: Bool) {
+        guard GameMetadataPlatform(platformID: target.platformID) != nil else { return }
+        guard !searching.contains(target.id) else { return }
+        if !force && !needsRefresh(id: target.id, language: language) { return }
+
+        if queuedIDs.contains(target.id) {
+            if prioritize, let idx = queue.firstIndex(where: { $0.target.id == target.id }) {
+                let existing = queue.remove(at: idx)
+                let upgraded = QueueJob(target: target, language: language, force: existing.force || force)
+                queue.insert(upgraded, at: 0)
+            }
+            return
+        }
+
+        let job = QueueJob(target: target, language: language, force: force)
+        queuedIDs.insert(target.id)
+        if prioritize {
+            queue.insert(job, at: 0)
+        } else {
+            queue.append(job)
+        }
+    }
+
+    private func processQueue() {
+        while activeWorkers < 2, !queue.isEmpty {
+            activeWorkers += 1
+            Task { [weak self] in
+                guard let self else { return }
+                defer {
+                    self.activeWorkers -= 1
+                    self.processQueue()
+                }
+                while !self.queue.isEmpty {
+                    let job = self.queue.removeFirst()
+                    self.queuedIDs.remove(job.target.id)
+                    await self.performLookup(target: job.target, language: job.language, force: job.force)
+                }
+            }
+        }
+    }
+
+    func lookup(id: String, title: String, platformID: String, source: URL?, titleID: String?, force: Bool = false) async {
+        let language = MetadataRefreshPolicy.preferredLanguage()
+        let target = LookupTarget(id: id, title: title, platformID: platformID, source: source, titleID: titleID)
+        await performLookup(target: target, language: language, force: force)
+    }
+
+    private func persistIndex() async {
         let rootDir = root
-        let snapshot = updated
+        let snapshot = records
         do {
             try await Task.detached(priority: .utility) {
                 try FileManager.default.createDirectory(at: rootDir, withIntermediateDirectories: true)
                 try JSONEncoder().encode(snapshot).write(to: rootDir.appendingPathComponent("index.json"), options: .atomic)
             }.value
         } catch {
-            messages[id] = "保存游戏信息失败：" + error.localizedDescription
+            // Non-fatal: caller reports errors when saving final record.
         }
     }
 
-    func lookup(id: String, title: String, platformID: String, source: URL?, titleID: String?, force: Bool = false) async {
-        guard !searching.contains(id), let platform = GameMetadataPlatform(platformID: platformID) else { return }
-        let preferred = Locale.preferredLanguages.first?.lowercased() ?? "en"
-        let language = preferred.hasPrefix("zh") ? "zh" : preferred.hasPrefix("ja") ? "ja" : "en"
-        if !force, let cached = records[id], cached.language == language,
-           cached.updated > Date.now.addingTimeInterval(-86400) { return }
+    private func applyText(_ result: GameMetadataResult, id: String, language: String) async {
+        var record = records[id] ?? Record(status: "searching", language: language, updated: .distantPast)
+        if let title = result.title { record.title = title }
+        if let synopsis = result.synopsis { record.synopsis = synopsis }
+        if let source = result.metadataSourceURL { record.source = source }
+        var updated = records
+        updated[id] = record
+        records = updated
+        await persistIndex()
+    }
+
+    private func applyBackdrop(_ data: Data, id: String, language: String) async {
+        guard MetadataRefreshPolicy.isValidImageData(data) else { return }
+        let rootDir = root
+        let oldBackdrop = records[id]?.backdrop
+        let newFile: String? = try? await Task.detached(priority: .utility) {
+            try FileManager.default.createDirectory(at: rootDir, withIntermediateDirectories: true)
+            let stem = SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined() + "-" + UUID().uuidString
+            let file = stem + "-backdrop.image"
+            try data.write(to: rootDir.appendingPathComponent(file), options: .atomic)
+            return file
+        }.value
+        guard let newFile else { return }
+
+        var record = records[id] ?? Record(status: "searching", language: language, updated: .distantPast)
+        record.backdrop = newFile
+        var updated = records
+        updated[id] = record
+        records = updated
+        if let oldBackdrop, oldBackdrop != newFile {
+            imageCache.removeObject(forKey: ("bg:" + oldBackdrop) as NSString)
+            let staleURL = rootDir.appendingPathComponent(oldBackdrop)
+            Task.detached(priority: .utility) { try? FileManager.default.removeItem(at: staleURL) }
+        }
+        imageRevision &+= 1
+        await persistIndex()
+    }
+
+    private func performLookup(target: LookupTarget, language: String, force: Bool) async {
+        let id = target.id
+        guard !searching.contains(id), let platform = GameMetadataPlatform(platformID: target.platformID) else { return }
+        if !force && !needsRefresh(id: id, language: language) { return }
+
         searching.insert(id)
         messages[id] = nil
+        if var existing = records[id] {
+            existing.status = "searching"
+            var updated = records
+            updated[id] = existing
+            records = updated
+        }
         defer { searching.remove(id) }
 
         let result = await service.lookup(
-            title: title,
+            title: target.title,
             platform: platform,
             language: language,
-            sourceURL: source,
-            titleID: titleID,
+            sourceURL: target.source,
+            titleID: MetadataRefreshPolicy.normalizedSwitchTitleID(target.titleID),
             onText: { [weak self] partial in
                 await self?.applyText(partial, id: id, language: language)
+            },
+            onBackdrop: { [weak self] data in
+                await self?.applyBackdrop(data, id: id, language: language)
             }
         )
+
+        let rootDir = root
+        let existingRecord = records[id]
         guard result.hasMetadata else {
+            var record = existingRecord ?? Record(status: "notFound", language: language, updated: .now)
+            record.status = (record.synopsis != nil || record.cover != nil || record.backdrop != nil) ? "found" : "notFound"
+            record.language = language
+            record.updated = .now
+            var updated = records
+            updated[id] = record
+            records = updated
+            await persistIndex()
             messages[id] = "暂未查到游戏信息，请检查网络或稍后重试。已有信息会保留。"
             return
         }
-        let rootDir = root
-        let existingRecord = records[id]
+
+        let existingBackdropFile = existingRecord?.backdrop
         do {
-            let (newCover, newBackdrop) = try await Task.detached(priority: .utility) { () throws -> (String?, String?) in
-                try FileManager.default.createDirectory(at: rootDir, withIntermediateDirectories: true)
-                let stem = SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined() + "-" + UUID().uuidString
+            struct WrittenMedia {
                 var coverFile: String?
                 var backdropFile: String?
-                if let image = result.artworkData, CGImageSourceCreateWithData(image as CFData, nil) != nil {
+                var clearExistingBackdrop = false
+            }
+            let written = try await Task.detached(priority: .utility) { () throws -> WrittenMedia in
+                try FileManager.default.createDirectory(at: rootDir, withIntermediateDirectories: true)
+                let stem = SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined() + "-" + UUID().uuidString
+                var media = WrittenMedia()
+                if let image = result.artworkData, MetadataRefreshPolicy.isValidImageData(image) {
                     let file = stem + "-cover.image"
                     try image.write(to: rootDir.appendingPathComponent(file), options: .atomic)
-                    coverFile = file
+                    media.coverFile = file
                 }
-                if let image = result.backdropData, CGImageSourceCreateWithData(image as CFData, nil) != nil {
+                if let image = result.backdropData, MetadataRefreshPolicy.isValidImageData(image) {
                     let file = stem + "-backdrop.image"
                     try image.write(to: rootDir.appendingPathComponent(file), options: .atomic)
-                    backdropFile = file
+                    media.backdropFile = file
+                } else if let existingBackdropFile {
+                    let existingURL = rootDir.appendingPathComponent(existingBackdropFile)
+                    if !MetadataRefreshPolicy.isAcceptableBackdrop(at: existingURL) {
+                        media.clearExistingBackdrop = true
+                    }
                 }
-                return (coverFile, backdropFile)
+                return media
             }.value
 
-            var record = existingRecord ?? Record(language: language, updated: .now)
+            var record = records[id] ?? Record(language: language, updated: .now)
             if let title = result.title { record.title = title }
             if let synopsis = result.synopsis { record.synopsis = synopsis }
             if let source = result.metadataSourceURL { record.source = source }
-            if let newCover { record.cover = newCover }
-            if let newBackdrop { record.backdrop = newBackdrop }
+            if let newCover = written.coverFile { record.cover = newCover }
+            if let newBackdrop = written.backdropFile {
+                record.backdrop = newBackdrop
+            } else if written.clearExistingBackdrop {
+                record.backdrop = nil
+            }
+            record.status = "found"
             record.language = language
             record.updated = .now
+
             let old = records[id]
             var updated = records
             updated[id] = record
@@ -179,8 +349,17 @@ final class PhoneGameMetadata: ObservableObject {
                     try? FileManager.default.removeItem(at: rootDir.appendingPathComponent(file))
                 }
             }.value
+            imageRevision &+= 1
             messages[id] = "游戏信息已更新"
         } catch {
+            var record = records[id] ?? Record(status: "error", language: language, updated: .now)
+            record.status = record.synopsis == nil ? "error" : "found"
+            record.language = language
+            record.updated = .now
+            var updated = records
+            updated[id] = record
+            records = updated
+            await persistIndex()
             messages[id] = "保存游戏信息失败：" + error.localizedDescription
         }
     }

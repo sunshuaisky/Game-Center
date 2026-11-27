@@ -21,9 +21,11 @@ for item in json.loads(pathlib.Path(sys.argv[1]).read_bytes()):
         key = str(uuid.UUID(item['id'])).upper()
     except (ValueError, KeyError):
         continue
-    source = artwork / (key + '.jpg')
-    if source.is_file():
-        jobs.append((source, destination / (key + '.jpg')))
+    for ext in ('.jpg', '.jpeg', '.png', '.webp'):
+        source = artwork / (key + ext)
+        if source.is_file():
+            jobs.append((source, destination / (key + '.jpg')))
+            break
 if jobs:
     destination.mkdir(exist_ok=True)
     def resize(pair):
@@ -93,7 +95,7 @@ xcrun --sdk "$sdk" clang -target "$target" -isysroot "$sdk_path" -fobjc-arc -O2 
   -c "$root/Mobile/S2ArmRuntime.m" -o "$work/S2ArmRuntime.o"
 xcrun --sdk "$sdk" swiftc -target "$target" -sdk "$sdk_path" -O -parse-as-library "${swift_flags[@]}" \
   -import-objc-header "$work/GameCenter-Bridging.h" \
-  "$root/Sources/GameCenter/GameMetadataPlatform.swift" "$root/Sources/GameCenter/GameTitleMatcher.swift" "$root/Sources/GameCenter/GameMetadataService.swift" "$root/Sources/GameCenterSaveSupport/GameSaveLayout.swift" "$root/Sources/GameCenter/MobileLibraryFormat.swift" "$root/Sources/GameCenter/CloudSaveSyncView.swift" "$root/Sources/GameCenter/CloudSaveDirectorySync.swift" "$root/Sources/GameCenter/CloudSaveLocation.swift" "$root"/Mobile/*.swift "$work/RetroCore.o" "$work/NXShellMain.o" "$work/S2ArmRuntime.o" \
+  "$root/Sources/GameCenter/GameMetadataPlatform.swift" "$root/Sources/GameCenter/GameTitleMatcher.swift" "$root/Sources/GameCenter/MetadataRefreshPolicy.swift" "$root/Sources/GameCenter/GameMetadataService.swift" "$root/Sources/GameCenterSaveSupport/GameSaveLayout.swift" "$root/Sources/GameCenter/MobileLibraryFormat.swift" "$root/Sources/GameCenter/CloudSaveSyncView.swift" "$root/Sources/GameCenter/CloudSaveDirectorySync.swift" "$root/Sources/GameCenter/CloudSaveLocation.swift" "$root"/Mobile/*.swift "$work/RetroCore.o" "$work/NXShellMain.o" "$work/S2ArmRuntime.o" \
   -o "$binary"
 
 printf 'GC_MOBILE_STAGE\t4\t正在准备 iOS 模拟器核心，首次生成需要下载\n'

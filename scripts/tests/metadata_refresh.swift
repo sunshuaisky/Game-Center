@@ -14,6 +14,16 @@ import Foundation
         precondition(needs(status: "error"), "Retry stale failures")
         precondition(needs(updated: now, status: "searching"), "Resume an interrupted request on next launch")
         precondition(needs(language: "en"), "Refresh a different language")
-        print("PASS: partial success completion, complete cache retention, retry backoff, stale errors, interrupted work, language change")
+        precondition(MetadataRefreshPolicy.normalizedSwitchTitleID("01008cf01baac000") == "01008CF01BAAC000")
+        precondition(MetadataRefreshPolicy.normalizedSwitchTitleID("1F140E62-99BA-4D4B-AB35-91F2A7CDFF9B") == nil)
+        precondition(MetadataRefreshPolicy.isAcceptableBackdrop(width: 1920, height: 1080))
+        precondition(!MetadataRefreshPolicy.isAcceptableBackdrop(width: 400, height: 240))
+        precondition(!MetadataRefreshPolicy.isAcceptableBackdrop(width: 600, height: 900))
+        precondition(MetadataRefreshPolicy.isWideImage(width: 1280, height: 720))
+        precondition(!MetadataRefreshPolicy.isWideImage(width: 600, height: 900))
+        precondition(MetadataRefreshPolicy.preferredLanguage(from: ["zh-Hans-CN"]) == "zh")
+        precondition(MetadataRefreshPolicy.preferredLanguage(from: ["ja-JP"]) == "ja")
+        precondition(MetadataRefreshPolicy.preferredLanguage(from: ["en-US"]) == "en")
+        print("PASS: partial success completion, complete cache retention, retry backoff, stale errors, interrupted work, language change, TitleID validation, backdrop rules")
     }
 }

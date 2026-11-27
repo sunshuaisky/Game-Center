@@ -85,7 +85,7 @@ fi
 mkdir -p "$MOBILE_BUILD/Sources/GameCenterSaveSupport"
 cp "$ROOT_DIR/Sources/GameCenterSaveSupport/GameSaveLayout.swift" "$MOBILE_BUILD/Sources/GameCenterSaveSupport/"
 cp "$ROOT_DIR/Sources/GameCenter/MobileLibraryFormat.swift" "$MOBILE_BUILD/Sources/GameCenter/"
-cp "$ROOT_DIR/Sources/GameCenter/GameMetadataPlatform.swift" "$ROOT_DIR/Sources/GameCenter/GameTitleMatcher.swift" "$ROOT_DIR/Sources/GameCenter/GameMetadataService.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveSyncView.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveDirectorySync.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveLocation.swift" "$MOBILE_BUILD/Sources/GameCenter/"
+cp "$ROOT_DIR/Sources/GameCenter/GameMetadataPlatform.swift" "$ROOT_DIR/Sources/GameCenter/GameTitleMatcher.swift" "$ROOT_DIR/Sources/GameCenter/MetadataRefreshPolicy.swift" "$ROOT_DIR/Sources/GameCenter/GameMetadataService.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveSyncView.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveDirectorySync.swift" "$ROOT_DIR/Sources/GameCenter/CloudSaveLocation.swift" "$MOBILE_BUILD/Sources/GameCenter/"
 
 cat > "$APP_PATH/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

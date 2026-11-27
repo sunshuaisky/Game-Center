@@ -222,7 +222,7 @@ struct GameArtwork: View {
     }
 
     nonisolated private static func isWide(_ image: NSImage) -> Bool {
-        image.size.height > 0 && image.size.width / image.size.height >= 1.3
+        MetadataRefreshPolicy.isWideImage(width: image.size.width, height: image.size.height)
     }
 
     nonisolated private static func resolvedBookmark(_ bookmark: Data) -> URL? {

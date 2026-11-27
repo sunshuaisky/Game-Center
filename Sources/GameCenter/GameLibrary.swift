@@ -214,24 +214,8 @@ final class GameLibrary: ObservableObject {
     func refreshMissingMetadata(language: String) {
         preferredMetadataLanguage = language
         var enqueuedAny = false
-        if UserDefaults.standard.integer(forKey: "metadataMatchingVersion") < 11 {
-            UserDefaults.standard.set(11, forKey: "metadataMatchingVersion")
-            for game in games {
-                refreshMetadata(for: game.id, language: language, force: true, persist: false)
-                enqueuedAny = true
-            }
-        }
-        let switch2MetadataVersionKey = "switch2MetadataVersion"
-        if UserDefaults.standard.integer(forKey: switch2MetadataVersionKey) < 5 {
-            UserDefaults.standard.set(5, forKey: switch2MetadataVersionKey)
-            for game in games where game.platform == .switchConsole {
-                refreshMetadata(for: game.id, language: language, force: true, persist: false)
-                enqueuedAny = true
-            }
-        }
-        let artworkQualityKey = "artworkQualityVersion"
-        if UserDefaults.standard.integer(forKey: artworkQualityKey) < 15 {
-            UserDefaults.standard.set(15, forKey: artworkQualityKey)
+        if UserDefaults.standard.integer(forKey: MetadataRefreshPolicy.queryVersionDefaultsKey) < MetadataRefreshPolicy.currentQueryVersion {
+            UserDefaults.standard.set(MetadataRefreshPolicy.currentQueryVersion, forKey: MetadataRefreshPolicy.queryVersionDefaultsKey)
             for game in games {
                 refreshMetadata(for: game.id, language: language, force: true, persist: false)
                 enqueuedAny = true
@@ -264,11 +248,20 @@ final class GameLibrary: ObservableObject {
                         activeMetadataLookups.remove(job.id)
                         continue
                     }
+                    let sourceURL = try? game.resolvedURL()
+                    let titleID = game.platform == .switchConsole
+                        ? sourceURL.flatMap(GameDirectoryScanner.switchTitleID)
+                        : nil
+                    guard let platform = GameMetadataPlatform(platformID: game.platform.rawValue) else {
+                        activeMetadataLookups.remove(job.id)
+                        continue
+                    }
                     let result = await metadataService.lookup(
                         title: game.displayTitle,
-                        platform: GameMetadataPlatform(rawValue: game.platform.rawValue)!,
+                        platform: platform,
                         language: job.language,
-                        sourceURL: try? game.resolvedURL(),
+                        sourceURL: sourceURL,
+                        titleID: titleID,
                         onText: { partial in await self.applyText(partial, to: job.id, language: job.language) },
                         onBackdrop: { data in await self.applyBackdrop(data, to: job.id, language: job.language) }
                     )
@@ -282,7 +275,9 @@ final class GameLibrary: ObservableObject {
     }
 
     private func applyBackdrop(_ data: Data, to id: UUID, language: String) async {
-        guard preferredMetadataLanguage == language, games.contains(where: { $0.id == id }) else { return }
+        guard preferredMetadataLanguage == language,
+              MetadataRefreshPolicy.isValidImageData(data),
+              games.contains(where: { $0.id == id }) else { return }
         let dir = artworkDirectory
         let url = dir.appendingPathComponent(id.uuidString + "-backdrop.jpg")
         do {
@@ -311,6 +306,7 @@ final class GameLibrary: ObservableObject {
         defer { activeMetadataLookups.remove(id) }
         guard let initialIndex = games.firstIndex(where: { $0.id == id }) else { return }
         let dir = artworkDirectory
+        let existingArtwork = games[initialIndex].metadataArtworkPath
         let existingBackdrop = games[initialIndex].metadataBackdropPath
 
         struct DiskMediaResult {
@@ -324,7 +320,7 @@ final class GameLibrary: ObservableObject {
         let media = await Task.detached(priority: .utility) { () -> DiskMediaResult in
             let fm = FileManager.default
             var outcome = DiskMediaResult()
-            if let artworkData = result.artworkData {
+            if let artworkData = result.artworkData, MetadataRefreshPolicy.isValidImageData(artworkData) {
                 let requestedExtension = result.artworkExtension?.lowercased() ?? ""
                 let fileExtension = ["png", "jpg", "jpeg", "webp"].contains(requestedExtension) ? requestedExtension : "png"
                 let artworkURL = dir.appendingPathComponent(id.uuidString).appendingPathExtension(fileExtension)
@@ -332,11 +328,14 @@ final class GameLibrary: ObservableObject {
                     try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: nil)
                     try artworkData.write(to: artworkURL, options: .atomic)
                     outcome.artworkPath = artworkURL.path
+                    if let existingArtwork, existingArtwork != artworkURL.path {
+                        try? fm.removeItem(atPath: existingArtwork)
+                    }
                 } catch {
                     outcome.artworkFailed = true
                 }
             }
-            if let backdropData = result.backdropData {
+            if let backdropData = result.backdropData, MetadataRefreshPolicy.isValidImageData(backdropData) {
                 let backdropURL = dir.appendingPathComponent(id.uuidString + "-backdrop").appendingPathExtension("jpg")
                 do {
                     try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: nil)
@@ -346,16 +345,8 @@ final class GameLibrary: ObservableObject {
                     outcome.backdropFailed = true
                 }
             } else if let existingBackdrop {
-                // Clear stale low-res (< 960x540) backdrop so GameArtwork falls back to softly blurred HD box art.
-                let isTooSmall: Bool = {
-                    let url = URL(fileURLWithPath: existingBackdrop)
-                    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-                          let w = props[kCGImagePropertyPixelWidth] as? Int,
-                          let h = props[kCGImagePropertyPixelHeight] as? Int else { return true }
-                    return w < 960 || h < 540
-                }()
-                if isTooSmall {
+                // Clear stale low-res backdrop so GameArtwork falls back to softly blurred HD box art.
+                if !MetadataRefreshPolicy.isAcceptableBackdrop(at: URL(fileURLWithPath: existingBackdrop)) {
                     try? fm.removeItem(atPath: existingBackdrop)
                     outcome.clearExistingBackdrop = true
                 }

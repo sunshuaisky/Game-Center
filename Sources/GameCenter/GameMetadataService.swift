@@ -9,6 +9,27 @@ struct GameMetadataResult: Sendable {
     let artworkExtension: String?
     let artworkSourceURL: String?
     let backdropData: Data?
+    let backdropSourceURL: String?
+
+    init(
+        title: String?,
+        synopsis: String?,
+        metadataSourceURL: String?,
+        artworkData: Data?,
+        artworkExtension: String?,
+        artworkSourceURL: String?,
+        backdropData: Data?,
+        backdropSourceURL: String? = nil
+    ) {
+        self.title = title
+        self.synopsis = synopsis
+        self.metadataSourceURL = metadataSourceURL
+        self.artworkData = artworkData
+        self.artworkExtension = artworkExtension
+        self.artworkSourceURL = artworkSourceURL
+        self.backdropData = backdropData
+        self.backdropSourceURL = backdropSourceURL
+    }
 
     var hasMetadata: Bool {
         title != nil || synopsis != nil || artworkData != nil || backdropData != nil
@@ -29,14 +50,15 @@ actor GameMetadataService {
         configuration.waitsForConnectivity = false
         return URLSession(configuration: configuration)
     }()
+
     init(session: URLSession? = nil, trace: @escaping @Sendable (String) -> Void = { _ in }) {
-        self.session = session ?? Self.networkSession; self.trace = trace
+        self.session = session ?? Self.networkSession
+        self.trace = trace
     }
-    private var artworkCatalogs: [GameMetadataPlatform: [(filename: String, normalized: String)]] = [:]
-    private var artworkCatalogTasks: [GameMetadataPlatform: Task<[(filename: String, normalized: String)], Never>] = [:]
-    // Base URL each cached filename resolves against — the libretro index or
-    // its jsDelivr mirror, whichever produced the catalog.
-    private var artworkCatalogSources: [GameMetadataPlatform: URL] = [:]
+
+    private var artworkCatalogs: [String: [(filename: String, normalized: String)]] = [:]
+    private var artworkCatalogTasks: [String: Task<[(filename: String, normalized: String)], Never>] = [:]
+    private var artworkCatalogSources: [String: URL] = [:]
     private var gameTDBCatalogs: [String: [(id: String, title: String, normalized: String)]] = [:]
     private var gameTDBCatalogTasks: [String: Task<[(id: String, title: String, normalized: String)], Never>] = [:]
     private var switchCatalogs: [String: [(id: String, title: String, normalized: String)]] = [:]
@@ -44,13 +66,26 @@ actor GameMetadataService {
 
     private static let boxartHrefRegex = try! NSRegularExpression(pattern: #"href=[\"']([^\"']+\.png)[\"']"#, options: [.caseInsensitive])
     private static let whitespaceRegex = try! NSRegularExpression(pattern: #"\s+"#)
+    private static let browserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+    private static let bangumiUserAgent = "GameCenter/0.2 (https://github.com/phoenixicarus/gamecenter)"
+    private static let baikeUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
-    func lookup(title: String, platform: GameMetadataPlatform, language: String, sourceURL: URL?, titleID explicitTitleID: String? = nil, onText: @escaping @Sendable (GameMetadataResult) async -> Void = { _ in }, onBackdrop: @escaping @Sendable (Data) async -> Void = { _ in }) async -> GameMetadataResult {
+    func lookup(
+        title: String,
+        platform: GameMetadataPlatform,
+        language: String,
+        sourceURL: URL?,
+        titleID explicitTitleID: String? = nil,
+        onText: @escaping @Sendable (GameMetadataResult) async -> Void = { _ in },
+        onBackdrop: @escaping @Sendable (Data) async -> Void = { _ in }
+    ) async -> GameMetadataResult {
+        let localMeta = sourceURL.flatMap { readLocalGameMetadata(from: $0, platform: platform, language: language) }
         let switch2Metadata = platform == .switchConsole
             ? sourceURL.flatMap { readSwitch2ContainerMetadata(from: $0, language: language) }
             : nil
+        let validatedExplicitID = MetadataRefreshPolicy.normalizedSwitchTitleID(explicitTitleID)
         let titleID = platform == .switchConsole
-            ? (explicitTitleID ?? sourceURL.flatMap(switchTitleID(from:)) ?? switch2Metadata?.titleID)
+            ? (validatedExplicitID ?? sourceURL.flatMap(switchTitleID(from:)) ?? switch2Metadata?.titleID)
             : nil
         let knownSwitchMetadata = platform == .switchConsole
             ? knownSwitchGameMetadata(titleID: titleID, title: title, language: language)
@@ -62,64 +97,160 @@ actor GameMetadataService {
         } else {
             codeMetadata = nil
         }
-        let searchTitle = codeMetadata?.title ?? switch2Metadata?.title ?? knownSwitchMetadata?.title ?? filenameTitle ?? title
-        let aliasHint = Self.chineseFranchiseHint(for: [title, filenameTitle, searchTitle].compactMap { $0 }.joined(separator: " "), platform: platform)
+
+        let searchTitle = codeMetadata?.title
+            ?? switch2Metadata?.title
+            ?? knownSwitchMetadata?.title
+            ?? localMeta?.title
+            ?? filenameTitle
+            ?? title
+        let aliasHint = Self.chineseFranchiseHint(
+            for: [title, filenameTitle, searchTitle, localMeta?.title].compactMap { $0 }.joined(separator: " "),
+            platform: platform
+        )
         let effectiveSearchTitle = aliasHint?.zh ?? searchTitle
 
-        async let wikiTask = wikipediaResult(for: effectiveSearchTitle, language: language, localizedTitle: filenameTitle ?? effectiveSearchTitle)
+        // Stage 1: Fetch text/identity metadata + Switch 1080p banner in parallel.
+        async let wikiTask = wikipediaResult(
+            for: effectiveSearchTitle,
+            language: language,
+            localizedTitle: filenameTitle ?? effectiveSearchTitle
+        )
+        async let bangumiTask = bangumiLookup(
+            queries: Self.deduplicatedQueries([aliasHint?.zh, filenameTitle, searchTitle, aliasHint?.en, title]),
+            platform: platform,
+            language: language
+        )
         async let baikeTask = baikeLookupTask(title: effectiveSearchTitle, filenameTitle: filenameTitle, language: language)
         async let bannerTask = switchBanner(titleID: titleID, platform: platform)
 
-        let wiki = await wikiTask
+        var wiki = await wikiTask
+        let bangumi = await bangumiTask
         let baike = await baikeTask
-        let resolvedTitle: String?
-        if language == "en" {
-            resolvedTitle = codeMetadata?.title ?? wiki?.title ?? knownSwitchMetadata?.title ?? switch2Metadata?.title ?? aliasHint?.en
-        } else {
-            resolvedTitle = wiki?.title ?? knownSwitchMetadata?.title ?? switch2Metadata?.title ?? codeMetadata?.title
-                ?? baike?.title ?? aliasHint?.zh
+
+        // Stage 1.5: If Wikipedia missed on the raw/colloquial filename, cross-enrich
+        // using canonical titles discovered by Bangumi or Baidu Baike.
+        if wiki == nil {
+            let enrichmentTitle = bangumi?.englishTitle ?? baike?.latinTitle ?? aliasHint?.en
+            let enrichmentLocalized = bangumi?.chineseTitle ?? baike?.title
+            if let query = enrichmentTitle ?? enrichmentLocalized,
+               normalize(query) != normalize(effectiveSearchTitle) {
+                wiki = await wikipediaResult(for: query, language: language, localizedTitle: enrichmentLocalized)
+            }
         }
-        let resolvedSynopsis: String?
+
+        var resolvedTitle: String?
         if language == "en" {
-            resolvedSynopsis = codeMetadata?.synopsis ?? wiki?.synopsis ?? knownSwitchMetadata?.synopsis
+            resolvedTitle = codeMetadata?.title
+                ?? wiki?.title
+                ?? knownSwitchMetadata?.title
+                ?? switch2Metadata?.title
+                ?? bangumi?.englishTitle
+                ?? aliasHint?.en
+                ?? localMeta?.title
+        } else if language == "ja" {
+            resolvedTitle = wiki?.title
+                ?? codeMetadata?.title
+                ?? knownSwitchMetadata?.title
+                ?? switch2Metadata?.title
+                ?? bangumi?.originalTitle
+                ?? bangumi?.chineseTitle
+                ?? localMeta?.title
         } else {
-            resolvedSynopsis = wiki?.synopsis ?? codeMetadata?.synopsis ?? knownSwitchMetadata?.synopsis
+            resolvedTitle = wiki?.title
+                ?? knownSwitchMetadata?.title
+                ?? switch2Metadata?.title
+                ?? codeMetadata?.title
+                ?? bangumi?.chineseTitle
+                ?? baike?.title
+                ?? aliasHint?.zh
+                ?? localMeta?.title
+        }
+
+        var resolvedSynopsis: String?
+        if language == "en" {
+            resolvedSynopsis = codeMetadata?.synopsis
+                ?? wiki?.synopsis
+                ?? knownSwitchMetadata?.synopsis
+        } else if language == "ja" {
+            resolvedSynopsis = wiki?.synopsis
+                ?? codeMetadata?.synopsis
+                ?? knownSwitchMetadata?.synopsis
+        } else {
+            resolvedSynopsis = wiki?.synopsis
+                ?? codeMetadata?.synopsis
+                ?? knownSwitchMetadata?.synopsis
+                ?? bangumi?.synopsis
                 ?? baike?.synopsis
         }
 
-        let text = GameMetadataResult(title: resolvedTitle, synopsis: resolvedSynopsis,
-            metadataSourceURL: wiki?.pageURL ?? baike?.pageURL.absoluteString ?? codeMetadata?.sourceURL ?? knownSwitchMetadata?.sourceURL,
-            artworkData: nil, artworkExtension: nil, artworkSourceURL: nil, backdropData: nil)
+        var resolvedSourceURL = wiki?.pageURL
+            ?? bangumi?.pageURL
+            ?? baike?.pageURL.absoluteString
+            ?? codeMetadata?.sourceURL
+            ?? knownSwitchMetadata?.sourceURL
 
-        if text.hasMetadata { await onText(text) }
+        let initialText = GameMetadataResult(
+            title: resolvedTitle,
+            synopsis: resolvedSynopsis,
+            metadataSourceURL: resolvedSourceURL,
+            artworkData: nil,
+            artworkExtension: nil,
+            artworkSourceURL: nil,
+            backdropData: nil
+        )
+        if initialText.hasMetadata { await onText(initialText) }
+
         let banner = await bannerTask
         if let banner { await onBackdrop(banner.data) }
 
-        // Build deduplicated Romanized / English title candidates for LaunchBox, GameTDB, Libretro, and Steam.
-        var romanizedCandidates: [String] = []
-        for raw in [aliasHint?.en, wiki?.alternateTitle, baike?.latinTitle, wiki?.title, searchTitle, filenameTitle].compactMap({ $0 }) {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            if !romanizedCandidates.contains(where: { normalize($0) == normalize(trimmed) }) {
-                romanizedCandidates.append(trimmed)
-            }
-        }
-        let englishCandidates = romanizedCandidates.filter { !GameTitleMatcher.hasHan($0) }
+        // Build deduplicated candidates for dedicated game media databases.
+        let cleanWikiAlternate: String? = (wiki?.alternateTitle).map(Self.stripWikipediaDisambiguator)
+        let cleanWikiTitle: String? = wiki.map { Self.stripWikipediaDisambiguator($0.title) }
+        let allCandidates = Self.deduplicatedQueries([
+            aliasHint?.en,
+            cleanWikiAlternate,
+            bangumi?.englishTitle,
+            baike?.latinTitle,
+            codeMetadata?.title,
+            localMeta?.title,
+            cleanWikiTitle,
+            bangumi?.chineseTitle,
+            bangumi?.originalTitle,
+            searchTitle,
+            filenameTitle,
+            title
+        ])
+        let englishCandidates = allCandidates.filter { !GameTitleMatcher.hasHan($0) && !GameTitleMatcher.hasKana($0) }
+        let localizedCandidates = allCandidates.filter { GameTitleMatcher.hasHan($0) || GameTitleMatcher.hasKana($0) }
+        let needsFallbackSynopsis = resolvedSynopsis == nil
 
-        // 1. Query LaunchBox GamesDB (curated per-platform Box-Front + 1080p/4K Fanart-Background)
-        //    and Steam 16:9 HD media in parallel.
+        // Stage 2: Query LaunchBox GamesDB & Steam in parallel.
         async let launchBoxTask: LaunchBoxMediaResult? = {
-            for candidateTitle in englishCandidates.prefix(3) {
-                if let res = await self.launchBoxMedia(for: candidateTitle, platform: platform, language: language) {
+            for candidateTitle in englishCandidates.prefix(4) {
+                if let res = await self.launchBoxMedia(
+                    for: candidateTitle,
+                    platform: platform,
+                    language: language,
+                    fetchSynopsisIfNeeded: needsFallbackSynopsis
+                ) {
                     return res
                 }
             }
             return nil
         }()
+
         async let steamTask: SteamMediaResult? = {
             for candidateTitle in englishCandidates.prefix(3) {
-                if let res = await self.steamMedia(for: candidateTitle, platform: platform) {
+                if let res = await self.steamMedia(for: candidateTitle, platform: platform, language: language) {
                     return res
+                }
+            }
+            if language == "zh" || language == "ja" {
+                for candidateTitle in localizedCandidates.prefix(2) {
+                    if let res = await self.steamMedia(for: candidateTitle, platform: platform, language: language) {
+                        return res
+                    }
                 }
             }
             return nil
@@ -128,75 +259,139 @@ actor GameMetadataService {
         let launchBox = await launchBoxTask
         let steamResult = await steamTask
 
-        // 2. Build dedicated game-database cover candidates first (so movie/anime posters from
-        //    Baidu Baike never override real game box art).
-        var gameCoverCandidates: [DownloadedArtwork] = []
-        if let lbCover = launchBox?.cover { gameCoverCandidates.append(lbCover) }
-        if let steamCover = steamResult?.cover { gameCoverCandidates.append(steamCover) }
-        if let icon = switch2Metadata?.icon { gameCoverCandidates.append(icon) }
+        // Enrich missing title / synopsis from Steam or LaunchBox when encyclopedias missed.
+        var textEnriched = false
+        if resolvedTitle == nil, let fallbackTitle = steamResult?.title ?? launchBox?.title {
+            resolvedTitle = fallbackTitle
+            textEnriched = true
+        }
+        if resolvedSynopsis == nil, let fallbackSynopsis = steamResult?.synopsis ?? launchBox?.synopsis {
+            resolvedSynopsis = fallbackSynopsis
+            textEnriched = true
+        }
+        if resolvedSourceURL == nil {
+            resolvedSourceURL = steamResult?.sourceURL ?? launchBox?.sourceURL
+        }
+        if textEnriched {
+            let enrichedText = GameMetadataResult(
+                title: resolvedTitle,
+                synopsis: resolvedSynopsis,
+                metadataSourceURL: resolvedSourceURL,
+                artworkData: nil,
+                artworkExtension: nil,
+                artworkSourceURL: nil,
+                backdropData: nil
+            )
+            if enrichedText.hasMetadata { await onText(enrichedText) }
+        }
+
+        // Stage 3: Tiered cover selection (dedicated game covers always take priority
+        // over encyclopedia thumbnails so movie/anime posters never replace real box art).
+        var primaryCoverCandidates: [DownloadedArtwork] = []
+        if let lbCover = launchBox?.cover { primaryCoverCandidates.append(lbCover) }
+        if let steamCover = steamResult?.cover { primaryCoverCandidates.append(steamCover) }
+        if let icon = switch2Metadata?.icon { primaryCoverCandidates.append(icon) }
+
         var knownArtwork: DownloadedArtwork?
         if let artworkURL = knownSwitchMetadata?.artworkURL,
-           let data = try? await download(artworkURL) {
-            let downloaded = DownloadedArtwork(data: data, fileExtension: "jpg", sourceURL: artworkURL.absoluteString)
+           let data = try? await download(artworkURL),
+           pixelArea(data) > 0 {
+            let ext = imageExtension(for: data) ?? "jpg"
+            let downloaded = DownloadedArtwork(data: data, fileExtension: ext, sourceURL: artworkURL.absoluteString)
             knownArtwork = downloaded
-            gameCoverCandidates.append(downloaded)
+            primaryCoverCandidates.append(downloaded)
         }
 
-        if gameCoverCandidates.isEmpty {
-            for candidateTitle in romanizedCandidates {
-                if let tdb = await gameTDBBoxart(for: candidateTitle, platform: platform, language: language) {
-                    gameCoverCandidates.append(tdb)
-                    break
+        // Tier 2: Console boxart databases (GameTDB, Libretro Named_Boxarts), secondary LaunchBox, Bangumi game cover.
+        var secondaryCoverCandidates: [DownloadedArtwork] = []
+        if primaryCoverCandidates.isEmpty {
+            // Direct GameTDB lookup by local product ID (e.g., PS3 PARAM.SFO / WiiU meta.xml / filename serial)
+            let directProductID = localMeta?.productID ?? Self.extractGameTDBID(from: sourceURL, title: title, platform: platform)
+            if let directProductID,
+               let directTDB = await gameTDBBoxartByID(directProductID, platform: platform, language: language) {
+                secondaryCoverCandidates.append(directTDB)
+            }
+            if secondaryCoverCandidates.isEmpty {
+                for candidateTitle in allCandidates.prefix(5) {
+                    if let tdb = await gameTDBBoxart(for: candidateTitle, platform: platform, language: language) {
+                        secondaryCoverCandidates.append(tdb)
+                        break
+                    }
                 }
             }
-        }
-        if gameCoverCandidates.isEmpty {
-            for candidateTitle in romanizedCandidates {
-                if let libretroCover = await boxartData(for: candidateTitle, platform: platform, language: language) {
-                    gameCoverCandidates.append(libretroCover)
-                    break
+            if secondaryCoverCandidates.isEmpty {
+                let boxartQueryCandidates = platform == .switchConsole ? allCandidates : englishCandidates + localizedCandidates
+                for candidateTitle in boxartQueryCandidates.prefix(5) {
+                    if let libretroCover = await boxartData(for: candidateTitle, platform: platform, language: language) {
+                        secondaryCoverCandidates.append(libretroCover)
+                        break
+                    }
                 }
+            }
+            if let secondaryLB = launchBox?.secondaryCover {
+                secondaryCoverCandidates.append(secondaryLB)
+            }
+            if let bgmCoverURL = bangumi?.coverURL,
+               let data = try? await download(bgmCoverURL, userAgent: Self.bangumiUserAgent),
+               let dims = pixelDimensions(data),
+               min(dims.width, dims.height) >= MetadataRefreshPolicy.minimumCoverDimension {
+                let ext = imageExtension(for: data) ?? "jpg"
+                secondaryCoverCandidates.append(DownloadedArtwork(data: data, fileExtension: ext, sourceURL: bgmCoverURL.absoluteString))
             }
         }
 
-        // Fallback to encyclopedia / Switch icon only if dedicated game databases had no cover.
+        // Tier 3: Fallbacks only when all dedicated game cover sources missed.
         var fallbackCoverCandidates: [DownloadedArtwork] = []
-        if gameCoverCandidates.isEmpty {
+        if primaryCoverCandidates.isEmpty && secondaryCoverCandidates.isEmpty {
+            if let steamHeader = steamResult?.headerCover {
+                fallbackCoverCandidates.append(steamHeader)
+            }
+            if fallbackCoverCandidates.isEmpty && platform.isRetroConsole {
+                for candidateTitle in englishCandidates.prefix(3) {
+                    if let titleScreen = await libretroMediaData(for: candidateTitle, platform: platform, directory: "Named_Titles") {
+                        fallbackCoverCandidates.append(titleScreen)
+                        break
+                    }
+                }
+            }
             if let artworkURL = wiki?.artworkURL,
-               let data = try? await download(artworkURL) {
-                fallbackCoverCandidates.append(DownloadedArtwork(
-                    data: data,
-                    fileExtension: artworkURL.pathExtension.isEmpty ? "jpg" : artworkURL.pathExtension,
-                    sourceURL: artworkURL.absoluteString
-                ))
+               let data = try? await download(artworkURL),
+               pixelArea(data) > 0 {
+                let ext = imageExtension(for: data) ?? (artworkURL.pathExtension.isEmpty ? "jpg" : artworkURL.pathExtension)
+                fallbackCoverCandidates.append(DownloadedArtwork(data: data, fileExtension: ext, sourceURL: artworkURL.absoluteString))
             }
             if let artworkURL = baike?.artworkURL,
-               let data = try? await download(artworkURL, userAgent: Self.baikeUserAgent) {
-                fallbackCoverCandidates.append(DownloadedArtwork(data: data, fileExtension: "jpg", sourceURL: artworkURL.absoluteString))
+               let data = try? await download(artworkURL, userAgent: Self.baikeUserAgent),
+               pixelArea(data) > 0 {
+                let ext = imageExtension(for: data) ?? "jpg"
+                fallbackCoverCandidates.append(DownloadedArtwork(data: data, fileExtension: ext, sourceURL: artworkURL.absoluteString))
             }
             if fallbackCoverCandidates.isEmpty,
                let iconString = codeMetadata?.iconURL,
                let iconURL = URL(string: iconString),
-               let iconData = try? await download(iconURL) {
-                fallbackCoverCandidates.append(DownloadedArtwork(
-                    data: iconData,
-                    fileExtension: iconURL.pathExtension.isEmpty ? "jpg" : iconURL.pathExtension,
-                    sourceURL: iconURL.absoluteString
-                ))
+               let iconData = try? await download(iconURL),
+               pixelArea(iconData) > 0 {
+                let ext = imageExtension(for: iconData) ?? (iconURL.pathExtension.isEmpty ? "jpg" : iconURL.pathExtension)
+                fallbackCoverCandidates.append(DownloadedArtwork(data: iconData, fileExtension: ext, sourceURL: iconURL.absoluteString))
+            }
+            if fallbackCoverCandidates.isEmpty, let localIcon = localMeta?.icon {
+                fallbackCoverCandidates.append(localIcon)
             }
         }
-        let coverPool = gameCoverCandidates.isEmpty ? fallbackCoverCandidates : gameCoverCandidates
-        let selectedArtwork = coverPool
-            .map { (artwork: $0, area: pixelArea($0.data)) }
-            .max { $0.area < $1.area }?.artwork
 
-        // 3. Select true HD 16:9 backdrop (never stretch tiny 400x240 emulator screenshots).
+        let coverPool = !primaryCoverCandidates.isEmpty
+            ? primaryCoverCandidates
+            : (!secondaryCoverCandidates.isEmpty ? secondaryCoverCandidates : fallbackCoverCandidates)
+        let selectedArtwork = selectBestCover(from: coverPool)
+
+        // Stage 4: Select true HD wide backdrop (never stretch tiny low-res screenshots).
         let knownBackdrop: DownloadedArtwork?
         if let url = knownSwitchMetadata?.backdropURL {
             if let knownArtwork, knownSwitchMetadata?.artworkURL == url {
                 knownBackdrop = knownArtwork
-            } else if let data = try? await download(url) {
-                knownBackdrop = DownloadedArtwork(data: data, fileExtension: "jpg", sourceURL: url.absoluteString)
+            } else if let data = try? await download(url), pixelArea(data) > 0 {
+                let ext = imageExtension(for: data) ?? "jpg"
+                knownBackdrop = DownloadedArtwork(data: data, fileExtension: ext, sourceURL: url.absoluteString)
             } else {
                 knownBackdrop = nil
             }
@@ -204,14 +399,43 @@ actor GameMetadataService {
             knownBackdrop = nil
         }
 
-        var wideArtwork = banner ?? knownBackdrop ?? launchBox?.backdrop ?? steamResult?.backdrop
-        if wideArtwork == nil, let wikiTitle = wiki?.alternateTitle ?? wiki?.title {
-            let wikiLang = wiki?.alternateTitle != nil ? "en" : language
-            wideArtwork = await wikipediaWideImage(for: wikiTitle, language: wikiLang)
+        var wideArtwork = banner
+            ?? knownBackdrop
+            ?? launchBox?.backdrop
+            ?? steamResult?.backdrop
+            ?? localMeta?.backdrop
+            ?? launchBox?.secondaryBackdrop
+
+        if wideArtwork == nil {
+            var wikiImageQueries: [(title: String, lang: String)] = []
+            if let enTitle = wiki?.alternateTitle { wikiImageQueries.append((enTitle, "en")) }
+            if let mainTitle = wiki?.title {
+                let mainLang = GameTitleMatcher.hasHan(mainTitle) ? "zh" : (GameTitleMatcher.hasKana(mainTitle) ? "ja" : "en")
+                if !wikiImageQueries.contains(where: { $0.title == mainTitle && $0.lang == mainLang }) {
+                    wikiImageQueries.append((mainTitle, mainLang))
+                }
+            }
+            for item in wikiImageQueries {
+                if let wide = await wikipediaWideImage(for: item.title, language: item.lang) {
+                    wideArtwork = wide
+                    break
+                }
+            }
         }
         if wideArtwork == nil {
-            wideArtwork = steamResult?.panoramicBackdrop
+            wideArtwork = steamResult?.panoramicBackdrop ?? launchBox?.bannerBackdrop
         }
+        if wideArtwork == nil && platform.isRetroConsole {
+            for candidateTitle in englishCandidates.prefix(2) {
+                if let snap = await libretroMediaData(for: candidateTitle, platform: platform, directory: "Named_Snaps"),
+                   let dims = pixelDimensions(snap.data),
+                   MetadataRefreshPolicy.isAcceptableBackdrop(width: dims.width, height: dims.height) {
+                    wideArtwork = snap
+                    break
+                }
+            }
+        }
+
         if let wide = wideArtwork, banner == nil {
             await onBackdrop(wide.data)
         }
@@ -219,12 +443,58 @@ actor GameMetadataService {
         return GameMetadataResult(
             title: resolvedTitle,
             synopsis: resolvedSynopsis,
-            metadataSourceURL: wiki?.pageURL ?? baike?.pageURL.absoluteString ?? codeMetadata?.sourceURL ?? knownSwitchMetadata?.sourceURL,
+            metadataSourceURL: resolvedSourceURL,
             artworkData: selectedArtwork?.data,
             artworkExtension: selectedArtwork?.fileExtension,
             artworkSourceURL: selectedArtwork?.sourceURL,
-            backdropData: wideArtwork?.data
+            backdropData: wideArtwork?.data,
+            backdropSourceURL: wideArtwork?.sourceURL
         )
+    }
+
+    private func selectBestCover(from candidates: [DownloadedArtwork]) -> DownloadedArtwork? {
+        guard !candidates.isEmpty else { return nil }
+        return candidates.max { lhs, rhs in
+            coverQualityScore(lhs.data) < coverQualityScore(rhs.data)
+        }
+    }
+
+    private func coverQualityScore(_ data: Data) -> Double {
+        guard let dims = pixelDimensions(data) else { return 0 }
+        let area = Double(dims.width * dims.height)
+        let ratio = Double(dims.width) / Double(dims.height)
+        // Prefer vertical/box-art ratios (0.55...1.15) over wide banners for cover tiles.
+        let ratioWeight: Double
+        if (0.55...1.15).contains(ratio) {
+            ratioWeight = 1.25
+        } else if ratio <= 1.5 {
+            ratioWeight = 1.0
+        } else {
+            ratioWeight = 0.72
+        }
+        return area * ratioWeight
+    }
+
+    private static func stripWikipediaDisambiguator(_ value: String) -> String {
+        value.replacingOccurrences(
+            of: #"\s*[\(（][^\)）]*(?:video\s*game|game|游戏|遊戲|ゲーム)[^\)）]*[\)）]\s*$"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func deduplicatedQueries(_ items: [String?]) -> [String] {
+        var result: [String] = []
+        for raw in items.compactMap({ $0 }) {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let norm = GameTitleMatcher.normalize(trimmed)
+            guard !norm.isEmpty else { continue }
+            if !result.contains(where: { GameTitleMatcher.normalize($0) == norm }) {
+                result.append(trimmed)
+            }
+        }
+        return result
     }
 
     private func knownSwitchGameMetadata(titleID: String?, title: String, language: String) -> KnownSwitchGameMetadata? {
@@ -265,10 +535,20 @@ actor GameMetadataService {
             candidates.append(sourceURL.deletingLastPathComponent().lastPathComponent)
         }
 
-        let ignored = Set(["switch", "switch2", "switch 2", "games", "game", "roms", "nup", "nsp", "xci", "nsz", "xcz", "base", "updates", "dlc", "mod"])
+        let ignored = Set([
+            "switch", "switch2", "switch 2", "games", "game", "roms", "gamelibrary",
+            "nup", "nsp", "xci", "nsz", "xcz", "base", "updates", "dlc", "mod",
+            "gba", "gb", "gbc", "nds", "3ds", "psp", "psv", "ps1", "ps2", "ps3", "wii", "wiiu", "fc", "sfc", "md", "n64"
+        ])
         let titleIDPattern = try? NSRegularExpression(pattern: #"(?i)\b[0-9a-f]{16}\b"#)
         // Full-width brackets are common in Chinese release names (（汉化版）, 【简】).
-        let noisePattern = try? NSRegularExpression(pattern: #"(?i)\[[^\]]*\]|\([^)]*\)|（[^）]*）|【[^】]*】|\b(?:xci|nsp|nsz|xcz|nup|mod|v\d+(?:\.\d+)*)\b"#)
+        let noisePattern = try? NSRegularExpression(
+            pattern: #"(?i)\[[^\]]*\]|\([^)]*\)|（[^）]*）|【[^】]*】|\b(?:xci|nsp|nsz|xcz|nup|mod|rev\s*\d+|disc\s*\d+|cd\s*\d+|v\d+(?:\.\d+)*|usa|eur|jpn|chs|cht)\b"#
+        )
+        let chineseNoisePattern = try? NSRegularExpression(
+            pattern: #"(?:完整|完美|最新|最终|官方)?(?:简体|繁体|简繁)?(?:中文|汉化|日文|英文|美|日|欧|港)版|(?:全\s*DLC|整合版|金手指|免安装|修正版|简中|繁中)"#,
+            options: [.caseInsensitive]
+        )
 
         for candidate in candidates {
             var cleaned = candidate
@@ -276,13 +556,13 @@ actor GameMetadataService {
             cleaned = titleIDPattern?.stringByReplacingMatches(in: cleaned, range: fullRange, withTemplate: " ") ?? cleaned
             let noiseRange = NSRange(cleaned.startIndex..., in: cleaned)
             cleaned = noisePattern?.stringByReplacingMatches(in: cleaned, range: noiseRange, withTemplate: " ") ?? cleaned
-            // Dumps usually lead with a release serial ("3191 - …",
-            // "PS3CH032 - …"). It is not part of the game name and dilutes the
-            // matcher's score against clean catalogue titles.
+            let zhNoiseRange = NSRange(cleaned.startIndex..., in: cleaned)
+            cleaned = chineseNoisePattern?.stringByReplacingMatches(in: cleaned, range: zhNoiseRange, withTemplate: " ") ?? cleaned
+            // Strip leading ROM dump indexes ("001 - …", "3191 - …", "#042 - …", "PS3CH032 - …").
             cleaned = cleaned.replacingOccurrences(
-                of: #"^\s*(?=[A-Za-z0-9]{4,12}\s*[-–—])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]+\s*[-–—]+\s*"#,
+                of: #"^\s*#?(?=[A-Za-z0-9]{2,12}\s*[-–—._])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]+\s*[-–—._]+\s*"#,
                 with: "", options: .regularExpression)
-            // Serials glued to the name ("骇客追忆PCSH10079", "BLUS12345") go too.
+            // Serials glued to the name ("骇客追忆PCSH10079", "BLUS12345", "SLUS-20312") go too.
             cleaned = cleaned.replacingOccurrences(
                 of: #"(?<![A-Za-z0-9])[A-Z]{2,4}-?\d{4,6}(?![0-9])"#, with: " ", options: .regularExpression)
             cleaned = cleaned
@@ -292,9 +572,9 @@ actor GameMetadataService {
 
             guard !cleaned.isEmpty,
                   !ignored.contains(cleaned.lowercased()),
-                  // Bare release serials ("PCSH10079") are not names; the next
-                  // candidate (the real directory or file name) is the title.
+                  // Bare release serials ("PCSH10079") or UUIDs are not names.
                   cleaned.range(of: #"^[A-Za-z]*\d[\w-]*$"#, options: .regularExpression) == nil,
+                  cleaned.range(of: #"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"#, options: .regularExpression) == nil,
                   cleaned.range(of: #"^[\d\s.-]+$"#, options: .regularExpression) == nil else { continue }
             return cleaned
         }
@@ -309,6 +589,127 @@ actor GameMetadataService {
         guard language != "en" else { return codeTitle ?? local?.title }
         return await wikipediaResult(for: candidate, language: language)?.title ?? candidate
     }
+
+    // MARK: - Local Container Metadata (PS3 / PSV / Wii U)
+
+    private func readLocalGameMetadata(from sourceURL: URL, platform: GameMetadataPlatform, language: String) -> LocalGameMetadata? {
+        let fm = FileManager.default
+        guard (try? sourceURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
+
+        switch platform {
+        case .ps3:
+            let sfoCandidates = [
+                sourceURL.appendingPathComponent("PS3_GAME/PARAM.SFO"),
+                sourceURL.appendingPathComponent("PARAM.SFO")
+            ]
+            guard let sfo = sfoCandidates.first(where: { fm.fileExists(atPath: $0.path) }) else { return nil }
+            let rawTitle = Self.readSFOString("TITLE", at: sfo)?.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            let productID = Self.readSFOString("TITLE_ID", at: sfo)?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            let base = sfo.deletingLastPathComponent()
+            let icon = readLocalArtwork(at: base.appendingPathComponent("ICON0.PNG"))
+            let backdrop = readLocalArtwork(at: base.appendingPathComponent("PIC1.PNG"), requireWideBackdrop: true)
+            guard rawTitle != nil || productID != nil || icon != nil || backdrop != nil else { return nil }
+            return LocalGameMetadata(title: rawTitle, productID: productID, icon: icon, backdrop: backdrop)
+
+        case .psv:
+            let sfo = sourceURL.appendingPathComponent("sce_sys/param.sfo")
+            guard fm.fileExists(atPath: sfo.path) else { return nil }
+            let rawTitle = (Self.readSFOString("TITLE", at: sfo) ?? Self.readSFOString("STITLE", at: sfo))?
+                .replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            let productID = Self.readSFOString("TITLE_ID", at: sfo)?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            let icon = readLocalArtwork(at: sourceURL.appendingPathComponent("sce_sys/icon0.png"))
+            let backdrop = readLocalArtwork(at: sourceURL.appendingPathComponent("sce_sys/livearea/contents/bg.png"), requireWideBackdrop: true)
+                ?? readLocalArtwork(at: sourceURL.appendingPathComponent("sce_sys/pic0.png"), requireWideBackdrop: true)
+            guard rawTitle != nil || productID != nil || icon != nil || backdrop != nil else { return nil }
+            return LocalGameMetadata(title: rawTitle, productID: productID, icon: icon, backdrop: backdrop)
+
+        case .wiiu:
+            let metaXML = sourceURL.appendingPathComponent("meta/meta.xml")
+            guard fm.fileExists(atPath: metaXML.path),
+                  let data = try? Data(contentsOf: metaXML),
+                  let xml = String(data: data, encoding: .utf8) else { return nil }
+            let tagOrder: [String]
+            switch language {
+            case "zh": tagOrder = ["longname_zhs", "longname_zht", "longname_en", "longname_ja"]
+            case "ja": tagOrder = ["longname_ja", "longname_en"]
+            default: tagOrder = ["longname_en", "longname_ja"]
+            }
+            var parsedTitle: String?
+            for tag in tagOrder {
+                if let value = Self.firstCapture(in: xml, pattern: "<\(tag)[^>]*>([^<]+)</\(tag)>") {
+                    let cleaned = Self.unescapeHTML(value).replacingOccurrences(of: "\n", with: " ")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !cleaned.isEmpty { parsedTitle = cleaned; break }
+                }
+            }
+            var productID: String?
+            if let code = Self.firstCapture(in: xml, pattern: #"<product_code[^>]*>([^<]+)</product_code>"#) {
+                let parts = code.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "-")
+                if let suffix = parts.last, suffix.count >= 4 {
+                    productID = String(suffix).uppercased()
+                }
+            }
+            guard parsedTitle != nil || productID != nil else { return nil }
+            return LocalGameMetadata(title: parsedTitle, productID: productID, icon: nil, backdrop: nil)
+
+        default:
+            return nil
+        }
+    }
+
+    private func readLocalArtwork(at url: URL, requireWideBackdrop: Bool = false) -> DownloadedArtwork? {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url),
+              let dims = pixelDimensions(data),
+              let ext = imageExtension(for: data) else { return nil }
+        if requireWideBackdrop {
+            guard MetadataRefreshPolicy.isAcceptableBackdrop(width: dims.width, height: dims.height) else { return nil }
+        }
+        return DownloadedArtwork(data: data, fileExtension: ext, sourceURL: url.path)
+    }
+
+    private static func readSFOString(_ key: String, at url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url), data.count >= 20, data.count <= 1_048_576,
+              Array(data.prefix(4)) == [0, 80, 83, 70] else { return nil }
+        func number(_ offset: Int, _ count: Int) -> Int {
+            guard offset >= 0, offset + count <= data.count else { return -1 }
+            return (0..<count).reduce(0) { $0 | Int(data[offset + $1]) << ($1 * 8) }
+        }
+        let keys = number(8, 4), values = number(12, 4), count = number(16, 4)
+        guard count >= 0, count <= (data.count - 20) / 16 else { return nil }
+        for entry in 0..<count {
+            let index = 20 + entry * 16
+            let start = keys + number(index, 2)
+            guard start >= 0, start < data.count, let end = data[start...].firstIndex(of: 0),
+                  String(data: data[start..<end], encoding: .utf8) == key else { continue }
+            let offset = values + number(index + 12, 4), length = number(index + 4, 4)
+            guard offset >= 0, length >= 0, offset <= data.count, length <= data.count - offset else { return nil }
+            return String(data: data[offset..<(offset + length)].prefix { $0 != 0 }, encoding: .utf8)
+        }
+        return nil
+    }
+
+    private static func extractGameTDBID(from sourceURL: URL?, title: String, platform: GameMetadataPlatform) -> String? {
+        let texts = [sourceURL?.lastPathComponent, title].compactMap { $0 }
+        let pattern: String?
+        switch platform {
+        case .ps3: pattern = #"(?i)\b([A-Z]{4}\d{5})\b"#
+        case .wii, .gamecube: pattern = #"(?i)[\[\(]([A-Z0-9]{6})[\]\)]"#
+        case .wiiu: pattern = #"(?i)[\[\(]([A-Z0-9]{4,6})[\]\)]"#
+        case .nds, .threeDS: pattern = #"(?i)[\[\(]([A-Z0-9]{4})[\]\)]"#
+        default: pattern = nil
+        }
+        guard let pattern else { return nil }
+        for text in texts {
+            if let captured = firstCapture(in: text, pattern: pattern)?.uppercased(),
+               isValidGameTDBID(captured, platform: platform) {
+                return captured
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Switch TitleDB (api.nlib.cc)
 
     private func switchTitleMetadata(for titleID: String, language: String) async -> SwitchTitleMetadata? {
         let preferredLanguage: String
@@ -355,23 +756,124 @@ actor GameMetadataService {
         )
     }
 
+    // MARK: - Bangumi (api.bgm.tv — dedicated video game database, type=4)
+
+    private struct BangumiGameInfo {
+        let chineseTitle: String?
+        let originalTitle: String?
+        let englishTitle: String?
+        let synopsis: String?
+        let coverURL: URL?
+        let pageURL: String
+    }
+
+    private func bangumiLookup(queries: [String], platform: GameMetadataPlatform, language: String) async -> BangumiGameInfo? {
+        let candidates = queries.prefix(3)
+        for query in candidates {
+            guard !query.isEmpty,
+                  let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+                  let searchURL = URL(string: "https://api.bgm.tv/search/subject/\(encoded)?type=4&responseGroup=medium&max_results=6"),
+                  let data = try? await download(searchURL, userAgent: Self.bangumiUserAgent),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let list = root["list"] as? [[String: Any]], !list.isEmpty else { continue }
+
+            let best = list.compactMap { item -> (id: Int, score: Double)? in
+                guard let id = item["id"] as? Int else { return nil }
+                let rawName = (item["name"] as? String) ?? ""
+                let rawCN = (item["name_cn"] as? String) ?? ""
+                let score = max(matchScore(query, rawName), matchScore(query, rawCN))
+                return (id, score)
+            }.max { $0.score < $1.score }
+
+            let minScore = GameTitleMatcher.hasHan(query) || GameTitleMatcher.hasKana(query) ? 0.68 : max(0.70, minimumMatchScore(for: query))
+            guard let best, best.score >= minScore else { continue }
+
+            guard let detailURL = URL(string: "https://api.bgm.tv/v0/subjects/\(best.id)"),
+                  let detailData = try? await download(detailURL, userAgent: Self.bangumiUserAgent),
+                  let detail = try? JSONSerialization.jsonObject(with: detailData) as? [String: Any] else { continue }
+
+            let name = (detail["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let nameCN = (detail["name_cn"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let summary = (detail["summary"] as? String).map(cleanSynopsis).flatMap { $0.isEmpty ? nil : $0 }
+
+            var englishAlias: String?
+            if let infobox = detail["infobox"] as? [[String: Any]] {
+                for entry in infobox {
+                    let key = (entry["key"] as? String) ?? ""
+                    if key == "英文名", let val = entry["value"] as? String {
+                        let trimmed = val.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty, !GameTitleMatcher.hasHan(trimmed), !GameTitleMatcher.hasKana(trimmed) {
+                            englishAlias = trimmed
+                            break
+                        }
+                    } else if key == "别名", let arr = entry["value"] as? [[String: Any]] {
+                        for aliasItem in arr {
+                            let k = (aliasItem["k"] as? String) ?? ""
+                            let v = (aliasItem["v"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            if !v.isEmpty, !GameTitleMatcher.hasHan(v), !GameTitleMatcher.hasKana(v),
+                               (k.contains("英文") || k.lowercased().contains("english") || k == "欧美版名") {
+                                englishAlias = v
+                                break
+                            }
+                        }
+                    }
+                    if englishAlias != nil { break }
+                }
+            }
+            if englishAlias == nil, let name, !name.isEmpty,
+               !GameTitleMatcher.hasHan(name), !GameTitleMatcher.hasKana(name) {
+                englishAlias = name
+            }
+
+            let images = detail["images"] as? [String: Any]
+            let coverString = (images?["large"] as? String) ?? (images?["medium"] as? String) ?? (images?["common"] as? String)
+            var coverURLComponents = coverString.flatMap(URLComponents.init(string:))
+            if coverURLComponents?.scheme == "http" { coverURLComponents?.scheme = "https" }
+
+            return BangumiGameInfo(
+                chineseTitle: nameCN?.isEmpty == false ? nameCN : nil,
+                originalTitle: name?.isEmpty == false ? name : nil,
+                englishTitle: englishAlias,
+                synopsis: summary,
+                coverURL: coverURLComponents?.url,
+                pageURL: "https://bgm.tv/subject/\(best.id)"
+            )
+        }
+        return nil
+    }
+
+    // MARK: - LaunchBox GamesDB
+
     private struct SteamMediaResult {
+        let title: String?
+        let synopsis: String?
+        let sourceURL: String?
         let cover: DownloadedArtwork?
+        let headerCover: DownloadedArtwork?
         let backdrop: DownloadedArtwork?
         let panoramicBackdrop: DownloadedArtwork?
     }
 
     private struct LaunchBoxMediaResult {
+        let title: String?
+        let synopsis: String?
+        let sourceURL: String?
         let cover: DownloadedArtwork?
+        let secondaryCover: DownloadedArtwork?
         let backdrop: DownloadedArtwork?
+        let secondaryBackdrop: DownloadedArtwork?
+        let bannerBackdrop: DownloadedArtwork?
     }
-
-    private static let browserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
 
     /// LaunchBox GamesDB provides human-curated per-platform `Box - Front` covers and
     /// 16:9 HD `Fanart - Background` wallpapers specifically intended for game launcher backdrops.
-    private func launchBoxMedia(for title: String, platform: GameMetadataPlatform, language: String) async -> LaunchBoxMediaResult? {
-        guard !title.isEmpty, !GameTitleMatcher.hasHan(title),
+    private func launchBoxMedia(
+        for title: String,
+        platform: GameMetadataPlatform,
+        language: String,
+        fetchSynopsisIfNeeded: Bool
+    ) async -> LaunchBoxMediaResult? {
+        guard !title.isEmpty, !GameTitleMatcher.hasHan(title), !GameTitleMatcher.hasKana(title),
               let encoded = title.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
               let searchURL = URL(string: "https://gamesdb.launchbox-app.com/games/results/\(encoded)"),
               let data = try? await download(searchURL, userAgent: Self.browserUserAgent),
@@ -382,17 +884,18 @@ actor GameMetadataService {
             options: [.dotMatchesLineSeparators]
         ) else { return nil }
 
-        let targetPlatform = launchBoxPlatformName(for: platform)?.lowercased()
+        let targetPlatforms = launchBoxPlatformNames(for: platform).map { $0.lowercased() }
         let matches = cardRegex.matches(in: html, range: NSRange(html.startIndex..., in: html))
         struct Card {
             let id: String
+            let title: String
             let titleScore: Double
             let platformMatch: Bool
             let isHack: Bool
         }
         var cards: [Card] = []
         var seenIDs = Set<String>()
-        for match in matches.prefix(24) {
+        for match in matches.prefix(28) {
             guard let idRange = Range(match.range(at: 1), in: html),
                   let bodyRange = Range(match.range(at: 2), in: html) else { continue }
             let id = String(html[idRange])
@@ -405,10 +908,13 @@ actor GameMetadataService {
             guard !stripped.isEmpty else { continue }
             let lower = stripped.lowercased()
             let isHack = lower.contains("rom hack") || lower.contains("homebrew") || lower.contains("unlicensed")
-            let platformMatch = targetPlatform.map { lower.contains($0) } ?? false
-            // Extract the title prefix before the platform name or "Add to collection" for clean scoring.
+            let platformMatch = targetPlatforms.contains { lower.contains($0) }
             let titlePart = stripped
-                .replacingOccurrences(of: #"\s+(?:Nintendo|Sony|Sega|Microsoft|Windows|Add to collection|Released).*$"#, with: "", options: .regularExpression)
+                .replacingOccurrences(
+                    of: #"\s+(?:Nintendo|Sony|Sega|Microsoft|Windows|Apple|Arcade|Atari|NEC|SNK|Bandai|Add to collection|Released).*$"#,
+                    with: "",
+                    options: .regularExpression
+                )
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let candidateTitle = titlePart.isEmpty ? stripped : titlePart
             var score = matchScore(title, candidateTitle)
@@ -418,11 +924,10 @@ actor GameMetadataService {
                 score = max(score, platformMatch ? 0.88 : 0.78)
             }
             guard score >= 0.72 else { continue }
-            cards.append(Card(id: id, titleScore: score, platformMatch: platformMatch, isHack: isHack))
+            cards.append(Card(id: id, title: candidateTitle, titleScore: score, platformMatch: platformMatch, isHack: isHack))
         }
         guard !cards.isEmpty else { return nil }
 
-        // Prefer non-hack, then platform-matched, then highest title similarity.
         let ordered = cards.sorted { lhs, rhs in
             if lhs.isHack != rhs.isHack { return !lhs.isHack }
             if lhs.platformMatch != rhs.platformMatch { return lhs.platformMatch }
@@ -430,9 +935,12 @@ actor GameMetadataService {
         }
 
         var bestCover: DownloadedArtwork?
+        var secondaryCover: DownloadedArtwork?
         var bestBackdrop: DownloadedArtwork?
+        var secondaryBackdrop: DownloadedArtwork?
+        var bannerBackdrop: DownloadedArtwork?
 
-        for card in ordered.prefix(3) {
+        for card in ordered.prefix(4) {
             if bestCover != nil && bestBackdrop != nil { break }
             guard let imgPageURL = URL(string: "https://gamesdb.launchbox-app.com/games/images/\(card.id)"),
                   let imgData = try? await download(imgPageURL, userAgent: Self.browserUserAgent),
@@ -442,29 +950,51 @@ actor GameMetadataService {
                   ) else { continue }
 
             var fanartURLs: [URL] = []
-            var boxFrontURLs: [(url: URL, priority: Int)] = []
+            var screenshotURLs: [URL] = []
+            var bannerURLs: [URL] = []
+            var platformBoxURLs: [(url: URL, priority: Int)] = []
+            var fallbackBoxURLs: [(url: URL, priority: Int)] = []
+
             for m in itemRegex.matches(in: imgHTML, range: NSRange(imgHTML.startIndex..., in: imgHTML)) {
                 guard let uRange = Range(m.range(at: 1), in: imgHTML),
                       let lRange = Range(m.range(at: 2), in: imgHTML),
                       let imgURL = URL(string: String(imgHTML[uRange])) else { continue }
                 let label = Self.unescapeHTML(String(imgHTML[lRange]))
+
                 if label.contains("Fanart - Background") {
                     fanartURLs.append(imgURL)
-                } else if label.contains("Box - Front") && card.platformMatch {
-                    let prio: Int
-                    if label.contains("World") || label.contains("North America") || label.contains("United States") { prio = 3 }
-                    else if (language == "ja" || language == "zh") && (label.contains("Japan") || label.contains("Asia")) { prio = 4 }
-                    else if label.contains("Europe") || label.contains("Japan") { prio = 2 }
-                    else { prio = 1 }
-                    boxFrontURLs.append((imgURL, prio))
+                } else if label.contains("Screenshot - Gameplay") || label.contains("Screenshot - Game Title") {
+                    screenshotURLs.append(imgURL)
+                } else if label.contains("Steam Banner") || label.contains("Banner Image") {
+                    bannerURLs.append(imgURL)
+                } else if label.contains("Box - Front") || label.contains("Fanart - Box - Front") || label.contains("Box - 3D") {
+                    let isFlatFront = label.contains("Box - Front") && !label.contains("Box - Back")
+                    var prio = isFlatFront ? 10 : 4
+                    if (language == "ja" || language == "zh") && (label.contains("Japan") || label.contains("Asia")) { prio += 4 }
+                    else if label.contains("World") || label.contains("North America") || label.contains("United States") { prio += 3 }
+                    else if label.contains("Europe") || label.contains("Japan") { prio += 2 }
+                    else { prio += 1 }
+                    if card.platformMatch && isFlatFront {
+                        platformBoxURLs.append((imgURL, prio))
+                    } else {
+                        fallbackBoxURLs.append((imgURL, prio))
+                    }
                 }
             }
 
-            if bestCover == nil, let topBox = boxFrontURLs.sorted(by: { $0.priority > $1.priority }).first {
+            if bestCover == nil, let topBox = platformBoxURLs.sorted(by: { $0.priority > $1.priority }).first {
                 if let bytes = try? await download(topBox.url, userAgent: Self.browserUserAgent),
-                   pixelArea(bytes) >= 250 * 250 {
-                    let ext = topBox.url.pathExtension.lowercased() == "png" ? "png" : "jpg"
+                   pixelArea(bytes) >= 200 * 200 {
+                    let ext = imageExtension(for: bytes) ?? (topBox.url.pathExtension.lowercased() == "png" ? "png" : "jpg")
                     bestCover = DownloadedArtwork(data: bytes, fileExtension: ext, sourceURL: topBox.url.absoluteString)
+                }
+            }
+            if bestCover == nil && secondaryCover == nil,
+               let fallbackBox = fallbackBoxURLs.sorted(by: { $0.priority > $1.priority }).first {
+                if let bytes = try? await download(fallbackBox.url, userAgent: Self.browserUserAgent),
+                   pixelArea(bytes) >= 200 * 200 {
+                    let ext = imageExtension(for: bytes) ?? (fallbackBox.url.pathExtension.lowercased() == "png" ? "png" : "jpg")
+                    secondaryCover = DownloadedArtwork(data: bytes, fileExtension: ext, sourceURL: fallbackBox.url.absoluteString)
                 }
             }
 
@@ -473,10 +1003,11 @@ actor GameMetadataService {
                 for url in fanartURLs.prefix(4) {
                     if let bytes = try? await download(url, userAgent: Self.browserUserAgent),
                        let dims = pixelDimensions(bytes),
-                       dims.width >= 960, dims.height >= 540 {
+                       dims.width >= MetadataRefreshPolicy.preferredHDWidth,
+                       dims.height >= MetadataRefreshPolicy.preferredHDHeight {
                         let ratio = Double(dims.width) / Double(dims.height)
                         if ratio >= 1.35 && ratio <= 2.35 {
-                            let ext = url.pathExtension.lowercased() == "png" ? "png" : "jpg"
+                            let ext = imageExtension(for: bytes) ?? (url.pathExtension.lowercased() == "png" ? "png" : "jpg")
                             hdCandidates.append(DownloadedArtwork(data: bytes, fileExtension: ext, sourceURL: url.absoluteString))
                             if dims.width >= 1920 && dims.height >= 1080 { break }
                         }
@@ -484,38 +1015,125 @@ actor GameMetadataService {
                 }
                 bestBackdrop = hdCandidates.max { pixelArea($0.data) < pixelArea($1.data) }
             }
+
+            if bestBackdrop == nil && secondaryBackdrop == nil {
+                for url in screenshotURLs.prefix(3) {
+                    if let bytes = try? await download(url, userAgent: Self.browserUserAgent),
+                       let dims = pixelDimensions(bytes),
+                       dims.width >= MetadataRefreshPolicy.preferredHDWidth,
+                       dims.height >= MetadataRefreshPolicy.preferredHDHeight {
+                        let ratio = Double(dims.width) / Double(dims.height)
+                        if ratio >= 1.35 && ratio <= 2.35 {
+                            let ext = imageExtension(for: bytes) ?? (url.pathExtension.lowercased() == "png" ? "png" : "jpg")
+                            secondaryBackdrop = DownloadedArtwork(data: bytes, fileExtension: ext, sourceURL: url.absoluteString)
+                            break
+                        }
+                    }
+                }
+            }
+
+            if bestBackdrop == nil && secondaryBackdrop == nil && bannerBackdrop == nil {
+                for url in bannerURLs.prefix(2) {
+                    if let bytes = try? await download(url, userAgent: Self.browserUserAgent),
+                       let dims = pixelDimensions(bytes),
+                       MetadataRefreshPolicy.isAcceptableBackdrop(width: dims.width, height: dims.height) {
+                        let ext = imageExtension(for: bytes) ?? (url.pathExtension.lowercased() == "png" ? "png" : "jpg")
+                        bannerBackdrop = DownloadedArtwork(data: bytes, fileExtension: ext, sourceURL: url.absoluteString)
+                        break
+                    }
+                }
+            }
         }
 
-        guard bestCover != nil || bestBackdrop != nil else { return nil }
-        return LaunchBoxMediaResult(cover: bestCover, backdrop: bestBackdrop)
+        var overviewSynopsis: String?
+        let topCard = ordered.first
+        let detailURLString = topCard.map { "https://gamesdb.launchbox-app.com/games/details/\($0.id)" }
+        if fetchSynopsisIfNeeded, let detailURLString, let detailURL = URL(string: detailURLString),
+           let detailData = try? await download(detailURL, userAgent: Self.browserUserAgent),
+           let detailHTML = String(data: detailData, encoding: .utf8),
+           let rawDesc = Self.firstCapture(in: detailHTML, pattern: #"<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']"#) {
+            let cleaned = cleanSynopsis(Self.unescapeHTML(rawDesc))
+            if cleaned.count >= 25 && !cleaned.lowercased().contains("launchbox games database") {
+                overviewSynopsis = cleaned
+            }
+        }
+
+        guard bestCover != nil || secondaryCover != nil || bestBackdrop != nil || secondaryBackdrop != nil || bannerBackdrop != nil || overviewSynopsis != nil else {
+            return nil
+        }
+        return LaunchBoxMediaResult(
+            title: topCard?.title,
+            synopsis: overviewSynopsis,
+            sourceURL: detailURLString,
+            cover: bestCover,
+            secondaryCover: secondaryCover,
+            backdrop: bestBackdrop,
+            secondaryBackdrop: secondaryBackdrop,
+            bannerBackdrop: bannerBackdrop
+        )
     }
 
-    private func launchBoxPlatformName(for platform: GameMetadataPlatform) -> String? {
+    private func launchBoxPlatformNames(for platform: GameMetadataPlatform) -> [String] {
         switch platform {
-        case .gba: return "Game Boy Advance"
-        case .gb: return "Game Boy"
-        case .gbc: return "Game Boy Color"
-        case .nds: return "Nintendo DS"
-        case .threeDS: return "Nintendo 3DS"
-        case .psp: return "Sony PSP"
-        case .psv: return "Sony Playstation Vita"
-        case .ps1: return "Sony Playstation"
-        case .ps2: return "Sony Playstation 2"
-        case .ps3: return "Sony Playstation 3"
-        case .wii: return "Nintendo Wii"
-        case .wiiu: return "Nintendo Wii U"
-        case .switchConsole: return "Nintendo Switch"
-        default: return nil
+        case .gba: return ["Game Boy Advance"]
+        case .gb: return ["Game Boy"]
+        case .gbc: return ["Game Boy Color"]
+        case .nds: return ["Nintendo DS"]
+        case .threeDS: return ["Nintendo 3DS"]
+        case .psp: return ["Sony PSP"]
+        case .psv: return ["Sony Playstation Vita"]
+        case .ps1: return ["Sony Playstation"]
+        case .ps2: return ["Sony Playstation 2"]
+        case .ps3: return ["Sony Playstation 3"]
+        case .ps4: return ["Sony Playstation 4"]
+        case .famicom, .dendy: return ["Nintendo Entertainment System"]
+        case .fds: return ["Nintendo Famicom Disk System"]
+        case .superFamicom: return ["Super Nintendo Entertainment System"]
+        case .n64, .n64dd: return ["Nintendo 64"]
+        case .megaDrive: return ["Sega Genesis", "Sega Mega Drive"]
+        case .gamecube: return ["Nintendo GameCube"]
+        case .wii: return ["Nintendo Wii"]
+        case .wiiu: return ["Nintendo Wii U"]
+        case .dreamcast: return ["Sega Dreamcast"]
+        case .xbox: return ["Microsoft Xbox"]
+        case .switchConsole: return ["Nintendo Switch"]
+        case .macOS: return ["Apple Mac OS", "Windows"]
+        case .atari2600: return ["Atari 2600"]
+        case .sms: return ["Sega Master System"]
+        case .gg: return ["Sega Game Gear"]
+        case .segacd: return ["Sega CD"]
+        case .sega32x: return ["Sega 32X"]
+        case .pce, .sgx: return ["NEC TurboGrafx-16", "PC Engine"]
+        case .pcecd, .sgxcd: return ["NEC TurboGrafx-CD"]
+        case .ws: return ["WonderSwan"]
+        case .wsc: return ["WonderSwan Color"]
+        case .ngp: return ["SNK Neo Geo Pocket"]
+        case .ngpc: return ["SNK Neo Geo Pocket Color"]
+        case .arcade, .aes, .mvs: return ["Arcade", "SNK Neo Geo AES"]
+        default: return []
         }
     }
 
-    private func steamMedia(for title: String, platform: GameMetadataPlatform) async -> SteamMediaResult? {
-        guard !title.isEmpty, !GameTitleMatcher.hasHan(title) else { return nil }
+    // MARK: - Steam Store Media & Localized Synopsis
+
+    private func steamMedia(for title: String, platform: GameMetadataPlatform, language: String) async -> SteamMediaResult? {
+        guard !title.isEmpty else { return nil }
+        let isCJK = GameTitleMatcher.hasHan(title) || GameTitleMatcher.hasKana(title)
+        let searchLang: String
+        let searchCC: String
+        if GameTitleMatcher.hasHan(title) {
+            searchLang = "schinese"; searchCC = "CN"
+        } else if GameTitleMatcher.hasKana(title) {
+            searchLang = "japanese"; searchCC = "JP"
+        } else {
+            searchLang = "english"; searchCC = "US"
+        }
+
         guard var components = URLComponents(string: "https://store.steampowered.com/api/storesearch/") else { return nil }
         components.queryItems = [
             URLQueryItem(name: "term", value: title),
-            URLQueryItem(name: "l", value: "english"),
-            URLQueryItem(name: "cc", value: "US")
+            URLQueryItem(name: "l", value: searchLang),
+            URLQueryItem(name: "cc", value: searchCC)
         ]
         guard let searchURL = components.url,
               let searchData = try? await download(searchURL),
@@ -523,30 +1141,65 @@ actor GameMetadataService {
               let items = root["items"] as? [[String: Any]] else { return nil }
 
         let normQuery = normalize(title)
+        let editionSuffixes: Set<String> = [
+            "hd", "remaster", "remastered", "definitive", "complete", "deluxe",
+            "goty", "special", "ultimate", "collection", "director", "cut", "steam", "pc", "royal", "golden"
+        ]
         let match = items
             .filter { ($0["type"] as? String) == "app" }
-            .compactMap { item -> (id: Int, score: Double)? in
+            .compactMap { item -> (id: Int, name: String, score: Double)? in
                 guard let id = item["id"] as? Int, let name = item["name"] as? String else { return nil }
                 var score = matchScore(title, name)
                 let normName = normalize(name)
-                if normName.hasPrefix(normQuery) || normQuery.hasPrefix(normName) {
-                    score = max(score, 0.86)
+                if !isCJK, normQuery.count >= 5 {
+                    if normName == normQuery {
+                        score = 1.0
+                    } else if normName.hasPrefix(normQuery + " ") {
+                        let extraTokens = normName.dropFirst(normQuery.count + 1).split(separator: " ").map(String.init)
+                        if !extraTokens.isEmpty && extraTokens.allSatisfy({ editionSuffixes.contains($0) }) {
+                            score = max(score, 0.88)
+                        }
+                    } else if normQuery.hasPrefix(normName + " ") {
+                        let extraTokens = normQuery.dropFirst(normName.count + 1).split(separator: " ").map(String.init)
+                        if !extraTokens.isEmpty && extraTokens.allSatisfy({ editionSuffixes.contains($0) }) {
+                            score = max(score, 0.86)
+                        }
+                    }
                 }
-                return (id, score)
+                return (id, name, score)
             }
             .max { $0.score < $1.score }
-        guard let match, match.score >= 0.78 else { return nil }
+        guard let match, match.score >= (isCJK ? 0.72 : 0.78) else { return nil }
 
+        let detailLang: String
+        let detailCC: String
+        switch language {
+        case "zh": detailLang = "schinese"; detailCC = "CN"
+        case "ja": detailLang = "japanese"; detailCC = "JP"
+        default: detailLang = "english"; detailCC = "US"
+        }
+
+        var localizedTitle: String?
+        var localizedSynopsis: String?
         var backdrop16x9: DownloadedArtwork?
         var panoramic: DownloadedArtwork?
         var cover: DownloadedArtwork?
+        var headerCover: DownloadedArtwork?
 
-        // 1. Prefer true 16:9 HD background_raw / full-res screenshots over narrow 3.1:1 library_hero strips.
-        if let detailsURL = URL(string: "https://store.steampowered.com/api/appdetails?appids=\(match.id)&l=english&cc=US"),
+        if let detailsURL = URL(string: "https://store.steampowered.com/api/appdetails?appids=\(match.id)&l=\(detailLang)&cc=\(detailCC)"),
            let detailsData = try? await download(detailsURL),
            let details = try? JSONSerialization.jsonObject(with: detailsData) as? [String: Any],
            let app = details[String(match.id)] as? [String: Any],
            let data = app["data"] as? [String: Any] {
+            if let name = (data["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+                localizedTitle = name
+            }
+            if let shortDesc = (data["short_description"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !shortDesc.isEmpty {
+                let stripped = Self.unescapeHTML(shortDesc.replacingOccurrences(of: #"<[^>]+>"#, with: " ", options: .regularExpression))
+                let cleaned = cleanSynopsis(stripped)
+                if cleaned.count >= 15 { localizedSynopsis = cleaned }
+            }
+
             var imageURLs: [URL] = []
             for key in ["background_raw", "background"] {
                 if let value = data[key] as? String, let url = URL(string: value) { imageURLs.append(url) }
@@ -557,17 +1210,24 @@ actor GameMetadataService {
             for url in imageURLs {
                 if let imageData = try? await download(url),
                    let dims = pixelDimensions(imageData),
-                   dims.width >= 1200, dims.height >= 675 {
+                   dims.width >= MetadataRefreshPolicy.preferredHDWidth,
+                   dims.height >= MetadataRefreshPolicy.preferredHDHeight {
                     let ratio = Double(dims.width) / Double(dims.height)
                     if ratio >= 1.4 && ratio <= 2.2 {
-                        backdrop16x9 = DownloadedArtwork(data: imageData, fileExtension: "jpg", sourceURL: url.absoluteString)
+                        let ext = imageExtension(for: imageData) ?? "jpg"
+                        backdrop16x9 = DownloadedArtwork(data: imageData, fileExtension: ext, sourceURL: url.absoluteString)
                         break
                     }
                 }
             }
+
+            if let headerStr = data["header_image"] as? String, let headerURL = URL(string: headerStr),
+               let headerData = try? await download(headerURL),
+               pixelArea(headerData) >= 400 * 180 {
+                headerCover = DownloadedArtwork(data: headerData, fileExtension: imageExtension(for: headerData) ?? "jpg", sourceURL: headerURL.absoluteString)
+            }
         }
 
-        // 2. Fallback to Steam panoramic library_hero only when no 16:9 artwork was found.
         if backdrop16x9 == nil {
             for urlStr in [
                 "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/\(match.id)/page_bg_raw.jpg",
@@ -578,7 +1238,7 @@ actor GameMetadataService {
                       let data = try? await download(url),
                       let dims = pixelDimensions(data),
                       dims.width >= 960, dims.height >= 400 else { continue }
-                panoramic = DownloadedArtwork(data: data, fileExtension: "jpg", sourceURL: url.absoluteString)
+                panoramic = DownloadedArtwork(data: data, fileExtension: imageExtension(for: data) ?? "jpg", sourceURL: url.absoluteString)
                 break
             }
         }
@@ -590,13 +1250,23 @@ actor GameMetadataService {
             guard let url = URL(string: urlStr),
                   let data = try? await download(url),
                   pixelArea(data) >= 300 * 400 else { continue }
-            cover = DownloadedArtwork(data: data, fileExtension: "jpg", sourceURL: url.absoluteString)
+            cover = DownloadedArtwork(data: data, fileExtension: imageExtension(for: data) ?? "jpg", sourceURL: url.absoluteString)
             break
         }
 
-        guard cover != nil || backdrop16x9 != nil || panoramic != nil else { return nil }
-        return SteamMediaResult(cover: cover, backdrop: backdrop16x9, panoramicBackdrop: panoramic)
+        guard cover != nil || headerCover != nil || backdrop16x9 != nil || panoramic != nil || localizedSynopsis != nil else { return nil }
+        return SteamMediaResult(
+            title: localizedTitle,
+            synopsis: localizedSynopsis,
+            sourceURL: "https://store.steampowered.com/app/\(match.id)/",
+            cover: cover,
+            headerCover: headerCover,
+            backdrop: backdrop16x9,
+            panoramicBackdrop: panoramic
+        )
     }
+
+    // MARK: - Chinese Franchise Hints
 
     /// Maps common Chinese ROM hack / fan-translation names to canonical Chinese & English game titles.
     private static func chineseFranchiseHint(for text: String, platform: GameMetadataPlatform) -> (zh: String, en: String)? {
@@ -613,7 +1283,7 @@ actor GameMetadataService {
             (["阿尔法蓝宝石", "蓝宝石"], "宝可梦 阿尔法蓝宝石", "Pokemon Alpha Sapphire"),
             (["心金"], "宝可梦 心金", "Pokemon HeartGold Version"),
             (["魂银"], "宝可梦 魂银", "Pokemon SoulSilver Version"),
-            (["漆黑的魅影", "绿宝石"], "宝可梦 绿宝石", "Pokemon Emerald Version"),
+            (["漆黑的魅影", "究极绿宝石", "绿宝石"], "宝可梦 绿宝石", "Pokemon Emerald Version"),
             (["火红"], "宝可梦 火红", "Pokemon FireRed Version"),
             (["叶绿"], "宝可梦 叶绿", "Pokemon LeafGreen Version"),
             (["白金"], "宝可梦 白金", "Pokemon Platinum Version"),
@@ -624,29 +1294,36 @@ actor GameMetadataService {
             (["哈利波特", "消失的密室"], "哈利·波特与密室", "Harry Potter and the Chamber of Secrets"),
             (["哈利波特", "魔法石"], "哈利·波特与魔法石", "Harry Potter and the Sorcerer's Stone"),
             (["塞尔达传说", "风之杖"], "塞尔达传说 风之杖", "The Legend of Zelda: The Wind Waker"),
-            (["塞尔达传说", "智慧的再现"], "塞尔达传说 智慧的再现", "The Legend of Zelda: Echoes of Wisdom")
+            (["塞尔达传说", "智慧的再现"], "塞尔达传说 智慧的再现", "The Legend of Zelda: Echoes of Wisdom"),
+            (["塞尔达传说", "旷野之息", "荒野之息"], "塞尔达传说 旷野之息", "The Legend of Zelda: Breath of the Wild"),
+            (["塞尔达传说", "王国之泪"], "塞尔达传说 王国之泪", "The Legend of Zelda: Tears of the Kingdom"),
+            (["塞尔达传说", "织梦岛"], "塞尔达传说 织梦岛", "The Legend of Zelda: Link's Awakening")
         ]
         for rule in rules {
-            // Require either a specific single subtitle match or all listed keywords when multi-word.
             if rule.patterns.count == 1 {
                 if text.contains(rule.patterns[0]) {
                     return (rule.zh, rule.en)
                 }
             } else {
-                // Match if the primary franchise + subtitle match OR any unique subtitle matches.
                 let hitCount = rule.patterns.filter { text.contains($0) }.count
-                if hitCount >= 2 || (rule.patterns.contains("欧米伽红宝石") && text.contains("欧米伽红宝石"))
+                if hitCount >= 2
+                    || (rule.patterns.contains("欧米伽红宝石") && text.contains("欧米伽红宝石"))
                     || (rule.patterns.contains("阿尔法蓝宝石") && text.contains("阿尔法蓝宝石"))
-                    || (rule.patterns.contains("漆黑的魅影") && text.contains("漆黑的魅影"))
+                    || (rule.patterns.contains("漆黑的魅影") && (text.contains("漆黑的魅影") || text.contains("究极绿宝石")))
                     || (rule.patterns.contains("网络侦探") && (text.contains("网络侦探") || text.contains("骇客追忆")))
                     || (rule.patterns.contains("失落之歌") && text.contains("失落之歌"))
-                    || (rule.patterns.contains("消失的密室") && text.contains("消失的密室")) {
+                    || (rule.patterns.contains("消失的密室") && text.contains("消失的密室"))
+                    || (rule.patterns.contains("旷野之息") && (text.contains("旷野之息") || text.contains("荒野之息")))
+                    || (rule.patterns.contains("王国之泪") && text.contains("王国之泪"))
+                    || (rule.patterns.contains("织梦岛") && text.contains("织梦岛")) {
                     return (rule.zh, rule.en)
                 }
             }
         }
         return nil
     }
+
+    // MARK: - GameTDB (Switch / 3DS / NDS / Wii / Wii U / GameCube / PS3)
 
     private static func isValidGameTDBID(_ id: String, platform: GameMetadataPlatform) -> Bool {
         let bytes = Array(id.utf8)
@@ -662,28 +1339,57 @@ actor GameMetadataService {
         switch platform {
         case .nds, .threeDS:
             return bytes.count == 4 && bytes.allSatisfy(isAsciiAlnum)
-        case .wii, .wiiu:
+        case .wii, .wiiu, .gamecube:
             return (4...6).contains(bytes.count) && bytes.allSatisfy(isAsciiAlnum)
         case .ps3:
             return bytes.count == 9 && bytes.prefix(4).allSatisfy(isAsciiAlpha) && bytes.dropFirst(4).allSatisfy(isAsciiDigit)
+        case .switchConsole:
+            return bytes.count == 5 && bytes.allSatisfy(isAsciiAlnum)
         default:
             return false
         }
     }
 
-    private func gameTDBBoxart(for title: String, platform: GameMetadataPlatform, language: String) async -> DownloadedArtwork? {
-        let tdbInfo: (db: String, artPrefix: String)? = {
-            switch platform {
-            case .nds: return ("dstdb", "ds")
-            case .threeDS: return ("3dstdb", "3ds")
-            case .wii: return ("wiitdb", "wii")
-            case .wiiu: return ("wiiutdb", "wiiu")
-            case .ps3: return ("ps3tdb", "ps3")
-            default: return nil
+    private func gameTDBInfo(for platform: GameMetadataPlatform) -> (db: String, artPrefix: String)? {
+        switch platform {
+        case .nds: return ("dstdb", "ds")
+        case .threeDS: return ("3dstdb", "3ds")
+        case .wii, .gamecube: return ("wiitdb", "wii")
+        case .wiiu: return ("wiiutdb", "wiiu")
+        case .ps3: return ("ps3tdb", "ps3")
+        default: return nil
+        }
+    }
+
+    private func gameTDBBoxartByID(_ id: String, platform: GameMetadataPlatform, language: String) async -> DownloadedArtwork? {
+        guard let tdbInfo = gameTDBInfo(for: platform), Self.isValidGameTDBID(id, platform: platform) else { return nil }
+        let regions = language == "ja" ? ["JA", "US", "EN"] : (language == "zh" ? ["ZH", "US", "EN", "JA"] : ["US", "EN", "JA"])
+        for coverType in ["coverHQ", "cover", "cover3D"] {
+            for region in regions {
+                for ext in ["jpg", "png"] {
+                    guard let url = URL(string: "https://art.gametdb.com/\(tdbInfo.artPrefix)/\(coverType)/\(region)/\(id).\(ext)"),
+                          let data = try? await download(url), pixelArea(data) > 10000 else { continue }
+                    return DownloadedArtwork(data: data, fileExtension: imageExtension(for: data) ?? ext, sourceURL: url.absoluteString)
+                }
             }
-        }()
-        guard let tdbInfo else { return nil }
-        let cacheKey = "\(tdbInfo.db)-EN"
+        }
+        return nil
+    }
+
+    private func gameTDBBoxart(for title: String, platform: GameMetadataPlatform, language: String) async -> DownloadedArtwork? {
+        if platform == .switchConsole {
+            return await switchBoxartData(for: title, language: language)
+        }
+        guard let tdbInfo = gameTDBInfo(for: platform) else { return nil }
+        let catalogLang: String
+        if GameTitleMatcher.hasHan(title) {
+            catalogLang = "ZHCN"
+        } else if GameTitleMatcher.hasKana(title) {
+            catalogLang = "JA"
+        } else {
+            catalogLang = "EN"
+        }
+        let cacheKey = "\(tdbInfo.db)-\(catalogLang)"
         let entries: [(id: String, title: String, normalized: String)]
         if let cached = gameTDBCatalogs[cacheKey] {
             entries = cached
@@ -695,7 +1401,7 @@ actor GameMetadataService {
                 let db = tdbInfo.db
                 task = Task { [weak self] in
                     guard let self,
-                          let url = URL(string: "https://www.gametdb.com/\(db).txt?LANG=EN"),
+                          let url = URL(string: "https://www.gametdb.com/\(db).txt?LANG=\(catalogLang)"),
                           let data = try? await self.download(url),
                           let text = String(data: data, encoding: .utf8) else { return [] }
                     return text.split(whereSeparator: \.isNewline).compactMap { line in
@@ -720,18 +1426,10 @@ actor GameMetadataService {
             .max { $0.score < $1.score }
         guard let candidate, candidate.score >= max(0.78, minimumMatchScore(for: title)) else { return nil }
 
-        let regions = language == "ja" ? ["JA", "US", "EN"] : ["US", "EN", "JA"]
-        for coverType in ["coverHQ", "cover"] {
-            for region in regions {
-                for ext in ["jpg", "png"] {
-                    guard let url = URL(string: "https://art.gametdb.com/\(tdbInfo.artPrefix)/\(coverType)/\(region)/\(candidate.entry.id).\(ext)"),
-                          let data = try? await download(url), pixelArea(data) > 10000 else { continue }
-                    return DownloadedArtwork(data: data, fileExtension: ext, sourceURL: url.absoluteString)
-                }
-            }
-        }
-        return nil
+        return await gameTDBBoxartByID(candidate.entry.id, platform: platform, language: language)
     }
+
+    // MARK: - Wikipedia Wide Image & Switch Banner
 
     private func wikipediaWideImage(for pageTitle: String, language: String) async -> DownloadedArtwork? {
         guard var components = URLComponents(string: "https://\(language).wikipedia.org/w/api.php") else { return nil }
@@ -762,7 +1460,8 @@ actor GameMetadataService {
             guard let info = (page["imageinfo"] as? [[String: Any]])?.first,
                   let mime = info["mime"] as? String, (mime == "image/jpeg" || mime == "image/png"),
                   let w = info["width"] as? Int, let h = info["height"] as? Int,
-                  w >= 960, h >= 540, Double(w) / Double(h) >= 1.35, Double(w) / Double(h) <= 2.35,
+                  w >= MetadataRefreshPolicy.preferredHDWidth, h >= MetadataRefreshPolicy.preferredHDHeight,
+                  Double(w) / Double(h) >= 1.35, Double(w) / Double(h) <= 2.35,
                   let imgURLStr = (info["thumburl"] as? String) ?? (info["url"] as? String),
                   let imgURL = URL(string: imgURLStr) else { continue }
             candidates.append((imgURL, w * h))
@@ -770,10 +1469,11 @@ actor GameMetadataService {
         for item in candidates.sorted(by: { $0.area > $1.area }).prefix(3) {
             if let imgData = try? await download(item.url),
                let dims = pixelDimensions(imgData),
-               dims.width >= 960, dims.height >= 540 {
+               dims.width >= MetadataRefreshPolicy.preferredHDWidth,
+               dims.height >= MetadataRefreshPolicy.preferredHDHeight {
                 let ratio = Double(dims.width) / Double(dims.height)
                 if ratio >= 1.35 && ratio <= 2.35 {
-                    let ext = item.url.pathExtension.lowercased() == "png" ? "png" : "jpg"
+                    let ext = imageExtension(for: imgData) ?? (item.url.pathExtension.lowercased() == "png" ? "png" : "jpg")
                     return DownloadedArtwork(data: imgData, fileExtension: ext, sourceURL: item.url.absoluteString)
                 }
             }
@@ -786,14 +1486,24 @@ actor GameMetadataService {
               let url = URL(string: "https://api.nlib.cc/nx/\(titleID)/banner/1080p"),
               let data = try? await download(url),
               pixelArea(data) >= 1920 * 900 else { return nil }
-        return DownloadedArtwork(data: data, fileExtension: "jpg", sourceURL: url.absoluteString)
+        return DownloadedArtwork(data: data, fileExtension: imageExtension(for: data) ?? "jpg", sourceURL: url.absoluteString)
     }
+
+    // MARK: - Switch Title ID & Switch 2 Containers
 
     private func switchTitleID(from sourceURL: URL) -> String? {
         var candidates = [sourceURL.lastPathComponent]
-        for (relative, key) in [("Contents/Resources/dm/launcher.json", "game"), ("Contents/Resources/S2ArmStandalone/standalone.json", "gameID"), ("manifest.json", "titleID")] {
+        let manifestPaths: [(String, String)] = [
+            ("Contents/Resources/dm/launcher.json", "game"),
+            ("Contents/Resources/S2ArmStandalone/standalone.json", "gameID"),
+            ("manifest.json", "titleID"),
+            ("Builds/S2Arm/manifest.json", "titleID"),
+            ("Builds/NXNative/manifest.json", "titleID")
+        ]
+        for (relative, key) in manifestPaths {
             if let data = try? Data(contentsOf: sourceURL.appendingPathComponent(relative)),
-               let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let id = info[key] as? String {
+               let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let id = info[key] as? String {
                 candidates.insert(id, at: 0)
             }
         }
@@ -1021,20 +1731,27 @@ actor GameMetadataService {
     private func imageExtension(for data: Data) -> String? {
         if data.starts(with: [0xFF, 0xD8, 0xFF]) { return "jpg" }
         if data.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) { return "png" }
+        if data.count >= 12,
+           data.prefix(4) == Data("RIFF".utf8),
+           data.subdata(in: 8..<12) == Data("WEBP".utf8) { return "webp" }
         return nil
     }
 
+    // MARK: - Wikipedia
+
     private func wikipediaResult(for title: String, language: String, localizedTitle: String? = nil) async -> WikipediaGamePage? {
-        if language == "en" { return await searchWikipedia(language: "en", title: title) }
-        let query = localizedTitle.flatMap { GameTitleMatcher.hasHan($0) ? $0 : nil } ?? title
-        async let preferredLookup = searchWikipedia(language: language, title: query)
-        async let englishLookup = searchWikipedia(language: "en", title: title)
+        if language == "en" { return await searchWikipediaWithGameFallback(language: "en", title: title) }
+        let query = localizedTitle.flatMap { GameTitleMatcher.hasHan($0) || GameTitleMatcher.hasKana($0) ? $0 : nil } ?? title
+        async let preferredLookup = searchWikipediaWithGameFallback(language: language, title: query)
+        async let englishLookup = searchWikipediaWithGameFallback(language: "en", title: title)
         let (preferredPage, englishPage) = await (preferredLookup, englishLookup)
+        let preferredIsGame = preferredPage.map { Self.looksLikeVideoGame(title: $0.title, extract: $0.synopsis ?? "") } ?? false
+        let englishIsGame = englishPage.map { Self.looksLikeVideoGame(title: $0.title, extract: $0.synopsis ?? "") } ?? false
         let linkedPreferredPage: WikipediaGamePage?
-        if preferredPage == nil, let englishPage {
+        if (preferredPage == nil || (!preferredIsGame && englishIsGame)), let englishPage {
             linkedPreferredPage = await wikipediaLanguageLinkPage(from: englishPage.title, language: language)
         } else { linkedPreferredPage = nil }
-        guard let preferredPage = preferredPage ?? linkedPreferredPage else { return englishPage }
+        guard let preferredPage = linkedPreferredPage ?? preferredPage else { return englishPage }
 
         // Boxart catalogues are romanized; the English article title is the
         // key into them. When the direct English search missed (the cleaned
@@ -1052,6 +1769,24 @@ actor GameMetadataService {
             artworkURL: preferredPage.artworkURL ?? englishPage?.artworkURL,
             alternateTitle: englishTitle
         )
+    }
+
+    private func searchWikipediaWithGameFallback(language: String, title: String) async -> WikipediaGamePage? {
+        let direct = await searchWikipedia(language: language, title: title, searchQuery: title)
+        if let direct, Self.looksLikeVideoGame(title: direct.title, extract: direct.synopsis ?? "") {
+            return direct
+        }
+        let suffix: String
+        switch language {
+        case "zh": suffix = " 电子游戏"
+        case "ja": suffix = " ゲーム"
+        default: suffix = " video game"
+        }
+        if let gameFocused = await searchWikipedia(language: language, title: title, searchQuery: title + suffix),
+           Self.looksLikeVideoGame(title: gameFocused.title, extract: gameFocused.synopsis ?? "") {
+            return gameFocused
+        }
+        return direct
     }
 
     private func wikipediaEnglishTitle(from pageTitle: String, language: String) async -> String? {
@@ -1075,7 +1810,7 @@ actor GameMetadataService {
         return english
     }
 
-    // MARK: Baidu Baike
+    // MARK: - Baidu Baike
 
     private struct BaikePage {
         let title: String
@@ -1085,12 +1820,9 @@ actor GameMetadataService {
         let latinTitle: String?
     }
 
-    private static let baikeUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-
     /// Baidu Baike covers Chinese-context games Wikipedia misses — regional
     /// releases, Chinese translations and ROM hacks — and its image CDN is
-    /// reachable where upload.wikimedia.org is not. The mobile endpoints
-    /// serve plain HTML; an unknown lemma is resolved through the search page.
+    /// reachable where upload.wikimedia.org is not.
     private func baikeLookupTask(title: String, filenameTitle: String?, language: String) async -> BaikePage? {
         guard language == "zh" else { return nil }
         let candidate = filenameTitle ?? title
@@ -1101,19 +1833,12 @@ actor GameMetadataService {
     private func baikePage(for title: String) async -> BaikePage? {
         trace("baike: query \(title)")
         if let page = await baikeDirectPage(for: title) { return page }
-        // Release names rarely match a lemma verbatim. Search the full name
-        // and then each of its words, and keep the result whose title overlaps
-        // the game name most, so a franchise tag such as "口袋妖怪改版" cannot
-        // settle for the generic series page.
         var queries = [title]
         queries += title.split(separator: " ").map(String.init).filter { GameTitleMatcher.hasHan($0) && $0.count >= 3 }
         var best: (page: BaikePage, overlap: Int)?
         var seen = Set<String>()
         var fetched = 0
         nextQuery: for query in queries {
-            // Result links live in the searchList container; other /item/
-            // hrefs on the page are footer navigation (user agreements and
-            // the like) and must not be followed.
             guard fetched < 8,
                   let search = baikeSearchURL(for: query),
                   let data = try? await download(search, userAgent: Self.baikeUserAgent),
@@ -1138,7 +1863,6 @@ actor GameMetadataService {
         return best?.page
     }
 
-    /// A lemma named exactly like the game resolves directly.
     private func baikeDirectPage(for title: String) async -> BaikePage? {
         guard let url = baikeLemmaURL(title) else { return nil }
         guard let page = await baikePage(at: url), Self.sharesHan(page.title, title) else { return nil }
@@ -1146,16 +1870,12 @@ actor GameMetadataService {
     }
 
     private func baikeSearchURL(for query: String) -> URL? {
-        // /search/word answers with a redirect to plain http, which App
-        // Transport Security refuses; /search/none is the same page over https.
         var allowed = CharacterSet.urlQueryAllowed
         allowed.remove(charactersIn: "&+=?#")
         guard let encoded = query.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
         return URL(string: "https://wapbaike.baidu.com/search/none?word=" + encoded)
     }
 
-    /// Search results carry percent-encoded paths. Decode before encoding
-    /// once; re-encoding them as they come doubles the escapes and misses.
     private func baikeLemmaURL(_ href: String) -> URL? {
         let path = href.removingPercentEncoding ?? href
         guard let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else { return nil }
@@ -1177,8 +1897,6 @@ actor GameMetadataService {
         return BaikePage(title: title, synopsis: synopsis, pageURL: url, artworkURL: cover, latinTitle: latin)
     }
 
-    /// How much of the lemma title is covered by character pairs of the game
-    /// name. Chinese has no word boundaries, so bigram overlap is the signal.
     private static func hanBigramOverlap(_ lemma: String, _ title: String) -> (count: Int, ratio: Double) {
         let needle = hanBigrams(lemma), haystack = hanBigrams(title)
         let count = needle.intersection(haystack).count
@@ -1247,12 +1965,32 @@ actor GameMetadataService {
     }
 
     private func simplifiedChineseTitle(in synopsis: String?) -> String? {
-        guard let synopsis else { return nil }
-        let pattern = #"《([^》]{2,80})》"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: synopsis, range: NSRange(synopsis.startIndex..., in: synopsis)),
-              let range = Range(match.range(at: 1), in: synopsis) else { return nil }
-        return String(synopsis[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+        subjectChineseAliases(in: synopsis).first
+    }
+
+    /// Extracts Chinese titles from the lead subject clause of a Wikipedia extract
+    /// (e.g. `《塞尔达传说 旷野之息》（……中国大陆译作“……”）`), ignoring book titles
+    /// mentioned later in biographies or soundtrack articles.
+    private func subjectChineseAliases(in synopsis: String?) -> [String] {
+        guard let synopsis else { return [] }
+        let trimmed = synopsis.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("《") else { return [] }
+        let leadEnd = trimmed.firstIndex(where: { "。！？\n".contains($0) }) ?? trimmed.endIndex
+        let lead = String(trimmed[..<leadEnd])
+        let pattern = #"《([^》]{2,80})》|“([^”]{2,40})”|「([^」]{2,40})」"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        var aliases: [String] = []
+        let matches = regex.matches(in: lead, range: NSRange(lead.startIndex..., in: lead))
+        for match in matches.prefix(6) {
+            for group in 1...3 {
+                let r = match.range(at: group)
+                if r.location != NSNotFound, let range = Range(r, in: lead) {
+                    let value = String(lead[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !value.isEmpty { aliases.append(value) }
+                }
+            }
+        }
+        return aliases
     }
 
     private func wikipediaLanguageLinkPage(from englishTitle: String, language: String) async -> WikipediaGamePage? {
@@ -1300,14 +2038,14 @@ actor GameMetadataService {
         return wikipediaPage(from: article)
     }
 
-    private func searchWikipedia(language: String, title: String) async -> WikipediaGamePage? {
+    private func searchWikipedia(language: String, title: String, searchQuery: String) async -> WikipediaGamePage? {
         guard var components = URLComponents(string: "https://\(language).wikipedia.org/w/api.php") else {
             return nil
         }
         components.queryItems = [
             URLQueryItem(name: "action", value: "query"),
             URLQueryItem(name: "generator", value: "search"),
-            URLQueryItem(name: "gsrsearch", value: title),
+            URLQueryItem(name: "gsrsearch", value: searchQuery),
             URLQueryItem(name: "gsrlimit", value: "6"),
             URLQueryItem(name: "prop", value: "extracts|pageimages|info"),
             URLQueryItem(name: "exintro", value: "1"),
@@ -1318,6 +2056,9 @@ actor GameMetadataService {
             URLQueryItem(name: "format", value: "json"),
             URLQueryItem(name: "formatversion", value: "2")
         ]
+        if language == "zh" {
+            components.queryItems?.append(URLQueryItem(name: "variant", value: "zh-cn"))
+        }
         guard let url = components.url,
               let data = try? await download(url),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1327,18 +2068,52 @@ actor GameMetadataService {
         }
 
         let best = pages
-            .compactMap { page -> (score: Double, page: [String: Any])? in
+            .compactMap { page -> (rawScore: Double, rankedScore: Double, page: [String: Any])? in
                 guard let pageTitle = page["title"] as? String else { return nil }
-                let alias = simplifiedChineseTitle(in: page["extract"] as? String)
-                return (max(matchScore(title, pageTitle), alias.map { matchScore(title, $0) } ?? 0), page)
+                let extract = page["extract"] as? String ?? ""
+                let titleScore = matchScore(title, pageTitle)
+                let aliases = subjectChineseAliases(in: extract)
+                let aliasScore = aliases.map { matchScore(title, $0) }.max() ?? 0
+                let rawScore = max(titleScore, aliasScore)
+                let isGameArticle = Self.looksLikeVideoGame(title: pageTitle, extract: extract)
+                let isDerivative = Self.looksLikeDerivativeArticle(title: pageTitle)
+                let titleBonus = titleScore >= aliasScore ? 0.02 : 0
+                let rankedScore = rawScore + (isGameArticle ? 0.05 : 0) + titleBonus - (isDerivative ? 0.20 : 0)
+                return (rawScore, rankedScore, page)
             }
-            .max { $0.score < $1.score }
+            .max { lhs, rhs in
+                if abs(lhs.rankedScore - rhs.rankedScore) > 0.001 {
+                    return lhs.rankedScore < rhs.rankedScore
+                }
+                return lhs.rawScore < rhs.rawScore
+            }
 
-        guard let best, best.score >= minimumWikipediaMatchScore(for: title) else {
+        guard let best, best.rawScore >= minimumWikipediaMatchScore(for: title),
+              !Self.looksLikeDerivativeArticle(title: (best.page["title"] as? String) ?? "") else {
             return nil
         }
 
         return wikipediaPage(from: best.page)
+    }
+
+    private static func looksLikeDerivativeArticle(title: String) -> Bool {
+        let lower = title.lowercased()
+        let markers = [
+            "music of ", "soundtrack", "characters of ", "list of ", "discography",
+            "的音乐", "原声", "角色列表", "人物列表", "攻略", "漫画", "小说", "电影版"
+        ]
+        return markers.contains { lower.contains($0) }
+    }
+
+    private static func looksLikeVideoGame(title: String, extract: String) -> Bool {
+        let combined = (title + " " + extract).lowercased()
+        let keywords = [
+            "video game", "action-adventure", "role-playing", "platform game", "platformer",
+            "nintendo", "playstation", "xbox", "game boy", "sega", "capcom", "square enix",
+            "电子游戏", "动作冒险", "角色扮演", "任天堂", "索尼", "游戏机", "掌机", "电玩", "游戏作品",
+            "ゲーム", "ロールプレイング", "アクション"
+        ]
+        return keywords.contains { combined.contains($0) }
     }
 
     private func wikipediaPage(from page: [String: Any]) -> WikipediaGamePage? {
@@ -1362,40 +2137,52 @@ actor GameMetadataService {
         )
     }
 
+    // MARK: - Libretro Thumbnails & SwitchTDB
+
     private func boxartData(for title: String, platform: GameMetadataPlatform, language: String) async -> DownloadedArtwork? {
         if platform == .switchConsole {
             return await switchBoxartData(for: title, language: language)
         }
+        return await libretroMediaData(for: title, platform: platform, directory: "Named_Boxarts")
+    }
+
+    private func libretroMediaData(for title: String, platform: GameMetadataPlatform, directory: String) async -> DownloadedArtwork? {
         guard platform.isRetroConsole,
-              let match = await closestBoxart(to: title, platform: platform),
+              let match = await closestLibretroAsset(to: title, platform: platform, directory: directory),
               let encoded = match.filename.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
               let url = URL(string: encoded, relativeTo: match.source)?.absoluteURL else {
             return nil
         }
-        // The libretro host is intermittently reachable: a listing that came
-        // through may still be followed by failing file downloads. Fall back
-        // to the raw.githubusercontent mirror for the bytes themselves.
-        if let data = try? await download(url) {
-            return DownloadedArtwork(data: data, fileExtension: url.pathExtension.isEmpty ? "png" : url.pathExtension, sourceURL: url.absoluteString)
+        if let data = try? await download(url), pixelArea(data) > 0 {
+            return DownloadedArtwork(data: data, fileExtension: imageExtension(for: data) ?? "png", sourceURL: url.absoluteString)
         }
-        guard let mirror = mirrorArtworkURL(for: encoded, platform: platform),
-              let data = try? await download(mirror) else { return nil }
-        return DownloadedArtwork(data: data, fileExtension: mirror.pathExtension.isEmpty ? "png" : mirror.pathExtension, sourceURL: mirror.absoluteString)
+        guard let mirror = mirrorArtworkURL(for: encoded, platform: platform, directory: directory),
+              let data = try? await download(mirror), pixelArea(data) > 0 else { return nil }
+        return DownloadedArtwork(data: data, fileExtension: imageExtension(for: data) ?? "png", sourceURL: mirror.absoluteString)
     }
 
-    private func mirrorArtworkURL(for encodedFilename: String, platform: GameMetadataPlatform) -> URL? {
+    private func mirrorArtworkURL(for encodedFilename: String, platform: GameMetadataPlatform, directory: String = "Named_Boxarts") -> URL? {
         guard let systemFolder = retroSystemFolder(for: platform) else { return nil }
         let repository = systemFolder.replacingOccurrences(of: " ", with: "_")
-        return URL(string: "https://raw.githubusercontent.com/libretro-thumbnails/\(repository)/master/Named_Boxarts/\(encodedFilename)")
+        return URL(string: "https://raw.githubusercontent.com/libretro-thumbnails/\(repository)/master/\(directory)/\(encodedFilename)")
     }
 
     private func switchBoxartData(for title: String, language: String) async -> DownloadedArtwork? {
+        // Match the catalog script to the candidate query so English titles search EN
+        // and Chinese titles search ZHCN (instead of comparing English against ZHCN).
         let catalogLanguage: String
+        if GameTitleMatcher.hasHan(title) {
+            catalogLanguage = "ZHCN"
+        } else if GameTitleMatcher.hasKana(title) {
+            catalogLanguage = "JA"
+        } else {
+            catalogLanguage = "EN"
+        }
         let coverLanguage: String
         switch language {
-        case "ja": catalogLanguage = "JA"; coverLanguage = "JA"
-        case "zh", "zh-Hans": catalogLanguage = "ZHCN"; coverLanguage = "ZH"
-        default: catalogLanguage = "EN"; coverLanguage = "EN"
+        case "ja": coverLanguage = "JA"
+        case "zh", "zh-Hans": coverLanguage = "ZH"
+        default: coverLanguage = "EN"
         }
 
         let entries: [(id: String, title: String, normalized: String)]
@@ -1415,9 +2202,7 @@ actor GameMetadataService {
                         guard let separator = line.range(of: " = ") else { return nil }
                         let id = String(line[..<separator.lowerBound]).trimmingCharacters(in: .whitespaces)
                         let name = String(line[separator.upperBound...]).trimmingCharacters(in: .whitespaces)
-                        guard id.utf8.count == 5,
-                              id.utf8.allSatisfy({ ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122) }),
-                              !name.isEmpty else { return nil }
+                        guard Self.isValidGameTDBID(id, platform: .switchConsole), !name.isEmpty else { return nil }
                         return (id: id, title: name, normalized: GameTitleMatcher.normalize(name))
                     }
                 }
@@ -1433,43 +2218,44 @@ actor GameMetadataService {
         let candidate = entries
             .map { (entry: $0, score: GameTitleMatcher.scoreNormalized(normalizedQuery, $0.normalized)) }
             .max { $0.score < $1.score }
-        guard let candidate, candidate.score >= max(0.82, minimumMatchScore(for: title)) else { return nil }
+        guard let candidate, candidate.score >= max(0.80, minimumMatchScore(for: title)) else { return nil }
 
         var regions: [String] = []
-        for region in [coverLanguage, "EN", "US"] where !regions.contains(region) {
+        for region in [coverLanguage, "EN", "US", "JA"] where !regions.contains(region) {
             regions.append(region)
         }
         for coverType in ["coverHQ", "cover"] {
             for region in regions {
                 guard let url = URL(string: "https://art.gametdb.com/switch/\(coverType)/\(region)/\(candidate.entry.id).jpg"),
                       let data = try? await download(url), pixelArea(data) > 0 else { continue }
-                return DownloadedArtwork(data: data, fileExtension: "jpg", sourceURL: url.absoluteString)
+                return DownloadedArtwork(data: data, fileExtension: imageExtension(for: data) ?? "jpg", sourceURL: url.absoluteString)
             }
         }
         return nil
     }
 
-    private func closestBoxart(to title: String, platform: GameMetadataPlatform) async -> (filename: String, source: URL)? {
+    private func closestLibretroAsset(to title: String, platform: GameMetadataPlatform, directory: String) async -> (filename: String, source: URL)? {
+        let cacheKey = "\(platform.rawValue):\(directory)"
         let entries: [(filename: String, normalized: String)]
-        if let cached = artworkCatalogs[platform] {
+        if let cached = artworkCatalogs[cacheKey] {
             entries = cached
         } else {
             let task: Task<[(filename: String, normalized: String)], Never>
-            if let existing = artworkCatalogTasks[platform] {
+            if let existing = artworkCatalogTasks[cacheKey] {
                 task = existing
             } else {
                 task = Task { [weak self] in
                     guard let self else { return [] }
-                    let filenames = await self.boxartCatalog(platform: platform)
+                    let filenames = await self.libretroCatalog(platform: platform, directory: directory, cacheKey: cacheKey)
                     return filenames.map { ($0, GameTitleMatcher.normalize($0)) }
                 }
-                artworkCatalogTasks[platform] = task
+                artworkCatalogTasks[cacheKey] = task
             }
             entries = await task.value
-            artworkCatalogTasks[platform] = nil
-            if !entries.isEmpty { artworkCatalogs[platform] = entries }
+            artworkCatalogTasks[cacheKey] = nil
+            if !entries.isEmpty { artworkCatalogs[cacheKey] = entries }
         }
-        let source = artworkCatalogSources[platform] ?? boxartIndexURL(for: platform)
+        let source = artworkCatalogSources[cacheKey] ?? libretroIndexURL(for: platform, directory: directory)
 
         let normalizedQuery = normalize(title)
         let match = entries
@@ -1480,22 +2266,18 @@ actor GameMetadataService {
         return (match.filename, source)
     }
 
-    /// The libretro thumbnail index is unreachable from some networks. Fall
-    /// back to the GitHub mirror, which serves the same Named_Boxarts trees
-    /// one system per repository.
-    private func boxartCatalog(platform: GameMetadataPlatform) async -> [String] {
-        if let indexURL = boxartIndexURL(for: platform),
+    private func libretroCatalog(platform: GameMetadataPlatform, directory: String, cacheKey: String) async -> [String] {
+        if let indexURL = libretroIndexURL(for: platform, directory: directory),
            let data = try? await download(indexURL),
            let html = String(data: data, encoding: .utf8) {
             let filenames = boxartFilenames(in: html)
             if !filenames.isEmpty {
-                artworkCatalogSources[platform] = indexURL
+                artworkCatalogSources[cacheKey] = indexURL
                 return filenames
             }
         }
         guard let systemFolder = retroSystemFolder(for: platform) else { return [] }
         let repository = systemFolder.replacingOccurrences(of: " ", with: "_")
-        let directory = "Named_Boxarts"
         let trees = "https://api.github.com/repos/libretro-thumbnails/\(repository)/git/trees"
         guard let rootURL = URL(string: trees + "/master"),
               let rootData = try? await download(rootURL),
@@ -1511,7 +2293,7 @@ actor GameMetadataService {
             return path
         }
         if !filenames.isEmpty {
-            artworkCatalogSources[platform] = URL(string: "https://raw.githubusercontent.com/libretro-thumbnails/\(repository)/master/\(directory)/")
+            artworkCatalogSources[cacheKey] = URL(string: "https://raw.githubusercontent.com/libretro-thumbnails/\(repository)/master/\(directory)/")
         }
         return filenames
     }
@@ -1535,25 +2317,49 @@ actor GameMetadataService {
         case .nds: return "Nintendo - Nintendo DS"
         case .threeDS: return "Nintendo - Nintendo 3DS"
         case .psp: return "Sony - PlayStation Portable"
-        case .famicom: return "Nintendo - Nintendo Entertainment System"
+        case .famicom, .dendy: return "Nintendo - Nintendo Entertainment System"
+        case .fds: return "Nintendo - Family Computer Disk System"
         case .superFamicom: return "Nintendo - Super Nintendo Entertainment System"
-        case .n64: return "Nintendo - Nintendo 64"
+        case .n64, .n64dd: return "Nintendo - Nintendo 64"
         case .megaDrive: return "Sega - Mega Drive - Genesis"
         case .ps1: return "Sony - PlayStation"
         case .ps2: return "Sony - PlayStation 2"
         case .ps3: return "Sony - PlayStation 3"
         case .psv: return "Sony - PlayStation Vita"
+        case .gamecube: return "Nintendo - GameCube"
         case .wii: return "Nintendo - Wii"
         case .wiiu: return "Nintendo - Wii U"
+        case .dreamcast: return "Sega - Dreamcast"
+        case .xbox: return "Microsoft - Xbox"
+        case .atari2600: return "Atari - 2600"
+        case .colecovision: return "Coleco - ColecoVision"
+        case .msx: return "Microsoft - MSX"
+        case .msx2: return "Microsoft - MSX2"
+        case .pce, .sgx: return "NEC - PC Engine - TurboGrafx 16"
+        case .pcecd, .sgxcd: return "NEC - PC Engine CD - TurboGrafx-CD"
+        case .sms: return "Sega - Master System - Mark III"
+        case .gg: return "Sega - Game Gear"
+        case .segacd, .segacd32x: return "Sega - Mega-CD - Sega CD"
+        case .sega32x: return "Sega - 32X"
+        case .sg1000, .sc3000: return "Sega - SG-1000"
+        case .ws: return "Bandai - WonderSwan"
+        case .wsc: return "Bandai - WonderSwan Color"
+        case .ngp: return "SNK - Neo Geo Pocket"
+        case .ngpc: return "SNK - Neo Geo Pocket Color"
+        case .aes, .mvs: return "SNK - Neo Geo"
+        case .arcade: return "FBNeo - Arcade Games"
+        case .zx, .zx128: return "Sinclair - ZX Spectrum"
         default: return nil
         }
     }
 
-    private func boxartIndexURL(for platform: GameMetadataPlatform) -> URL? {
+    private func libretroIndexURL(for platform: GameMetadataPlatform, directory: String) -> URL? {
         guard let systemFolder = retroSystemFolder(for: platform) else { return nil }
         let encodedFolder = systemFolder.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? systemFolder
-        return URL(string: "https://thumbnails.libretro.com/\(encodedFolder)/Named_Boxarts/")
+        return URL(string: "https://thumbnails.libretro.com/\(encodedFolder)/\(directory)/")
     }
+
+    // MARK: - Networking & Utilities
 
     private func download(_ url: URL, userAgent: String? = nil) async throws -> Data {
         var request = URLRequest(url: url)
@@ -1574,12 +2380,7 @@ actor GameMetadataService {
     }
 
     private func pixelDimensions(_ data: Data) -> (width: Int, height: Int)? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let width = properties[kCGImagePropertyPixelWidth] as? Int,
-              let height = properties[kCGImagePropertyPixelHeight] as? Int,
-              width > 0, height > 0 else { return nil }
-        return (width, height)
+        MetadataRefreshPolicy.imageDimensions(data: data)
     }
 
     private func pixelArea(_ data: Data) -> Int {
@@ -1605,6 +2406,13 @@ actor GameMetadataService {
         }
         return prefix + "…"
     }
+}
+
+private struct LocalGameMetadata {
+    let title: String?
+    let productID: String?
+    let icon: DownloadedArtwork?
+    let backdrop: DownloadedArtwork?
 }
 
 private struct WikipediaGamePage {
