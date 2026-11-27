@@ -39,7 +39,7 @@ struct GCRetro {
 
 static GCRetro *active;
 static char error[512];
-static char last_log_error[512];
+static char last_log_error[1024];
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void core_log(int level, const char *format, ...) {
@@ -51,6 +51,7 @@ static void core_log(int level, const char *format, ...) {
     int n = vsnprintf(buf, sizeof(buf), format, copy);
     va_end(copy);
     if (n > 0) {
+        if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
         while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
         if (n > 0) {
             pthread_mutex_lock(&log_mutex);
@@ -58,7 +59,22 @@ static void core_log(int level, const char *format, ...) {
                 snprintf(last_log_error, sizeof(last_log_error), "%s", buf);
             } else if (strstr(last_log_error, buf) == NULL) {
                 size_t cur = strlen(last_log_error);
-                if (cur + 3 < sizeof(last_log_error)) {
+                size_t add = 3 + (size_t)n;
+                /* Drop oldest entries so the most recent fatal error is never lost. */
+                while (cur + add >= sizeof(last_log_error)) {
+                    char *sep = strstr(last_log_error, " | ");
+                    if (!sep) {
+                        last_log_error[0] = '\0';
+                        cur = 0;
+                        break;
+                    }
+                    size_t rest = strlen(sep + 3);
+                    memmove(last_log_error, sep + 3, rest + 1);
+                    cur = rest;
+                }
+                if (cur == 0) {
+                    snprintf(last_log_error, sizeof(last_log_error), "%s", buf);
+                } else {
                     snprintf(last_log_error + cur, sizeof(last_log_error) - cur, " | %s", buf);
                 }
             }
@@ -101,6 +117,9 @@ static bool environment(unsigned command, void *arg) {
     switch (command) {
         case 27: ((struct { void (*log)(int, const char *, ...); } *)arg)->log = core_log; return true;
         case 3: *(bool *)arg = true; return true;  /* Can duplicate video frames. */
+        case 7: /* RETRO_ENVIRONMENT_SHUTDOWN */
+            active->shutdown_requested = true;
+            return true;
         case 9: *(const char **)arg = active->system; return true;
         case 30: *(const char **)arg = active->system; return true; /* GET_CORE_ASSETS_DIRECTORY */
         case 10:
@@ -108,9 +127,6 @@ static bool environment(unsigned command, void *arg) {
             active->format = *(const int *)arg;
             return true;
         case 11: return true; /* SET_INPUT_DESCRIPTORS */
-        case 13: /* RETRO_ENVIRONMENT_SHUTDOWN */
-            active->shutdown_requested = true;
-            return true;
         case 14: case (14 | 0x10000):  /* SET_HW_RENDER */
             active->hardware_requested = true;
             return false;
@@ -210,10 +226,11 @@ static bool environment(unsigned command, void *arg) {
         case 32: active->timing = ((const struct AVInfo *)arg)->timing; return true;
         case 37: return true; /* SET_GEOMETRY */
         case 39: *(unsigned *)arg = 12; return true;  /* GET_LANGUAGE: simplified Chinese */
-        case 47: *(unsigned *)arg = 1; return true;   /* GET_INPUT_MAX_USERS */
         case 52: *(unsigned *)arg = 2; return true;   /* GET_CORE_OPTIONS_VERSION */
         case 55: return true; /* SET_CORE_OPTIONS_DISPLAY */
         case 59: *(unsigned *)arg = 0; return true;   /* GET_MESSAGE_INTERFACE_VERSION */
+        case 61: *(unsigned *)arg = 1; return true;   /* GET_INPUT_MAX_USERS */
+        case 74: *(bool *)arg = false; return true;   /* GET_JIT_CAPABLE */
         case 51: case (51 | 0x10000): return true;    /* GET_INPUT_BITMASKS */
         default: return false;
     }
@@ -309,7 +326,7 @@ static int16_t input(unsigned port, unsigned device, unsigned index, unsigned id
 
 const char *gc_retro_error(void) { return error; }
 const char *gc_retro_last_log_error(void) {
-    static char snapshot[512];
+    static char snapshot[1024];
     pthread_mutex_lock(&log_mutex);
     snprintf(snapshot, sizeof(snapshot), "%s", last_log_error);
     pthread_mutex_unlock(&log_mutex);
@@ -373,10 +390,13 @@ GCRetro *gc_retro_open(const char *core, const char *rom, const char *system, co
     if (!s->loaded) {
         if (s->hardware_requested) {
             snprintf(error, sizeof(error), "该核心需要 Game Center 尚未接入的硬件渲染接口");
-        } else if (last_log_error[0]) {
-            snprintf(error, sizeof(error), "核心无法读取游戏，请检查 ROM 格式和 BIOS（%s）", last_log_error);
         } else {
-            snprintf(error, sizeof(error), "核心无法读取游戏，请检查 ROM 格式和 BIOS");
+            const char *log_detail = gc_retro_last_log_error();
+            if (log_detail[0]) {
+                snprintf(error, sizeof(error), "核心无法读取游戏，请检查 ROM 格式和 BIOS（%s）", log_detail);
+            } else {
+                snprintf(error, sizeof(error), "核心无法读取游戏，请检查 ROM 格式和 BIOS");
+            }
         }
         goto fail;
     }
