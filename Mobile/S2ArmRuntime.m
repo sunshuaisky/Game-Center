@@ -209,6 +209,7 @@ const char *gc_s2arm_start_game(const char *title_id) {
         if (!resumeGame) return "当前 IPA 的宿主尚不支持再次启动，请安装新版 Game Center IPA。";
         int result = resumeGame(title_id);
         if (result == -4) return "无法准备这款游戏的运行环境，请检查游戏包和运行日志。";
+        if (result == -7) return "当前进程已运行过其他 Switch 游戏，保留的地址空间不足以直接切换此游戏，请关闭并重新打开 Game Center 后运行。";
         return result ? "游戏会话暂时未能重新启动，请稍后重试。" : NULL;
     }
     if (gc_s2arm_active()) return "请先退出当前游戏，再选择另一款游戏。";

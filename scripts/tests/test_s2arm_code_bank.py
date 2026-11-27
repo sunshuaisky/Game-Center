@@ -26,10 +26,14 @@ static __attribute__((noreturn)) void die(const char *message, ...) { fprintf(st
 static int s2a_programs_count(const char *path) { return !strcmp(path, "A") ? 2 : 1; }
 static int s2a_programs_dir(const char *path, int n, char *out, size_t cap) { snprintf(out, cap, "%s/%d", path, n); return 0; }
 void s2a_loader_image_program(int p) { image_program = p; }
+static uint64_t a0_size = 4ull << 20;
 static uint64_t s2a_module_span(const char *path) {
-    if (!strcmp(path, "A/0")) { assert(image_program == 0); return 4ull << 20; }
+    if (!strcmp(path, "A/0")) { assert(image_program == 0); return a0_size; }
     if (!strcmp(path, "A/1")) { assert(image_program == 1); return 6ull << 20; }
-    assert(!strcmp(path, "B/0") && image_program == 0); return 8ull << 20;
+    if (!strcmp(path, "B/0")) { assert(image_program == 0); return 8ull << 20; }
+    if (!strcmp(path, "C/0")) { assert(image_program == 0); return 12ull << 20; }
+    if (!strcmp(path, "HUGE/0")) { assert(image_program == 0); return 1020ull << 20; }
+    assert(0); return 0;
 }
 static const s2a_launch_ctx *s2a_launch_ctx_get(void) { return &selected; }
 static int s2a_host_program_index(void) { return current_program; }
@@ -50,7 +54,35 @@ int main(void) {
     assert(s2a_loader_container_code_base(w) == w);
     current_program = 1;
     assert(s2a_loader_container_code_base(w) == w + (4ull << 20) && g_code_limit == w + (10ull << 20));
-    puts("PASS: A -> B -> A, ExecuteProgram slots, disjoint code/data budget, deduplicated reservations");
+    current_program = 0;
+
+    // Pre-lock update when title-A grows compacts slots cleanly.
+    a0_size = 6ull << 20;
+    assert(s2a_loader_container_code_ensure_tagged("title-A", "A", 101) == 0);
+    strcpy(selected.game_id, "title-B");
+    assert(s2a_loader_container_code_base(w) == w && g_code_limit == w + (8ull << 20));
+    strcpy(selected.game_id, "title-A");
+    assert(s2a_loader_container_code_base(w) == w + (8ull << 20) && g_code_limit == w + (14ull << 20));
+
+    // Lock the 1 GiB bank and verify late-imported C, returning to A, updated A, and overflow rejection.
+    s2a_loader_container_code_lock();
+    assert(s2a_loader_container_code_size() == (1ull << 30));
+    assert(s2a_loader_container_code_ensure_tagged("title-C", "C", 201) == 0);
+    strcpy(selected.game_id, "title-C");
+    assert(s2a_loader_container_code_base(w) == w + (20ull << 20) && g_code_limit == w + (32ull << 20));
+    // Returning to unchanged title-A reuses its exact slot.
+    assert(s2a_loader_container_code_ensure_tagged("title-A", "A", 101) == 0);
+    strcpy(selected.game_id, "title-A");
+    assert(s2a_loader_container_code_base(w) == w + (8ull << 20));
+    // Re-imported updated title-A (different tag) gets a fresh disjoint slot after C.
+    assert(s2a_loader_container_code_ensure_tagged("title-A", "A", 102) == 0);
+    assert(s2a_loader_container_code_base(w) == w + (32ull << 20) && g_code_limit == w + (38ull << 20));
+    // Overflowing the locked 1 GiB bank is rejected cleanly without losing existing slots.
+    assert(s2a_loader_container_code_ensure_tagged("title-HUGE", "HUGE", 301) != 0);
+    assert(s2a_loader_container_code_size() == (1ull << 30));
+    strcpy(selected.game_id, "title-C");
+    assert(s2a_loader_container_code_base(w) == w + (20ull << 20));
+    puts("PASS: A -> B -> A, late-import C, updated A, overflow guard, ExecuteProgram slots");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='gc-code-bank-') as tmp:

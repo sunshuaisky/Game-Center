@@ -73,7 +73,7 @@ Title ID，资源和程序分别保存。只有一个 IMG 的目录不构成可�
   回调和启动校验。NXNative 使用同一 IPA 内的 NX2Apple Shell 桥接。
   不包含每款游戏的程序和资源。运行时版本记在 IPA 的 `S2Arm-runtime.json`。
 - S2Arm 游戏包必须有 `catalogue.json`（宿主 ABI、程序哈希及签名团队）；旧版导出缺少该文件，
-  需要在 Mac 重新构建。首次导入后关闭并重新打开 App，让宿主在启动阶段准备地址空间。
+  需要在 Mac 重新构建。导入后可直接点击启动，宿主在起局前自动校验并按需调整地址空间与代码槽位。
   游戏文件仍在 `GameLibrary/Switch/<TitleID>/Builds/S2Arm`，内部运行目录使用别名，
   不复制 IMG；设置在 `<TitleID>/UserData/S2Arm`，存档统一在 `GameLibrary/save/switch/<TitleID>`。
 - S2Arm 设置菜单提供退出确认，安全退休会话后恢复启动前保留的游戏详情控制器。

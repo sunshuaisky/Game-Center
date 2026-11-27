@@ -1,6 +1,8 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 4bd6a0e..358c58e 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
-@@ -20923,6 +20923,8 @@
+@@ -20923,6 +20923,8 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
  // Do not wait indefinitely in display-link mode: see the note at STALL_NS. Only frames "not yet taken by the display link" are dropped; the one already on its way to the screen is waited for until handed to the GPU (same dropping as when entering the background)
  void nvn_be_present_wait(uint64_t tk) {
      pthread_mutex_lock(&g_pq_mu);
@@ -9,7 +11,7 @@
      // S2Arm: a full-window grab of this ticket or an earlier one still copying reads the texture being handed back (grab_present); wait for the copy (GPU time, under a millisecond)
      while (g_grab_tk && g_grab_tk <= tk && !atomic_load(&g_present_discard)) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
      int blk = g_pq_done < tk && !atomic_load(&g_present_discard); if (blk) { pthread_mutex_unlock(&g_pq_mu); DM_BLOCK_BEGIN(); pthread_mutex_lock(&g_pq_mu); }
-@@ -20938,7 +20940,8 @@
+@@ -20938,7 +20940,8 @@ void nvn_be_present_wait(uint64_t tk) {
          uint64_t n = tk - g_pq_read;
          for (uint64_t k = g_pq_read + 1; k <= tk; k++) g_pres[k % PRING] = (pres_ent){k, -1};
          g_link_dropped += n; g_pq_read = tk;
@@ -19,13 +21,14 @@
          if (g_pq_done < tk) g_pq_done = tk;
          pthread_cond_broadcast(&g_pq_cv);
          if (!g_stall_t0) { g_stall_t0 = last ? last : now; g_stall_drop = 0; g_stall_red = 0; g_stall_logged = 0; g_stall_n++; }
+diff --git a/graphics/nvn/host_adapt.m b/graphics/nvn/host_adapt.m
+index 546b045..711d0fa 100644
 --- a/graphics/nvn/host_adapt.m
 +++ b/graphics/nvn/host_adapt.m
-@@ -593,6 +593,16 @@
-     int r = nvn_be_reload_direct_library();
+@@ -594,6 +594,16 @@ int s2a_direct_program_switch(int n) {
      LOG("多程序合集：图形层换到序号 %d：着色器库 %s（%s）", n, getenv("DM_MSL_DIR"), r > 0 ? "已重读映射表、重开库容器" : "映射表路径没变，不重读");
      return r > 0 ? 1 : 0;
-+}
+ }
 +// Retarget all title-owned shader paths only between fully retired sessions.
 +int s2a_direct_game_switch(void) {
 +    const char *gd = getenv("S2A_GAME_DATA");
@@ -35,12 +38,15 @@
 +    direct_paths();
 +    (void)s2a_nvn_prof(); memset(&g_prof, 0, sizeof g_prof); prof_load(gd);
 +    return nvn_be_reload_direct_library() < 0 ? -1 : 0;
- }
++}
  // 直连模式下装载器解析游戏导入的 nvnBootstrapLoader 时调一次（重定位期）：查每款参数、换切栈桩，回取址入口（第一次被游戏调到时再定路径）
  void *s2a_nvn_bootstrap_entry(void) {
+     static int done; if (done) return (void *)direct_bootstrap;
+diff --git a/ios/app.m b/ios/app.m
+index 9e7893f..d9b797a 100644
 --- a/ios/app.m
 +++ b/ios/app.m
-@@ -225,6 +225,7 @@
+@@ -225,6 +225,7 @@ static void s2a_direct_drain_or_resume(int on) {
      if (suspend) suspend(on);
  }
  static void s2a_ios_suspend(int on, const char *why) {
@@ -48,7 +54,7 @@
      int transition = s2a_session_background_begin(on);
      if (transition == S2A_SESSION_LIFECYCLE_DEFERRED) {
          s2a_controller_set_foreground(0);
-@@ -324,7 +325,6 @@
+@@ -324,7 +325,6 @@ static void note_build(void) {
          [bs addObject:s2a_notice_button(S2AL(@"diag.report.title"), primary, ^(UIButton *b) { (void)b; s2a_diag_report(); })]; }
      g_note_view = s2a_notice_page(g_root.bounds, g_note[0], g_note[1], g_note[2], [g_note[3] floatValue], [g_note[4] length] ? g_note[4] : nil, bs);
      [g_root addSubview:g_note_view];
@@ -56,7 +62,7 @@
  }
  // C 层递来的规格文案（起局自检提示页 host_main.c → s2a_selfcheck_page、初启失败页正文 init_fail.c）是 runtime/include 里的中文原宏；
  //   英文 App 按逐字相等换成同名 <宏>_EN（#316）。不在表里的原样显示
-@@ -450,7 +450,6 @@
+@@ -450,7 +450,6 @@ static void help_build(NSString *title, NSString *detail, NSString *app) {
      UIButton *btn = s2a_notice_button(S2AL(@"app.packHelp.recheckPlaced"), YES, ^(UIButton *b) { b.enabled = NO; [b setTitle:S2AL(@"app.packHelp.checking") forState:UIControlStateDisabled];
          void (*f)(void) = g_help_recheck; if (f) f(); });
      g_help = s2a_notice_help_page(g_root.bounds, title, detail, app, btn); [g_root addSubview:g_help];
@@ -64,7 +70,7 @@
      // 测试开关（真机验收没法点屏）：S2A_PACK_RECHECK_AUTO=<秒> 每隔这么久代按一次「重新检查」，说明页收起即停
      { static int armed; const char *e = getenv("S2A_PACK_RECHECK_AUTO"); double sec = e ? atof(e) : 0;
        if (sec > 0 && !armed) { armed = 1; LOG("说明页：测试开关 S2A_PACK_RECHECK_AUTO=%s，每 %.0f 秒代按「重新检查」", e, sec);
-@@ -844,19 +843,19 @@
+@@ -844,19 +843,19 @@ - (void)startMonitoring {
      s2a_session_on_restart_done(restart_done);   // 任何发起方的进程内重启完成都由壳放重启首帧屏障（见 restart_done）
      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ snap_result_check(); });   // 兜住「恢复失败、进程直接退出」：下次打开时说
      NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
@@ -88,7 +94,7 @@
      // 测试开关 S2A_TEST_LIFECYCLE=<秒>（宿主生命周期自测，11-11 v0.3.0 局中失焦崩溃之后加；环境变量只有 devicectl / Xcode 起 App 能给，玩家碰不到）：
      //   启动后这么多秒（起局、虚拟手柄已显示），在主线程上按真机顺序发系统的前后台通知——失去焦点 → 获得焦点（短暂失焦，如下拉横幅）→
      //   进后台 → 回前台 → 获得焦点，走的是上面同一套处理函数与生命周期队列（s2a_ios_suspend_enqueue）。同时设 S2A_STRICT_MAIN=1：
-@@ -1378,14 +1377,6 @@
+@@ -1378,14 +1377,6 @@ static void pack_layout_prepare(const char *proc_docs) {   // 后台线程
          [NSFileManager.defaultManager createDirectoryAtURL:u withIntermediateDirectories:YES attributes:nil error:nil];
          if (![u setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:&e]) LOG("【红】资源包目录标「不进备份」没成：%s", e.localizedDescription.UTF8String);
      }
@@ -103,7 +109,7 @@
  }
  int s2a_dump_threads(const char *why);   // runtime/src/tdump.c
  static void import_watch_start(void);
-@@ -1861,3 +1852,43 @@
+@@ -1861,3 +1852,64 @@ void s2a_front_run(void (*start_host)(void)) {
  //   （Host.cs PickLanguage → SystemLocale.FromPreferred），选过界面语言时列表第一项就是它，跟随系统时是设备系统语言；玩家逐款选的游戏语言走 S2A_SYSTEM_LANGUAGE（settings.m）
  __attribute__((constructor)) static void s2a_ui_language_env(void) { @autoreleasepool { (void)s2a_l10n_apply_choice(); } }
  int dm_low_power_now(void) { return NSProcessInfo.processInfo.lowPowerModeEnabled ? 1 : 0; }
@@ -128,6 +134,27 @@
 +    {
 +        const char *why = s2a_launch_ctx_select(gid);
 +        if (why) { LOG("Game Center：切换游戏失败：%s", why); return -4; }
++        lc = s2a_launch_ctx_get();
++        if (!lc) return -4;
++        {
++            char npdm[1200]; snprintf(npdm, sizeof npdm, "%s/main.npdm", lc->module_dir);
++            int (*can_resume)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "s2a_window_can_resume_npdm");
++            if (can_resume && !can_resume(npdm)) {
++                LOG("Game Center：切换游戏 %s 失败：地址空间类型与当前窗口不兼容", gid);
++                return -7;
++            }
++            int (*ensure_code)(const char *, const char *, uint64_t) =
++                (int (*)(const char *, const char *, uint64_t))dlsym(RTLD_DEFAULT, "s2a_loader_container_code_ensure_tagged");
++            if (ensure_code) {
++                uint64_t tag = 0; struct stat st;
++                if (!stat(lc->images, &st)) tag = ((uint64_t)st.st_ino << 32) ^ (uint64_t)st.st_size ^ (uint64_t)st.st_mtimespec.tv_sec;
++                if (!tag) tag = 1;
++                if (ensure_code(gid, lc->module_dir, tag)) {
++                    LOG("Game Center：切换游戏 %s 失败：当前进程保留的代码区不足以加入这款游戏", gid);
++                    return -7;
++                }
++            }
++        }
 +        int s2a_host_select_stopped_game(void);
 +        if (s2a_host_select_stopped_game()) return -5;
 +        LOG("Game Center：切换游戏 %s，%s", gid, s2a_host_pre_ui_checks());
@@ -147,9 +174,11 @@
 +    }
 +    return -2;
 +}
+diff --git a/ios/loadpage.m b/ios/loadpage.m
+index 47fdde7..c2dd33e 100644
 --- a/ios/loadpage.m
 +++ b/ios/loadpage.m
-@@ -187,7 +187,6 @@
+@@ -187,7 +187,6 @@ void s2a_loadpage_attach(UIView *root) {
  static void page_build(UIView *root, int first) {
      g_page = [[S2ALoadPage alloc] initWithFrame:root.bounds firstRun:first];
      [root addSubview:g_page]; [g_page refresh];
@@ -157,9 +186,11 @@
      __weak S2ALoadPage *w = g_page;
      g_page.timer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) { (void)t;
          S2ALoadPage *pg = w; if (!pg) return;
+diff --git a/ios/vpad.m b/ios/vpad.m
+index d9091bf..9fb5e5c 100644
 --- a/ios/vpad.m
 +++ b/ios/vpad.m
-@@ -306,7 +306,6 @@
+@@ -306,7 +306,6 @@ @implementation S2AVPadView {
      S2AScreenLockView *_screenLock;
      _Atomic int _screenLocked;   // HID 线程也读，遮罩本身只在主线程操作
      UIButton *_gear; NSTimer *_gearFade;    // 游戏内设置入口：屏幕左上角常驻，闲置时淡到看得见但不抢画面
@@ -167,7 +198,7 @@
      UIButton *_snapBtn; NSString *_snapDir; // 0.6.0 快照：右上角和齿轮对称的存档按钮（同样式、同淡出）；单击存、长按出「回到这一刻」。起局没开快照就不建
      BOOL _touchWanted;                      // 游戏启用过触屏（s2a_vpad_touch_wanted）
      int _autoTouch;                         // 自动切（游戏声明触屏配置，manual=0）的本次运行覆盖：1 = 本次按仅触屏跑、不改持久化选择；0 = 没有覆盖
-@@ -394,11 +393,6 @@
+@@ -394,11 +393,6 @@ - (instancetype)initWithFrame:(CGRect)f {
      _gear.showsMenuAsPrimaryAction = YES; _gear.menu = [self gearMenu];
      [_gear addTarget:self action:@selector(wakeGear) forControlEvents:UIControlEventMenuActionTriggered];
      [self addSubview:_gear];
@@ -179,7 +210,7 @@
      [self buildSnapButton];
      [self wakeGear];
      for (int i = 0; i < 2; i++) {
-@@ -417,9 +411,9 @@
+@@ -417,9 +411,9 @@ - (instancetype)initWithFrame:(CGRect)f {
      return self;
  }
  - (void)wakeGear {   // 刚显示时看得清，3 秒后淡到 0.35：玩家找得到，又不挡画面
@@ -191,7 +222,7 @@
  }
  // ---------- 齿轮菜单（B 方案：一级 → 二级，见 docs 设计稿「游戏内手柄设置 B 方案稿」）----------
  // 四指长按 / 手柄长按「+」照旧开整页设置（系统菜单不能由代码弹出）；菜单最下「更多设置」也到整页
-@@ -717,7 +711,6 @@
+@@ -717,7 +711,6 @@ - (void)buildSnapButton {
  }
  - (void)snapTapped { [self wakeGear]; [self snapSave:_snapDir]; }
  // 故障报修（11-19 维护者定：从齿轮菜单拿出来放齿轮右边）：写清哪款游戏、做了什么、看到了什么（必填）→ 打包上传、给短码（diag.m s2a_diag_report）
@@ -199,7 +230,7 @@
  // 快照的缩略图与存下的时间：先用快照里的小图 thumb.png，没有就用存档那一刻的整帧 a_last.png；时间取图的修改时间（存下那一刻写的）；存的时候没取到画面的快照没有图，时间取清单 manifest.tsv 的修改时间
  static UIImage *snap_thumb(NSString *dir, CGFloat w, NSDate **when) {
      for (NSString *n in @[@"thumb.png", @"a_last.png"]) {
-@@ -1354,7 +1347,6 @@
+@@ -1354,7 +1347,6 @@ - (void)layoutSubviews {
      {   // 设置入口放安全区左上角；折叠屏内屏圆角比安全区报的大、又有开孔，四周再让 20 点（短边 ≥ 500 点才算大屏）
          CGRect g = self.safeAreaLayoutGuide.layoutFrame; CGFloat inset = MIN(self.bounds.size.width, self.bounds.size.height) >= 500 ? 20 : 4;
          _gear.frame = CGRectMake(CGRectGetMinX(g) + inset, CGRectGetMinY(g) + inset, 36, 36); _gear.hidden = _editing; [self bringSubviewToFront:_gear];
@@ -207,9 +238,11 @@
          if (_snapBtn) { _snapBtn.frame = CGRectMake(CGRectGetMaxX(g) - inset - 36, CGRectGetMinY(g) + inset, 36, 36); _snapBtn.hidden = _editing; [self bringSubviewToFront:_snapBtn]; } }
      if (!CGRectEqualToRect(_safeRect, safe) || !CGRectEqualToRect(_lastBounds, self.bounds) || !CGRectEqualToRect(_division,l.division)) {
          if (_editing) [self endEditing];   // 转屏 / 安全区变了：拖到一半的位置按旧几何算，放弃
+diff --git a/runtime/include/s2a_session.h b/runtime/include/s2a_session.h
+index 31311f5..b9e9bfc 100644
 --- a/runtime/include/s2a_session.h
 +++ b/runtime/include/s2a_session.h
-@@ -11,6 +11,7 @@
+@@ -11,6 +11,7 @@ enum {
      S2A_SESSION_RUNNING,
      S2A_SESSION_RESTARTING,
      S2A_SESSION_FAILED,
@@ -217,7 +250,7 @@
  };
  typedef void (*s2a_restart_callback)(int result, const char *detail, void *context);
  // 0 = accepted, -1 = no running session, -2 = missing lifecycle support,
-@@ -21,6 +22,9 @@
+@@ -21,6 +22,9 @@ typedef void (*s2a_restart_callback)(int result, const char *detail, void *conte
  // Timeout reports failure once and seals rebuilding; an execution worker may
  // still own old resources. Failure is not proof that cleanup has completed.
  int s2a_host_restart(s2a_restart_callback callback, void *context);
@@ -227,9 +260,11 @@
  int s2a_host_session_state(void);
  // 重启完成登记点（进程级，壳在启动时登记一次；会话复位不清）：任何发起方（设置页 / 游戏 ExecuteProgram /
  // 测试开关）的进程内重启，新局起来后都在控制线程上调一次，generation 是新会话代号；失败 / 超时不调（失败已报红）。
+diff --git a/runtime/src/host_main.c b/runtime/src/host_main.c
+index 5c8cacb..5297539 100644
 --- a/runtime/src/host_main.c
 +++ b/runtime/src/host_main.c
-@@ -213,6 +213,31 @@
+@@ -213,6 +213,31 @@ static void failed_session(int code) {
  // 宿主别处（svc_mem.c 布局判出设备放不下，#446）走同一个初启失败出口：iOS 人手局停提示页，Mac / 自动化局失败退出
  void s2a_init_failed(int code) { failed_session(code); }
  
@@ -261,9 +296,11 @@
  // 只由 session.c 在上一局 guest / 服务 / GPU 完整退休后调用。
  int s2a_host_rebuild(void) {
  #if TARGET_OS_IPHONE
+diff --git a/runtime/src/launchctx.c b/runtime/src/launchctx.c
+index 06a2318..765aca8 100644
 --- a/runtime/src/launchctx.c
 +++ b/runtime/src/launchctx.c
-@@ -481,7 +481,10 @@
+@@ -481,7 +481,10 @@ const char *s2a_launch_ctx_select(const char *gid) {
      if (!g_container) return "不是多款容器（包根没有 s2a_catalogue.json，或设了 S2A_LAUNCH_CTX）：启动上下文已在构造期定好，不能再选游戏";
      pthread_mutex_lock(&g_sel_mu);
      const char *r = NULL;
@@ -275,25 +312,28 @@
      s2a_launch_ctx c; char w[600];
      if (s2a_launch_ctx_resolve_game(&c, g_bundle, getenv("HOME"), gid, w, sizeof w)) { snprintf(why, sizeof why, "%s", w); g_sel_kind = S2A_SELECT_APP_INCOMPLETE; r = why; goto out; }
      {   // 宿主约定号（s2a_host_abi.h）：产物是按别的约定出的就不载入——不然改写器与运行时对不上，进游戏后静默崩。对不上 → 回游戏库标「要更新」
+diff --git a/runtime/src/loader.c b/runtime/src/loader.c
+index c4edfbd..2f0f817 100644
 --- a/runtime/src/loader.c
 +++ b/runtime/src/loader.c
-@@ -747,10 +747,12 @@
+@@ -747,18 +747,23 @@ enum { EMB_X0 = S2A_IMG_X0, EMB_W = S2A_IMG_W, EMB_X1 = S2A_IMG_X1, EMB_X2 = S2A
  // 弱链接[host,nvntest]：s2a_prov_hours_left_self（ios/prov_expiry.m 只在 iOS App 里；Mac 宿主与单测链接行按这行放行未定义）
  double s2a_prov_hours_left_self(void) __attribute__((weak_import));   // 本包描述文件剩几小时，读不到 NAN
  static const s2a_imgpack *ext_pack(void) {   // 进程内打开一次；包不在、打不开或签名不过 = 停（iOS 包必有它）
 -    static const s2a_imgpack *pk; static int done; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
-+    static const s2a_imgpack *pk; static char opened[S2A_LCTX_PATH]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
++    static const s2a_imgpack *pk; static char opened[S2A_LCTX_PATH]; static dev_t opened_dev; static ino_t opened_ino; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
      pthread_mutex_lock(&mu);
 -    if (!done) {
 -        const s2a_launch_ctx *lc = s2a_launch_ctx_get(); char why[512] = "";
+-        if (!lc) die("外置镜像包：启动上下文不可用：%s", s2a_launch_ctx_error());
 +    const s2a_launch_ctx *lc = s2a_launch_ctx_get();
 +    if (!lc) die("外置镜像包：启动上下文不可用：%s", s2a_launch_ctx_error());
-+    if (!pk || strcmp(opened, lc->images)) {
++    struct stat st; int has_st = !stat(lc->images, &st);
++    if (!pk || strcmp(opened, lc->images) || (has_st && (st.st_dev != opened_dev || st.st_ino != opened_ino))) {
 +        char why[512] = "";
-         if (!lc) die("外置镜像包：启动上下文不可用：%s", s2a_launch_ctx_error());
          const char *path = lc->images;   // 启动上下文冻结的镜像包（单款兼容 = <可执行文件目录>/Frameworks/S2AImages.dylib，同改造前）
          s2a_imgpack *q = NULL; int rc = s2a_imgpack_open(path, &q, why, sizeof why);
-@@ -758,7 +760,9 @@
+         // 免费签名 7 天到期后系统拒绝注册签名（#1496：3 局都在描述文件过期 13 小时后，重新签名装机后全好）：直接告诉玩家怎么办
          if (rc == S2A_IMG_ESIGN && s2a_prov_hours_left_self) { double h = s2a_prov_hours_left_self();
              if (h < 0) die("签名已过期（描述文件 %.1f 小时前到期，免费 Apple ID 签名 7 天有效）：在电脑上重新签名安装 S2Arm 即可，存档不受影响（%s）", -h, why); }
          if (rc) die("外置镜像包打不开（返回 %d）：%s", rc, why);
@@ -301,10 +341,11 @@
 +        // Opened packages are process-owned; previous signed mappings remain
 +        // valid and loader's code_same/slot retry selects a fresh landing site.
 +        pk = q; strlcpy(opened, path, sizeof opened);
++        if (has_st) { opened_dev = st.st_dev; opened_ino = st.st_ino; }
          LOG("外置镜像包：%s 已打开、签名已注册（镜像按需映射，不占宿主低区）", path);
      }
      pthread_mutex_unlock(&mu); return pk;
-@@ -844,6 +848,52 @@
+@@ -844,6 +849,180 @@ uint64_t s2a_module_span(const char *dir) {   // 模块目录里全部 <名>.fix
      }
      return t;
  }
@@ -313,10 +354,17 @@
 +// and ExecuteProgram branch returns to its own slot on A -> B -> A.
 +#if TARGET_OS_IPHONE
 +#include "s2a_programs.h"
-+typedef struct { char id[128]; int program; uint64_t offset, size; } s2a_code_slot;
++typedef struct { char id[128]; int program; uint64_t offset, size, tag; } s2a_code_slot;
 +static s2a_code_slot *g_code_slots;
 +static size_t g_code_count, g_code_titles;
 +static uint64_t g_code_bytes, g_code_limit;
++static uint64_t g_code_bank_locked;
++static int g_code_locked;
++static char g_code_single_id[128];
++static uint64_t g_code_single_tag;
++static uint64_t code_bank_round(uint64_t bytes) {
++    return (bytes + (1ull << 30) - 1) & ~((1ull << 30) - 1);
++}
 +void s2a_loader_container_code_add(const char *id, const char *directory) {
 +    for (size_t i = 0; i < g_code_count; i++) if (!strcmp(g_code_slots[i].id, id)) return;
 +    int n = s2a_programs_count(directory);
@@ -331,13 +379,134 @@
 +        uint64_t size = s2a_module_span(dir);
 +        s2a_code_slot *slot = &g_code_slots[g_code_count++];
 +        strlcpy(slot->id, id, sizeof slot->id); slot->program = i;
-+        slot->offset = g_code_bytes; slot->size = size;
++        slot->offset = g_code_bytes; slot->size = size; slot->tag = 0;
 +        g_code_bytes += size;
 +    }
 +    s2a_loader_image_program(0);
 +}
 +uint64_t s2a_loader_container_code_size(void) {
-+    return g_code_titles > 1 ? (g_code_bytes + (1ull << 30) - 1) & ~((1ull << 30) - 1) : 0;
++    if (g_code_locked) return g_code_bank_locked;
++    return g_code_titles > 1 ? code_bank_round(g_code_bytes) : 0;
++}
++void s2a_loader_container_code_lock(void) {
++    if (g_code_locked) return;
++    g_code_bank_locked = s2a_loader_container_code_size();
++    g_code_locked = 1;
++    const s2a_launch_ctx *lc = s2a_launch_ctx_get();
++    if (lc && lc->game_id[0]) strlcpy(g_code_single_id, lc->game_id, sizeof g_code_single_id);
++}
++void s2a_loader_container_code_reset_unlocked(void) {
++    if (g_code_locked) return;
++    free(g_code_slots);
++    g_code_slots = NULL;
++    g_code_count = g_code_titles = 0;
++    g_code_bytes = g_code_limit = 0;
++}
++int s2a_loader_container_code_ensure_tagged(const char *id, const char *directory, uint64_t tag) {
++    if (!id || !*id || !directory || !*directory) return -1;
++    int n = s2a_programs_count(directory);
++    if (n <= 0) return -1;
++    uint64_t *sizes = calloc((size_t)n, sizeof *sizes);
++    if (!sizes) return -1;
++    void s2a_loader_image_program(int);
++    uint64_t total = 0;
++    for (int i = 0; i < n; i++) {
++        char dir[1400];
++        if (s2a_programs_dir(directory, i, dir, sizeof dir)) { free(sizes); s2a_loader_image_program(0); return -1; }
++        s2a_loader_image_program(i);
++        sizes[i] = s2a_module_span(dir);
++        if (!sizes[i]) { free(sizes); s2a_loader_image_program(0); return -1; }
++        total += sizes[i];
++    }
++    s2a_loader_image_program(0);
++    size_t have = 0;
++    int fits = 1;
++    for (size_t i = 0; i < g_code_count; i++) {
++        if (strcmp(g_code_slots[i].id, id)) continue;
++        have++;
++        int p = g_code_slots[i].program;
++        if (p < 0 || p >= n || sizes[p] > g_code_slots[i].size) fits = 0;
++        if (g_code_locked && tag && g_code_slots[i].tag && g_code_slots[i].tag != tag) fits = 0;
++    }
++    if ((int)have != n) fits = 0;
++    if (!g_code_locked) {
++        if (have && fits) {
++            if (tag) {
++                for (size_t i = 0; i < g_code_count; i++)
++                    if (!strcmp(g_code_slots[i].id, id)) g_code_slots[i].tag = tag;
++                g_code_single_tag = tag;
++            }
++            free(sizes);
++            return 0;
++        }
++        if (have) {
++            size_t out = 0;
++            uint64_t off = 0;
++            for (size_t i = 0; i < g_code_count; i++) {
++                if (!strcmp(g_code_slots[i].id, id)) continue;
++                g_code_slots[out] = g_code_slots[i];
++                g_code_slots[out].offset = off;
++                off += g_code_slots[out].size;
++                out++;
++            }
++            g_code_count = out;
++            g_code_bytes = off;
++            if (g_code_titles) g_code_titles--;
++        }
++        s2a_code_slot *slots = realloc(g_code_slots, (g_code_count + (size_t)n) * sizeof *slots);
++        if (!slots) { free(sizes); return -1; }
++        g_code_slots = slots;
++        g_code_titles++;
++        for (int i = 0; i < n; i++) {
++            s2a_code_slot *slot = &g_code_slots[g_code_count++];
++            strlcpy(slot->id, id, sizeof slot->id);
++            slot->program = i;
++            slot->offset = g_code_bytes;
++            slot->size = sizes[i];
++            slot->tag = tag;
++            g_code_bytes += sizes[i];
++        }
++        if (tag) g_code_single_tag = tag;
++        free(sizes);
++        return 0;
++    }
++    if (!g_code_bank_locked) {
++        free(sizes);
++        if (strcmp(g_code_single_id, id)) return -1;
++        if (tag && g_code_single_tag && g_code_single_tag != tag) return -1;
++        return 0;
++    }
++    if (have && fits) {
++        if (tag) {
++            for (size_t i = 0; i < g_code_count; i++)
++                if (!strcmp(g_code_slots[i].id, id)) g_code_slots[i].tag = tag;
++        }
++        free(sizes);
++        return 0;
++    }
++    if (g_code_bytes + total > g_code_bank_locked) {
++        free(sizes);
++        return -1;
++    }
++    if (have) {
++        for (size_t i = 0; i < g_code_count; i++)
++            if (!strcmp(g_code_slots[i].id, id)) g_code_slots[i].id[0] = 0;
++    }
++    s2a_code_slot *slots = realloc(g_code_slots, (g_code_count + (size_t)n) * sizeof *slots);
++    if (!slots) { free(sizes); return -1; }
++    g_code_slots = slots;
++    if (!have) g_code_titles++;
++    for (int i = 0; i < n; i++) {
++        s2a_code_slot *slot = &g_code_slots[g_code_count++];
++        strlcpy(slot->id, id, sizeof slot->id);
++        slot->program = i;
++        slot->offset = g_code_bytes;
++        slot->size = sizes[i];
++        slot->tag = tag;
++        g_code_bytes += sizes[i];
++    }
++    free(sizes);
++    return 0;
 +}
 +uint64_t s2a_loader_container_code_base(uint64_t window) {
 +    g_code_limit = 0;
@@ -357,7 +526,7 @@
  static uint64_t g_modcur;   // 下一个模块的落点（窗口里模块段的游标）；0 = 没有窗口（S2A_VAWIN_NORESERVE 诊断），照旧由系统挑地址
  static uint64_t g_slot_at;  // 非 0：下一次 mod_slot 原地复用这个落点（nn::ro 卸了再装同一个 NRO：映回上次的地址，不再从游标切）
  // 模块落点：窗口里有模块段就从游标切一块（2 MB 对齐），否则 0（调用方用 ANYWHERE）
-@@ -852,6 +902,9 @@
+@@ -852,6 +1031,9 @@ static uint64_t mod_slot(module_t *m, uint64_t len) {
      if (!g_modcur) return 0;
      uint64_t at = g_modcur; g_modcur += (len + MOD_ALIGN - 1) & ~(MOD_ALIGN - 1);
      uint64_t wb, ws; s2a_window_get(&wb, &ws);
@@ -367,9 +536,11 @@
      if (g_modcur > wb + ws) die("%s 映像 %#llx 字节放不进窗口里的模块段（窗口 %#llx +%#llx，游标已到 %#llx）", m->name, (unsigned long long)len, (unsigned long long)wb, (unsigned long long)ws, (unsigned long long)g_modcur);
      return at;
  }
+diff --git a/runtime/src/session.c b/runtime/src/session.c
+index 2df3204..74d110b 100644
 --- a/runtime/src/session.c
 +++ b/runtime/src/session.c
-@@ -59,6 +59,8 @@
+@@ -59,6 +59,8 @@ int s2a_session_try_boot(void (*boot)(void *), void *context) {
  #define SESSION_FLAGS (SESSION_EXITING | SESSION_REPORTED)
  static _Atomic uint64_t g_session = SESSION(1, S2A_SESSION_STARTING);
  static _Atomic int g_stop_requested;
@@ -378,7 +549,7 @@
  static _Atomic int g_rebuilding;
  static _Atomic int g_control_ready;
  static _Atomic int g_retirement_active;
-@@ -440,6 +442,7 @@
+@@ -440,6 +442,7 @@ static void stop_failed(struct stop_progress *progress) {
  static const char *restart_session(unsigned *generation, struct stop_progress *progress) {
      unsigned old = *generation;
      const char *detail = retirement_error(old);
@@ -386,7 +557,7 @@
      if (!detail) detail = quiesce(progress);
      if (!detail) detail = retirement_error(old);
      if (!detail) {
-@@ -477,6 +480,17 @@
+@@ -477,6 +480,17 @@ static const char *restart_session(unsigned *generation, struct stop_progress *p
      if (!detail) detail = retirement_error(old);
      if (!detail) s2a_os_session_reset();
      if (!detail) detail = retirement_error(old);
@@ -404,7 +575,7 @@
      if (!detail) {
          // Only now have old guests, service callbacks and graphics retired.
          // This CAS also disarms the old-generation deadline in the controller.
-@@ -596,7 +610,7 @@
+@@ -596,7 +610,7 @@ static void *control_worker(void *unused) {
          if (exiting()) return NULL;
          // 重启完成登记点先于本次请求的回调：放屏障与发起方无关（设置页 / 游戏 ExecuteProgram 走同一处）；
          //   iOS 壳两者都派回主线程，先放屏障、后回设置页，与原设置页回调里的先后一致
@@ -413,7 +584,7 @@
          if (callback) callback(detail ? -1 : 0, detail ? detail : "新游戏会话已启动（尚不代表首帧/存档验收）", context);
      }
  }
-@@ -693,7 +707,7 @@
+@@ -693,7 +707,7 @@ void s2a_session_fresh_restart(void) {
  #else
  void s2a_session_fresh_restart(void) { s2a_logcon_flush(); _exit(6); }
  #endif
@@ -422,7 +593,7 @@
      if (pthread_mutex_trylock(&g_request_mu)) return -3;
      int state = s2a_host_session_state();
      if (!atomic_load(&g_control_ready) || exiting()) { pthread_mutex_unlock(&g_request_mu); return -2; }
-@@ -748,9 +762,46 @@
+@@ -748,9 +762,46 @@ int s2a_host_restart(s2a_restart_callback callback, void *context) {
          g_callback = NULL; g_context = NULL; g_requested_deadline = 0;
          pthread_mutex_unlock(&g_request_mu); return -1;
      }
@@ -469,9 +640,11 @@
 +    (void)callback; (void)context; return -2;
 +#endif
 +}
+diff --git a/runtime/src/svc_mem.c b/runtime/src/svc_mem.c
+index b80297f..b640262 100644
 --- a/runtime/src/svc_mem.c
 +++ b/runtime/src/svc_mem.c
-@@ -578,11 +578,20 @@
+@@ -578,11 +578,24 @@ static int far_direct_on(void) {
      const char *e = getenv("S2A_FAR_DIRECT"); if (e && *e == '0') { LOG("地址窗口：伸出段不并进窗口（S2A_FAR_DIRECT=0），照旧走远端"); return 0; }
      return 1;
  }
@@ -484,6 +657,10 @@
      uint32_t t, ms; uint64_t sr, pid, wb, ws;
      if (npdm_read(npdm, &t, &sr, &ms, &pid, 1)) die("读不到 NPDM：%s", npdm);
      s2a_window_get(&wb, &ws);
++    {
++        void (*lock_code)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "s2a_loader_container_code_lock");
++        if (lock_code) lock_code();
++    }
 +    uint64_t code_bank = container_code_size(), physical_base = wb;
 +    if (code_bank) {
 +        if (ws <= code_bank) die("多款程序代码区放不进地址窗口");
@@ -492,7 +669,7 @@
      uint64_t ws_hole = ws;   // 宿主占到的空洞（下面可能按学到的跨度再收）：判「放不下标准布局」用它（#1441）
      char detail[256] = {0};
      int platform_result = plat_layout_override(npdm, t, sr, pid, wb, ws, &L, &g_lay_need, detail, sizeof detail);
-@@ -592,7 +601,7 @@
+@@ -592,7 +605,7 @@ static void layout_prepare(const char *npdm) {
          s2a_window_trim(L.win_size); g_lay_ok = 1; return;
      }
      if (platform_result != ENOTSUP) die("【红】平台地址布局失败：%s", detail);
@@ -501,7 +678,7 @@
      g_lay_need = s2a_layout_need(t, sr, mod);
      // 多款容器选定游戏后按这一款自己学到的跨度收窗口（#55248c）：构造期还没选游戏，窗口按包内各款学到跨度的最大值给（vawin.c），
      //   一款跨度大的（或没记录、按标准布局算的）会把别款的窗口撑大、宿主被饿——11-16 马车世界三台：本款只碰到 13.6 GB，窗口却按别款 40 GB 给，
-@@ -611,7 +620,7 @@
+@@ -611,7 +624,7 @@ static void layout_prepare(const char *npdm) {
        // 收窄前按收窄后的大小试算一遍：堆区装不下这款要的堆（上一局记录；没记录按应用池满额）就不收。D-PR33（11-21，iOS 26.7、0.6.7）：
        //   学到的跨度来自开局就因窗口太小停掉的局（只碰到 356 MB），收到 3072 MB 后堆区只剩 2716 MB、游戏要 3252 MB，又停在开局——
        //   这条路不经构造期的当场放宽（s2a_window_span_widen 只认构造期按单款收的窗口），自愈不了，每局都打不开
@@ -510,7 +687,7 @@
            s2a_layout tl; uint64_t tmb = 0, tsb = 0, want = g_lay_heap_floor ? g_lay_heap_floor : APP_POOL;
            if (s2a_layout_cap_fits(s2a_layout_compute(t, sr, mod, alias_gb, wb, cap, &tl, &tmb, &tsb), tl.heap_base, wb + cap, want)) {
                LOG("地址窗口：按本款（%016llx）学到的跨度收到 %llu MB（原 %llu MB），其余还给宿主", (unsigned long long)pid, (unsigned long long)(cap >> 20), (unsigned long long)(ws >> 20)); ws = cap;
-@@ -623,13 +632,19 @@
+@@ -623,7 +636,7 @@ static void layout_prepare(const char *npdm) {
      if (rc == -1) die("【红】NPDM 地址空间类型 %u（%s）暂不支持（布局只支持类型 1 = 36 位、3 = 39 位）", t, s2a_as_type_bits(t));
      if (rc == -2) {   // 窗口按学到的跨度收窄了（#783）：当场放宽回缺省给法、重算一次（vawin.c；安卓 / 单测没有这个就不调）
          int (*widen)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "s2a_window_span_widen");
@@ -519,21 +696,24 @@
      }
      if (rc == -2) {   // #446：设备地址空间 / App 内存上限不够（iPad mini 6：2^39 以下只有 6 GB）。原先 die → abort，玩家只看到加载页后闪退；改走初启失败出口，iOS 停在提示页说清原因
          LOG("【红】窗口 %#llx +%llu MB 连模块段（%llu MB）、栈、堆前段都放不下（SystemResourceSize %#llx，标准布局要 %llu MB）：这台设备的地址空间 / 内存不够跑这款", (unsigned long long)wb, (unsigned long long)(ws >> 20),
-             (unsigned long long)(mod >> 20), (unsigned long long)sr, (unsigned long long)(g_lay_need >> 20));
+@@ -631,6 +644,12 @@ static void layout_prepare(const char *npdm) {
          s2a_init_failed(S2A_INIT_FAIL_E_DEVICE_ADDRESS);   // 宿主里不返回
          die("窗口放不下（没链宿主的失败出口）");
-+    }
+     }
 +    if (!rc && code_bank) {
 +        uint64_t (*base)(uint64_t) = (uint64_t (*)(uint64_t))dlsym(RTLD_DEFAULT, "s2a_loader_container_code_base");
 +        if (!base) die("多款程序缺少代码地址选择器");
 +        g_mod_base = base(physical_base);
 +        LOG("多款代码区：%llu MB，当前程序落点 %#llx，游戏内存起点 %#llx", (unsigned long long)(code_bank >> 20), (unsigned long long)g_mod_base, (unsigned long long)L.win_base);
-     }
++    }
      // Mac：别名区伸出窗口（乙）时先试把伸出段并进窗口（vawin.c s2a_window_extend_up）：成了就没有远端，游戏在那段的访存是真内存、不缺页代执行。
      //   布局本身不变（仍按 2^39 以下的空洞排，小区在前），只是窗口末从 2^39 接到别名区末。iOS / 安卓 / 单测没有这个就照旧开远端
+     if (g_shadow_base && far_direct_on()) {
+diff --git a/runtime/src/vawin.c b/runtime/src/vawin.c
+index a42398a..6828a9a 100644
 --- a/runtime/src/vawin.c
 +++ b/runtime/src/vawin.c
-@@ -1329,6 +1329,8 @@
+@@ -1329,6 +1329,8 @@ uint64_t s2a_window_container_need(const char *bundle, const char *home) {
          if (ast < 0) { ast = t; snprintf(first, sizeof first, "%s", gid); }
          if (span && span(img, why, sizeof why)) { LOG("【红】地址窗口：多款容器里 %s 的镜像包读不了偏移表：%s，不占窗口", gid, why); ok = 0; break; }
          uint64_t ni = need_dir(dir);
@@ -542,7 +722,7 @@
          if (span) span(NULL, NULL, 0);
          { uint64_t pg = poolf ? poolf() : 0; if (pg > g_ctr_pool) g_ctr_pool = pg; }
          if (pools && pool0) pools(pool0);
-@@ -1356,7 +1358,10 @@
+@@ -1356,7 +1358,10 @@ uint64_t s2a_window_container_need(const char *bundle, const char *home) {
      g_span_learned = span_unknown ? 0 : span_max;
      g_npdm[0] = 0;
      LOG("地址窗口：多款容器 %d 款取最大 %llu MB（地址空间类型 %d）", n, (unsigned long long)(top >> 20), ast);
@@ -554,7 +734,117 @@
  }
  static uint64_t need_from_npdm(void) {
      const char *e = getenv("S2A_WIN_NEED_MB");
-@@ -1757,8 +1762,9 @@
+@@ -1381,13 +1386,22 @@ static uint64_t need_from_npdm(void) {
+       g_ctor_pid = pf ? pf(np) : 0;
+       g_ctr_pool = pl ? pl(np) : 0; }   // 单款也按本款 NPDM 认应用池（小内存 iPad 按池给窗口）；多款在容器循环里取最大
+     g_span_learned = s2a_window_span_seen(g_ctor_pid);
+-    return need_dir(dir);
++    uint64_t need = need_dir(dir);
++    if (g_ctr && need) {
++        uint64_t (*code_size)(void) = (uint64_t (*)(void))dlsym(RTLD_DEFAULT, "s2a_loader_container_code_size");
++        uint64_t bank = code_size ? code_size() : 0;
++        if (bank) {
++            if (g_span_learned) g_span_learned += bank;
++            need += bank;
++        }
++    }
++    return need;
+ }
+ // 跨度为 0 的红行按事实分（11-05 Minecraft: Story Mode 的 NPDM 是地址空间类型 1，被报成「读不到 main.npdm」）：
+ //   读不到 / 不是 META → 读不到；读得到、类型不是 3 → 报类型与位宽（布局只支持 39 位，layout.c）；类型 3 仍为 0 → 模块段算不出
+ static int g_astype = -1;   // 跨度为 0 时读到的 NPDM 地址空间类型（-1 = 没读到）：自检页按它说「暂不支持 36 位地址空间」还是「资源不完整」（selfcheck.c）
+ int s2a_window_astype(void) { return g_astype; }
+-static int npdm_astype(void) { return g_ctr ? g_ctr_astype : astype_of(g_npdm); }   // 本款（多款容器 = 包内各款一致的）地址空间类型
++static int npdm_astype(void) { return (g_ctr && !s2a_launch_ctx_get()) ? g_ctr_astype : astype_of(g_npdm); }   // 本款（多款容器 = 包内各款一致的）地址空间类型
+ static void need_zero_red(void) {
+     int t = npdm_astype(); g_astype = t;
+     if (g_ctr) return;   // 多款容器：s2a_window_container_need 已按款报过红
+@@ -1565,8 +1579,38 @@ int s2a_window_reserve_late(void) {
+     snap_guard_drop();   // 普通局 / 恢复局都在起宿主前放（之后布局会按需 MAP_FIXED 铺别名区，不能留着自己的占位）
+     return g_ok;
+ }
++static void window_drop_for_rereserve(void) {
++    if (g_ok) munmap((void *)g_base, g_res);
++    g_ok = 0; g_base = g_size = g_res = 0; g_need = 0; g_keep_lo = 0; g_hi36 = 0;
++    if (g_gfd >= 0) {
++        close(g_gfd); g_gfd = -1;
++        free(g_gchunk); g_gchunk = NULL;
++        free(g_gtouch); g_gtouch = NULL;
++        g_gchunk_n = 0; g_gwhole = 0;
++    }
++    snap_guard_drop();
++}
+ static int reserve_late_(void) {
+     if (g_noreserve) return g_ok;
++#if TARGET_OS_IPHONE
++    const s2a_launch_ctx *lc = s2a_launch_ctx_get();
++    if (g_ctr && lc && lc->game_id[0] && lc->module_dir[0]) {
++        int ast_sel = -1;
++        { char np[1200]; snprintf(np, sizeof np, "%s/main.npdm", lc->module_dir); ast_sel = astype_of(np); }
++        if (g_ok && !g_placeholder && ast_sel >= 0 && !s2a_as_type_end((uint32_t)ast_sel, g_base, g_size)) {
++            void (*reset_code)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "s2a_loader_container_code_reset_unlocked");
++            if (reset_code) reset_code();
++        }
++        int (*ensure_code)(const char *, const char *, uint64_t) =
++            (int (*)(const char *, const char *, uint64_t))dlsym(RTLD_DEFAULT, "s2a_loader_container_code_ensure_tagged");
++        if (ensure_code) {
++            uint64_t tag = 0; struct stat st;
++            if (!stat(lc->images, &st)) tag = ((uint64_t)st.st_ino << 32) ^ (uint64_t)st.st_size ^ (uint64_t)st.st_mtimespec.tv_sec;
++            if (!tag) tag = 1;
++            (void)ensure_code(lc->game_id, lc->module_dir, tag);
++        }
++    }
++#endif
+     // 构造期按占位占的窗口（容器当时还没有游戏）：按现在导入的款核一次。放得进就留着，只把需求换成真实的（自检、日志按它说）；
+     //   36 位款、或真实应用池要窗口下方少留宿主（小内存 iPad）→ 放掉按真实的款重占（同改动前的补占）；占位那次没占成 → 按真实的款补占
+     if (g_placeholder) {
+@@ -1583,23 +1627,34 @@ static int reserve_late_(void) {
+         }
+         LOG("地址窗口：构造期占位窗口不合导入的款（地址空间类型 %d、下方宿主 %llu MB、按本款应 %llu MB、%s），放掉按导入的款重占",
+             npdm_astype(), (unsigned long long)(below_now >> 20), (unsigned long long)(below_real >> 20), g_ok ? "占位窗口占到了" : "占位窗口没占成");
+-        if (g_ok) munmap((void *)g_base, g_res);
+-        g_ok = 0; g_base = g_size = g_res = 0; g_need = 0;
+-        snap_guard_drop(); vawin_reserve();
++        window_drop_for_rereserve(); vawin_reserve();
+         return g_ok;
+     }
+     if (!g_ok && !g_need) {
+-        LOG("地址窗口：构造期容器里没有可算的游戏（启动后才导入），起宿主前按现在的游戏补占");
+-        snap_guard_drop(); vawin_reserve();
++        LOG("地址窗口：构造期容器里没有可算的游戏（启动后才导入或已释放），起宿主前按现在的游戏补占");
++        window_drop_for_rereserve(); vawin_reserve();
+         return g_ok;
+     }
+-    if (g_ok && g_ctr && g_size >= g_need) {
++    if (g_ok && g_ctr) {
+         uint64_t was = g_need, now = need_from_npdm();
+-        if (now > was) {
+-            LOG("地址窗口：构造期按 %llu MB 占的窗口 %#llx +%llu MB，启动后导入的款要 %llu MB，起宿主前放掉重占",
+-                (unsigned long long)(was >> 20), (unsigned long long)g_base, (unsigned long long)(g_res >> 20), (unsigned long long)(now >> 20));
+-            munmap((void *)g_base, g_res); g_ok = 0; g_base = g_size = g_res = 0;
+-            snap_guard_drop(); vawin_reserve();
++        int ast = npdm_astype();
++        int ast_mismatch = ast >= 0 && !s2a_as_type_end((uint32_t)ast, g_base, g_size);
++        int need_bigger = now > 0 && g_size >= was && now > g_size;
++        if (ast_mismatch || need_bigger) {
++            LOG("地址窗口：构造期按 %llu MB 占的窗口 %#llx +%llu MB 不合本款（%s，本款要 %llu MB），起宿主前放掉重占",
++                (unsigned long long)(was >> 20), (unsigned long long)g_base, (unsigned long long)(g_res >> 20),
++                ast_mismatch ? "地址空间类型不同" : "窗口不够大", (unsigned long long)(now >> 20));
++            window_drop_for_rereserve(); vawin_reserve();
++        } else if (now > 0 && g_keep_lo && g_size < now) {
++            uint64_t below_now = g_base > g_keep_lo ? g_base - g_keep_lo : 0;
++            uint64_t below_real = s2a_window_host_below_for_pool(g_fit, g_span_learned, s2a_window_container_pool());
++            if (below_now > below_real) {
++                LOG("地址窗口：构造期窗口因别款学到的跨度收窄（下方宿主 %llu MB，本款应 %llu MB），起宿主前放宽重占",
++                    (unsigned long long)(below_now >> 20), (unsigned long long)(below_real >> 20));
++                window_drop_for_rereserve(); vawin_reserve();
++            }
++        } else if (now > was) {
++            g_need = now;
+         }
+     }
+     return g_ok;
+@@ -1757,8 +1812,9 @@ static int snap_retake(void) {
      { void (*gc)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "s2a_gc_limit_reapply"); if (gc) gc(); }   // 低区变了：GC 上限按现在的重选
      return 1;
  }
@@ -565,9 +855,17 @@
  #if !TARGET_OS_OSX
      // 开关读数放在最前（11-22 0.6.8 候选冒烟 ③f）：下面「窗口外 / 宿主段底部」两条放法都提前返回，原先这行只在通用路径打，快照真开着的局反而没有读数
      LOG("即时存档：开关 %s（依据 %s）", s2a_snap_mode() ? "开" : "关", s2a_snap_source());
-@@ -1985,6 +1991,38 @@
+@@ -1984,7 +2040,46 @@ static uint64_t snap_late_take(uint64_t at, uint64_t avail) {
+     return A;
  #endif
  }
++// Check whether the locked VA window can host a resumed title's address space type.
++int s2a_window_can_resume_npdm(const char *npdm) {
++    if (!g_ok || !npdm || !*npdm) return 0;
++    int ast = astype_of(npdm);
++    if (ast < 0) return 0;
++    return s2a_as_type_end((uint32_t)ast, g_base, g_size);
++}
 +// Release unused constructor VA reservations before launching non-Switch iOS cores (Wii U / PS2).
 +int s2a_window_release_unused(void) {
 +    if (s2a_launch_ctx_get()) return -1;

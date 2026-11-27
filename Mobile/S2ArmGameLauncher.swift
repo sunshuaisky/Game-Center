@@ -6,8 +6,6 @@ import UIKit
 
 @objc(S2ArmLibrary)
 final class S2ArmGameLauncher: NSObject {
-    private static var startupCatalogs: [String: Data] = [:]
-
     // Called by the framework before the official host starts. The aliases
     // preserve its on-device layout without duplicating or moving game data.
     @objc static func prepareRuntime() {
@@ -25,7 +23,6 @@ final class S2ArmGameLauncher: NSObject {
             do {
                 try validate(at: build, titleID: title.lastPathComponent)
                 try preparePaths(titleID: title.lastPathComponent, build: build, title: title)
-                startupCatalogs[title.lastPathComponent] = try Data(contentsOf: build.appendingPathComponent("catalogue.json"))
             } catch {
                 NSLog("Game Center: S2Arm runtime paths: %@", error.localizedDescription)
             }
@@ -41,7 +38,6 @@ final class S2ArmGameLauncher: NSObject {
                     try validate(at: build, titleID: id)
                     try link(build.appendingPathComponent("Content"), to: home.appendingPathComponent(content))
                     try preparePaths(titleID: id, build: build, title: home.appendingPathComponent("Library/Caches/GameCenter/IntegrationTitles/" + id))
-                    startupCatalogs[id] = try Data(contentsOf: build.appendingPathComponent("catalogue.json"))
                 } catch { NSLog("GC_REPEAT second package failed: %@", error.localizedDescription) }
             }
             if let id = env["S2A_LIBRARY_AUTOPLAY"] { prepareIntegrationLaunch(id) }
@@ -95,9 +91,6 @@ final class S2ArmGameLauncher: NSObject {
         try GameSaveLayout.migrate(title.appendingPathComponent("UserData/S2Arm/SaveData"), to: save, saveRoot: library.root.appendingPathComponent("save"))
         try GameSaveLayout.prepareSwitchFolder(save, cache: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("GameCenter/Switch/" + build.titleID))
         setenv("S2A_SAVE_FOLDER", save.path, 1)
-        guard startupCatalogs[build.titleID] == (try Data(contentsOf: folder.appendingPathComponent("catalogue.json"))) else {
-            throw Failure("游戏已导入。S2Arm 需要在 App 启动时准备地址空间，请关闭并重新打开 Game Center 后运行。")
-        }
         // A library launch reads the committed save, including a new cloud
         // download. Snapshot restore is an explicit, separate in-game action.
         unsetenv("S2A_SNAP_RESTORE")
