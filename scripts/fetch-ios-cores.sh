@@ -11,58 +11,57 @@ base_url=${GAME_CENTER_IOS_CORE_BASE_URL:-https://buildbot.libretro.com/nightly/
 temporary_directory=$(mktemp -d "${TMPDIR:-/tmp}/game-center-ios-cores.XXXXXX")
 trap 'rm -rf -- "$temporary_directory"' EXIT INT TERM
 
+# 3DS (Citra.framework) and PSP (ppsspp.libretro) are staged from Manic EMU in fetch-ios-native.py.
 archives=(
   gambatte_libretro_ios.dylib.zip
   mgba_libretro.dylib.zip
   desmume_libretro_ios.dylib.zip
-  azahar_libretro.dylib.zip
-  ppsspp_libretro.dylib.zip
   pcsx_rearmed_libretro_ios.dylib.zip
   dolphin_libretro.dylib.zip
-  pcee2_libretro.dylib.zip
+)
+
+curl_opts=(
+  --fail --silent --show-error --location
+  --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20
 )
 
 mkdir -p -- "$temporary_directory/cores"
 mkdir -p -- "$output_directory"
 
-missing_archives=()
+if [[ ! -s "$output_directory/pcee2_libretro.dylib" ]]; then
+  /bin/bash "${0:A:h}/build-ios-pcee2.sh" "$output_directory"
+fi
+
 for archive in $archives; do
-  if [[ ! -s "$output_directory/${archive%.zip}" ]]; then
-    missing_archives+=("$archive")
+  module_name=${archive%.zip}
+  if [[ -s "$output_directory/$module_name" ]]; then
+    continue
   fi
-done
-
-if (( ${#missing_archives} > 0 )); then
-  for archive in $missing_archives; do
-    print "下载 iOS 核心：${archive%.zip}"
-    curl --fail --silent --show-error --location --retry 3 --output "$temporary_directory/$archive" "$base_url/$archive"
-    unzip -q -o "$temporary_directory/$archive" -d "$temporary_directory/cores" "${archive%.zip}"
-  done
-
-  typeset -a core_modules
-  core_modules=("$temporary_directory/cores"/*.dylib(N))
-  if (( ${#core_modules} != ${#missing_archives} )); then
-    print -u2 "核心数量不正确：期望 ${#missing_archives}，实际 ${#core_modules}"
+  print "下载 iOS 核心：$module_name"
+  curl "${curl_opts[@]}" --output "$temporary_directory/$archive" "$base_url/$archive"
+  unzip -q -o "$temporary_directory/$archive" -d "$temporary_directory/cores" "$module_name"
+  module="$temporary_directory/cores/$module_name"
+  if [[ ! -s "$module" ]]; then
+    print -u2 "核心压缩包中缺少文件：$module_name"
     exit 65
   fi
+  if ! xcrun lipo -verify_arch arm64 "$module"; then
+    print -u2 "不是 iOS arm64 核心：$module_name"
+    exit 66
+  fi
+  build_platform=$(xcrun vtool -arch arm64 -show-build "$module")
+  if ! grep -Eq 'platform[[:space:]]+IOS$|LC_VERSION_MIN_IPHONEOS' <<< "$build_platform"; then
+    print -u2 "核心不是 iOS 真机二进制：$module_name"
+    exit 66
+  fi
+  chmod 0755 "$module"
+  # Persist each verified core immediately so retries never discard prior downloads.
+  mv -f "$module" "$output_directory/$module_name"
+done
 
-  for module in $core_modules; do
-    if ! xcrun lipo -verify_arch arm64 "$module"; then
-      print -u2 "不是 iOS arm64 核心：$module"
-      exit 66
-    fi
-    build_platform=$(xcrun vtool -arch arm64 -show-build "$module")
-    if ! grep -Eq 'platform[[:space:]]+IOS$|LC_VERSION_MIN_IPHONEOS' <<< "$build_platform"; then
-      print -u2 "核心不是 iOS 真机二进制：$module"
-      exit 66
-    fi
-    chmod 0755 "$module"
-  done
-
-  cp "$temporary_directory/cores/"*.dylib "$output_directory/"
-fi
 if [[ ! -f "$output_directory/System/Wii/dolphin-emu/Sys/codehandler.bin" ]]; then
-  curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+  print "下载 Wii (Dolphin) 系统资源"
+  curl "${curl_opts[@]}" \
     --output "$temporary_directory/dolphin-source.tar.gz" \
     "https://codeload.github.com/libretro/dolphin/tar.gz/0863ee3"
   mkdir -p "$temporary_directory/dolphin-source"
@@ -72,7 +71,8 @@ if [[ ! -f "$output_directory/System/Wii/dolphin-emu/Sys/codehandler.bin" ]]; th
   cp "$temporary_directory/dolphin-source/COPYING" "$output_directory/System/Wii/Dolphin-LICENSE"
 fi
 if [[ ! -d "$output_directory/System/PSP/PPSSPP/flash0" ]]; then
-  curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+  print "下载 PSP (PPSSPP) 字体与系统资源"
+  curl "${curl_opts[@]}" \
     --output "$temporary_directory/ppsspp-source.tar.gz" \
     "https://codeload.github.com/hrydgard/ppsspp/tar.gz/refs/tags/v1.20.4"
   mkdir -p "$temporary_directory/ppsspp-source" "$output_directory/System/PSP"

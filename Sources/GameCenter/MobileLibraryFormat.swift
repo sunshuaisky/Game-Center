@@ -123,6 +123,8 @@ enum MobileLibraryFormat {
             let code = url.appendingPathComponent("code", isDirectory: true)
             return ((try? fm.contentsOfDirectory(at: code, includingPropertiesForKeys: nil)) ?? [])
                 .contains { $0.pathExtension.lowercased() == "rpx" }
+        case "vita3k":
+            return isVitaGameFolder(url)
         default: return false
         }
     }

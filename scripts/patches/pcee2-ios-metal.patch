@@ -832,3 +832,30 @@ index 51af0b4..c2be3c7 100644
  
  	Error error;
  	if (!PageFaultHandler::Install(&error))
+diff --git a/pcsx2/Vif_Dynarec.h b/pcsx2/Vif_Dynarec.h
+index 173bb89..b80d729 100644
+--- a/pcsx2/Vif_Dynarec.h
++++ b/pcsx2/Vif_Dynarec.h
+@@ -43,4 +43,8 @@ alignas(16) extern nVifStruct nVif[2];
+ alignas(16) extern nVifCall nVifUpk[(2 * 2 * 16) * 4]; // ([USN][Masking][Unpack Type]) [curCycle]
+ alignas(16) extern u32      nVifMask[3][4][4];         // [MaskNumber][CycleNumber][Vector]
+ 
+-static constexpr bool newVifDynaRec = 1; // Use code in Vif_Dynarec.inl
++#if defined(IOS)
++static constexpr bool newVifDynaRec = false;
++#else
++static constexpr bool newVifDynaRec = true;
++#endif // Use code in Vif_Dynarec.inl
+diff --git a/pcsx2/Vif_Unpack.cpp b/pcsx2/Vif_Unpack.cpp
+index 878a63c..9603117 100644
+--- a/pcsx2/Vif_Unpack.cpp
++++ b/pcsx2/Vif_Unpack.cpp
+@@ -484,7 +484,7 @@ __ri void _nVifUnpackLoop(const u8* data)
+ 	{
+ 		u8* dest = getVUptr(idx, vif.tag.addr);
+ 
+-		if (doMode)
++		if (doMode || !newVifDynaRec)
+ 		{
+ 			//if (1) {
+ 			ft(dest, data);

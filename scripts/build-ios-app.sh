@@ -48,10 +48,12 @@ nx_app="$nx_root/frontend-ios/Shell/App"
 cp "$nx_root/LICENSE" "$app/NX2Apple-LICENSE"
 cp "$nx_root/NOTICE" "$app/NX2Apple-NOTICE"
 cp "$root/Mobile/NXShellLibrary.h" "$work/DmShell-Swift.h"
-cat "$root/Mobile/RetroCore.h" "$nx_app/ShellEngine.h" "$root/Mobile/S2ArmRuntime.h" > "$work/GameCenter-Bridging.h"
+cat "$root/Mobile/RetroCore.h" "$nx_app/ShellEngine.h" "$root/Mobile/S2ArmRuntime.h" "$root/Mobile/ThreeDSBridge.h" > "$work/GameCenter-Bridging.h"
 printf 'GC_MOBILE_STAGE\t3\t正在编译游戏库和运行宿主\n'
 xcrun --sdk "$sdk" clang -target "$target" -isysroot "$sdk_path" -O2 \
-  -Wall -Wextra -c "$root/Mobile/RetroCore.c" -o "$work/RetroCore.o"
+  -Wall -Wextra -I "$root/Mobile" -c "$root/Mobile/RetroVulkanHost.c" -o "$work/RetroVulkanHost.o"
+xcrun --sdk "$sdk" clang -target "$target" -isysroot "$sdk_path" -O2 \
+  -Wall -Wextra -I "$root/Mobile" -c "$root/Mobile/RetroCore.c" -o "$work/RetroCore.o"
 cp "$nx_app/ShellMain.m" "$work/ShellMain.m"
 cat >> "$work/ShellMain.m" <<'OBJC'
 
@@ -93,9 +95,11 @@ xcrun --sdk "$sdk" clang -target "$target" -isysroot "$sdk_path" -fobjc-arc -O2 
   "${host_flags[@]}" -c "$work/ShellMain.m" -o "$work/NXShellMain.o"
 xcrun --sdk "$sdk" clang -target "$target" -isysroot "$sdk_path" -fobjc-arc -O2 -I "$root/Mobile" \
   -c "$root/Mobile/S2ArmRuntime.m" -o "$work/S2ArmRuntime.o"
+xcrun --sdk "$sdk" clang -target "$target" -isysroot "$sdk_path" -fobjc-arc -O2 -I "$root/Mobile" \
+  -c "$root/Mobile/ThreeDSBridge.m" -o "$work/ThreeDSBridge.o"
 xcrun --sdk "$sdk" swiftc -target "$target" -sdk "$sdk_path" -O -parse-as-library "${swift_flags[@]}" \
   -import-objc-header "$work/GameCenter-Bridging.h" \
-  "$root/Sources/GameCenter/GameMetadataPlatform.swift" "$root/Sources/GameCenter/GameTitleMatcher.swift" "$root/Sources/GameCenter/MetadataRefreshPolicy.swift" "$root/Sources/GameCenter/GameMetadataService.swift" "$root/Sources/GameCenterSaveSupport/GameSaveLayout.swift" "$root/Sources/GameCenter/MobileLibraryFormat.swift" "$root/Sources/GameCenter/CloudSaveSyncView.swift" "$root/Sources/GameCenter/CloudSaveDirectorySync.swift" "$root/Sources/GameCenter/CloudSaveLocation.swift" "$root"/Mobile/*.swift "$work/RetroCore.o" "$work/NXShellMain.o" "$work/S2ArmRuntime.o" \
+  "$root/Sources/GameCenter/GameMetadataPlatform.swift" "$root/Sources/GameCenter/GameTitleMatcher.swift" "$root/Sources/GameCenter/MetadataRefreshPolicy.swift" "$root/Sources/GameCenter/GameMetadataService.swift" "$root/Sources/GameCenterSaveSupport/GameSaveLayout.swift" "$root/Sources/GameCenter/MobileLibraryFormat.swift" "$root/Sources/GameCenter/CloudSaveSyncView.swift" "$root/Sources/GameCenter/CloudSaveDirectorySync.swift" "$root/Sources/GameCenter/CloudSaveLocation.swift" "$root"/Mobile/*.swift "$work/RetroCore.o" "$work/RetroVulkanHost.o" "$work/NXShellMain.o" "$work/S2ArmRuntime.o" "$work/ThreeDSBridge.o" \
   -o "$binary"
 
 printf 'GC_MOBILE_STAGE\t4\t正在准备 iOS 模拟器核心，首次生成需要下载\n'
@@ -105,17 +109,25 @@ if [[ "$sdk" == iphoneos ]]; then
   [[ -d "$bundled_core_dir" ]] || bundled_core_dir="$root/iOSCores"
   /usr/bin/python3 - "$request/platforms.json" <<'PYMODULES' > "$work/modules"
 import json, sys
-for name in sorted({item["module"] for item in json.load(open(sys.argv[1])) if not item.get("runtime")}):
+for item in json.load(open(sys.argv[1])):
+    if item.get("runtime") or item.get("id") == "psp":
+        # Native runtimes (cemu/citra/vita3k) and Manic EMU PSP are staged via fetch-ios-native.py.
+        continue
+    name = item["module"]
     if not name.endswith(".dylib"):
         raise SystemExit("原生核心缺少运行类型配置：" + name)
     print(name)
 PYMODULES
+  sort -u -o "$work/modules" "$work/modules"
   missing_core=0
   while IFS= read -r module; do
+    [[ -n "$module" ]] || continue
     if [[ ! -s "$bundled_core_dir/$module" && ! -s "$core_dir/$module" ]]; then missing_core=1; fi
     if [[ "$module" == dolphin_libretro.dylib && ! -f "$core_dir/System/Wii/dolphin-emu/Sys/codehandler.bin" ]]; then missing_core=1; fi
-    if [[ "$module" == ppsspp_libretro.dylib && ! -d "$core_dir/System/PSP/PPSSPP/flash0" ]]; then missing_core=1; fi
   done < "$work/modules"
+  if /usr/bin/python3 -c 'import json,sys; sys.exit(0 if any(p.get("id")=="psp" for p in json.load(open(sys.argv[1]))) else 1)' "$request/platforms.json"; then
+    if [[ ! -d "$core_dir/System/PSP/PPSSPP/flash0" ]]; then missing_core=1; fi
+  fi
   if [[ "$missing_core" == 1 && -z "${GAME_CENTER_IOS_CORE_DIR:-}" ]]; then
     /bin/zsh "$root/scripts/fetch-ios-cores.sh" "$core_dir"
   fi
@@ -191,9 +203,18 @@ PYPS1
   if [[ -d "$system_files/WiiU" ]]; then
     ditto "$system_files/WiiU" "$app/CoreAssets/WiiU"
   fi
+  if [[ -d "$system_files/PSVFirmware" ]]; then
+    ditto "$system_files/PSVFirmware" "$app/CoreAssets/PSV"
+  fi
   native_runtimes=$(/usr/bin/python3 - "$request/platforms.json" <<'PYNATIVE'
 import json, sys
-print(",".join(sorted({p["runtime"] for p in json.load(open(sys.argv[1])) if p.get("runtime") in {"cemu"}})))
+platforms = json.load(open(sys.argv[1]))
+wanted = {p["runtime"] for p in platforms if p.get("runtime") in {"cemu", "citra", "vita3k"}}
+if any(p.get("id") == "psp" for p in platforms):
+    wanted.add("manic-ppsspp")
+# Stage cemu before citra/manic-ppsspp so ManicEMU's newer MoltenVK.framework wins cleanly.
+order = ["cemu", "citra", "manic-ppsspp", "vita3k"]
+print(",".join(r for r in order if r in wanted))
 PYNATIVE
 )
   if [[ -n "$native_runtimes" ]]; then

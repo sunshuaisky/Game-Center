@@ -447,6 +447,10 @@ private struct LibraryView: View {
             if let library {
                 if rom.platform.runtime == "cemu" {
                     WiiUPlayer(rom: rom, library: library)
+                } else if rom.platform.runtime == "citra" && ThreeDSPlayer.isCoreInstalled {
+                    ThreeDSPlayer(rom: rom, library: library)
+                } else if rom.platform.runtime == "vita3k" {
+                    VitaPlayer(rom: rom, library: library)
                 } else {
                     RetroPlayer(rom: rom, library: library)
                 }

@@ -77,6 +77,7 @@ enum MobileAppBuilder {
             let fields = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
             if fields.count == 3, fields[0] == "GC_MOBILE_STAGE", let step = Int(fields[1]),
                (2...6).contains(step), step >= current.step {
+                lines.removeAll()
                 current = .init(step: step, detail: String(fields[2]))
             } else if line.hasPrefix("GC_MOBILE_DETAIL\t") {
                 current.detail = String(line.dropFirst("GC_MOBILE_DETAIL\t".count))

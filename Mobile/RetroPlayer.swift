@@ -14,6 +14,7 @@ struct RetroPlayer: View {
     @State private var showVirtualPad = GCController.controllers().isEmpty
     @AppStorage("phone.player.padOpacity") private var padOpacity = 0.86
     @AppStorage(TouchPadHaptics.defaultsKey) private var hapticsEnabled = true
+    @AppStorage("phone.player.performanceMode") private var performanceMode = 0
     let rom: PhoneLibrary.ROM
     let library: PhoneLibrary
 
@@ -23,6 +24,24 @@ struct RetroPlayer: View {
     private var hasTriggers: Bool { ["ps1", "ps2", "wii"].contains(rom.platform.id) }
     private var hasLeftStick: Bool { ["threeDS", "psp", "ps1", "ps2", "wii", "n64"].contains(rom.platform.id) }
     private var hasRightStick: Bool { ["ps1", "ps2", "wii"].contains(rom.platform.id) }
+    private var supportsPerformanceTuning: Bool { ["psp", "ps2", "threeDS", "wii"].contains(rom.platform.id) }
+
+    private var pauseSubtitle: String {
+        let jitTag = session.jitAvailable ? " · JIT 已开启" : ""
+        switch rom.platform.id {
+        case "psp":
+            let engine = session.isHardwareRendered ? "Vulkan 硬件加速 · IR 解释器" : "IR 解释器"
+            return "PSP · \(engine)\(jitTag)"
+        case "ps2":
+            return "PS2 · Metal 硬件加速\(session.jitAvailable ? jitTag : " · 无 JIT 加速")"
+        case "threeDS":
+            return "3DS · 兼容模式\(jitTag)"
+        case "wii":
+            return "Wii · \(session.isHardwareRendered ? "Vulkan 硬件加速" : "软件渲染")\(jitTag)"
+        default:
+            return "进度已自动保存"
+        }
+    }
 
     private var faceLabels: TouchDiamondPadUIView.Labels {
         if isPlayStation {
@@ -193,13 +212,29 @@ struct RetroPlayer: View {
                 if showingPauseMenu {
                     PlayerPauseOverlay(
                         title: rom.title,
+                        subtitle: pauseSubtitle,
                         hasController: hasController,
                         showVirtualPad: $showVirtualPad,
                         padOpacity: $padOpacity,
                         hapticsEnabled: $hapticsEnabled,
                         onResume: { closePauseMenu() },
                         onExit: { dismiss() }
-                    )
+                    ) {
+                        if supportsPerformanceTuning {
+                            Divider().overlay(Color.white.opacity(0.08))
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("性能模式（无 JIT 推荐极致流畅）")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.white.opacity(0.68))
+                                Picker("性能模式", selection: $performanceMode) {
+                                    Text("极致流畅").tag(0)
+                                    Text("均衡").tag(1)
+                                    Text("高画质").tag(2)
+                                }
+                                .pickerStyle(.segmented)
+                            }
+                        }
+                    }
                     .transition(.opacity)
                 }
             }
@@ -211,7 +246,10 @@ struct RetroPlayer: View {
         .persistentSystemOverlays(.hidden)
         .task {
             syncControllerState()
-            session.start(rom: rom, library: library)
+            session.start(rom: rom, library: library, performanceMode: performanceMode)
+        }
+        .onChange(of: performanceMode) { _, mode in
+            session.setPerformanceProfile(mode)
         }
         .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidConnect)) { _ in
             syncControllerState()
@@ -344,6 +382,8 @@ private final class RetroDisplayLinkProxy: NSObject {
 private final class RetroSession: NSObject, ObservableObject {
     @Published var hasFrame = false
     @Published var error: String?
+    @Published var isHardwareRendered = false
+    @Published var jitAvailable = gc_ios_jit_available()
     let screenView = RetroScreenUIView()
 
     private let worker = RetroCoreWorker()
@@ -352,6 +392,7 @@ private final class RetroSession: NSObject, ObservableObject {
     private var axes: [Int16] = [0, 0, 0, 0]
     private var pointer: (Int16, Int16, Bool) = (0, 0, false)
     private var mirrorStickToDPad = false
+    private var smoothVideo = false
     private var maxFramesPerTick = 2
     private var platformID = ""
 
@@ -369,15 +410,20 @@ private final class RetroSession: NSObject, ObservableObject {
     private var audioFrames = 0
     private var audioGeneration = 0
 
-    func start(rom: PhoneLibrary.ROM, library: PhoneLibrary) {
+    func start(rom: PhoneLibrary.ROM, library: PhoneLibrary, performanceMode: Int) {
         guard !opened, !starting else { return }
-        guard rom.platform.runtime == nil else {
-            error = "此游戏需要通过对应的原生模拟器入口启动。"
+        if let runtime = rom.platform.runtime {
+            if runtime == "citra" {
+                error = "未检测到 Manic EMU 3DS 核心（Citra.framework），请通过 Mac 端重新生成并安装最新版 iOS IPA。"
+            } else {
+                error = "此游戏需要通过对应的原生模拟器入口启动。"
+            }
             return
         }
         starting = true
         platformID = rom.platform.id
         mirrorStickToDPad = ["gb", "gbc", "gba", "nds", "famicom", "superFamicom", "megaDrive"].contains(rom.platform.id)
+        smoothVideo = ["psp", "ps2", "threeDS", "wii", "n64", "ps1"].contains(rom.platform.id)
         // Heavy 3D cores run at most 1 emulated frame per vsync to avoid the multi-frame catch-up spiral of death.
         maxFramesPerTick = ["threeDS", "ps2", "wii", "psp"].contains(rom.platform.id) ? 1 : 2
         GCController.startWirelessControllerDiscovery(completionHandler: nil)
@@ -401,10 +447,13 @@ private final class RetroSession: NSObject, ObservableObject {
             return
         }
 
+        let mvkCandidate = Bundle.main.bundleURL.appendingPathComponent("Frameworks/MoltenVK.framework/MoltenVK").path
+        let moltenVKPath = FileManager.default.fileExists(atPath: mvkCandidate) ? mvkCandidate : nil
+
         let token = generation
         let worker = self.worker
         RetroCoreWorker.queue.async { [weak self] in
-            let openResult: Result<(Double, Double), Error> = Result {
+            let openResult: Result<RetroCoreWorker.OpenInfo, Error> = Result {
                 let saves = library.saveFolder(rom)
                 try FileManager.default.createDirectory(at: saves, withIntermediateDirectories: true)
                 let bios = library.bios.appendingPathComponent(rom.platform.folder)
@@ -425,7 +474,14 @@ private final class RetroSession: NSObject, ObservableObject {
                         }
                     }
                 }
-                return try worker.open(module: path.path, rom: rom.url.path, bios: bios.path, saves: saves.path)
+                return try worker.open(
+                    module: path.path,
+                    rom: rom.url.path,
+                    bios: bios.path,
+                    saves: saves.path,
+                    moltenVKPath: rom.platform.id == "threeDS" ? nil : moltenVKPath,
+                    performanceProfile: performanceMode
+                )
             }
             DispatchQueue.main.async {
                 guard let self, self.generation == token else {
@@ -436,16 +492,22 @@ private final class RetroSession: NSObject, ObservableObject {
                 }
                 self.starting = false
                 switch openResult {
-                case let .success((fps, rate)):
+                case let .success(info):
                     self.opened = true
-                    self.frameRate = fps
+                    self.frameRate = info.fps
+                    self.isHardwareRendered = info.isHardwareRendered
+                    self.jitAvailable = info.jitAvailable
+                    if self.platformID == "psp" && info.isHardwareRendered {
+                        // Hardware Vulkan + IR Interpreter PSP easily keeps 60fps; allow 2-frame catch-up for smooth pacing.
+                        self.maxFramesPerTick = 2
+                    }
                     let proxy = RetroDisplayLinkProxy(target: self)
                     let link = CADisplayLink(target: proxy, selector: #selector(RetroDisplayLinkProxy.tick(_:)))
-                    let preferred = Float(min(60, max(30, fps.rounded())))
+                    let preferred = Float(min(60, max(30, info.fps.rounded())))
                     link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: preferred)
                     link.add(to: .main, forMode: .common)
                     self.displayLink = link
-                    self.startAudio(sampleRate: rate)
+                    self.startAudio(sampleRate: info.sampleRate)
                 case let .failure(err):
                     let instructions: [String: String] = [
                         "ps1": "应用已内置标准 PS1 BIOS（scph5500/5501/5502）；如仍无法启动，请检查光盘镜像（.cue/.bin/.chd/.pbp）是否完整。",
@@ -454,6 +516,13 @@ private final class RetroSession: NSObject, ObservableObject {
                     self.error = instructions[rom.platform.id].map { err.localizedDescription + "\n" + $0 } ?? err.localizedDescription
                 }
             }
+        }
+    }
+
+    func setPerformanceProfile(_ profile: Int) {
+        let worker = worker
+        RetroCoreWorker.queue.async {
+            worker.setPerformanceProfile(profile)
         }
     }
 
@@ -578,6 +647,8 @@ private final class RetroSession: NSObject, ObservableObject {
 
         let snapshot = consumeInput(frames: count)
         let worker = worker
+        let screenView = screenView
+        let smoothVideo = smoothVideo
         let token = generation
         inFlight = true
         RetroCoreWorker.queue.async { [weak self] in
@@ -586,8 +657,11 @@ private final class RetroSession: NSObject, ObservableObject {
                 buttons: snapshot.buttons,
                 axes: snapshot.axes,
                 pointer: snapshot.pointer,
-                save: save
-            )
+                save: save,
+                smoothVideo: smoothVideo
+            ) { pixels, width, height, smooth in
+                screenView.update(pixels: pixels, width: width, height: height, smooth: smooth)
+            }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.inFlight = false
@@ -602,9 +676,8 @@ private final class RetroSession: NSObject, ObservableObject {
                     return
                 }
                 self.enqueueAudio(output.audio)
-                if let cgImage = output.image {
-                    self.screenView.update(image: cgImage)
-                    if !self.hasFrame { self.hasFrame = true }
+                if output.presentedFrame && !self.hasFrame {
+                    self.hasFrame = true
                 }
             }
         }

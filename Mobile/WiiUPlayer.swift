@@ -40,7 +40,11 @@ private final class WiiUCore: @unchecked Sendable {
     typealias Available = @convention(c) () -> Bool
     typealias SetInt = @convention(c) (Int32) -> Void
     typealias SetBool = @convention(c) (Bool) -> Void
+    typealias SetBoolInt = @convention(c) (Bool, Int32) -> Void
+    typealias SetBoolBool = @convention(c) (Bool, Bool) -> Void
     typealias CountKeys = @convention(c) () -> Int32
+    typealias GetInt = @convention(c) () -> Int32
+    typealias GetDouble = @convention(c) () -> Double
     typealias StatusText = @convention(c) () -> UnsafePointer<CChar>?
 
     private static var instance: WiiUCore?
@@ -60,6 +64,19 @@ private final class WiiUCore: @unchecked Sendable {
     let reloadKeys: CountKeys?
     let setGraphicsAPI: SetInt?
     let setRecompiler: SetBool?
+    let setFavourPerformance: SetBool?
+    let setFavourAccuracy: SetBool?
+    let setFullSpeedRenders: SetBoolInt?
+    let setAsyncShaderCompile: SetBool?
+    let setFramebufferFetch: SetBool?
+    let setMulticoreEnabled: SetBool?
+    let setSkipHiddenScreen: SetBoolBool?
+    let setVisibleOutputs: SetBoolBool?
+    let setTimebaseAutoEnabled: SetBool?
+    let setVSyncEnabled: SetBool?
+    let setLowPowerMode: SetBool?
+    let cpuMode: GetInt?
+    let getFPS: GetDouble?
     let refreshInputDevices: Action?
     let statusText: StatusText?
     let queue = DispatchQueue(label: "GameCenter.WiiU", qos: .userInitiated)
@@ -113,6 +130,19 @@ private final class WiiUCore: @unchecked Sendable {
             reloadKeys = optionalSymbol("cemu_bridge_reload_and_count_keys", as: CountKeys.self)
             setGraphicsAPI = optionalSymbol("cemu_bridge_set_graphics_api", as: SetInt.self)
             setRecompiler = optionalSymbol("cemu_bridge_set_recompiler_enabled", as: SetBool.self)
+            setFavourPerformance = optionalSymbol("cemu_bridge_set_favour_performance", as: SetBool.self)
+            setFavourAccuracy = optionalSymbol("cemu_bridge_set_favour_accuracy", as: SetBool.self)
+            setFullSpeedRenders = optionalSymbol("cemu_bridge_set_full_speed_renders", as: SetBoolInt.self)
+            setAsyncShaderCompile = optionalSymbol("cemu_bridge_set_async_shader_compile", as: SetBool.self)
+            setFramebufferFetch = optionalSymbol("cemu_bridge_set_framebuffer_fetch", as: SetBool.self)
+            setMulticoreEnabled = optionalSymbol("cemu_bridge_set_multicore_enabled", as: SetBool.self)
+            setSkipHiddenScreen = optionalSymbol("cemu_bridge_set_skip_hidden_screen", as: SetBoolBool.self)
+            setVisibleOutputs = optionalSymbol("cemu_bridge_set_visible_outputs", as: SetBoolBool.self)
+            setTimebaseAutoEnabled = optionalSymbol("cemu_bridge_set_timebase_auto_enabled", as: SetBool.self)
+            setVSyncEnabled = optionalSymbol("cemu_bridge_set_vsync_enabled", as: SetBool.self)
+            setLowPowerMode = optionalSymbol("cemu_bridge_set_low_power_mode", as: SetBool.self)
+            cpuMode = optionalSymbol("cemu_bridge_cpu_mode", as: GetInt.self)
+            getFPS = optionalSymbol("cemu_bridge_get_fps", as: GetDouble.self)
             refreshInputDevices = optionalSymbol("cemu_bridge_refresh_input_devices", as: Action.self)
             statusText = optionalSymbol("cemu_bridge_status_text", as: StatusText.self)
         } catch {
@@ -179,11 +209,14 @@ private final class WiiUSession: NSObject, ObservableObject {
     @Published var starting = true
     @Published var stopping = false
     @Published var gamePad = false
+    @Published var jitActive = gc_ios_jit_available()
+    @Published var currentFPS = 0
     @Published fileprivate var core: WiiUCore?
     private var closing = false
     private var launched = false
     private var bootSucceeded = false
     private var displayLink: CADisplayLink?
+    private var fpsTimer: Timer?
     private var connectObserver: NSObjectProtocol?
     private var disconnectObserver: NSObjectProtocol?
     private var touchButtonsMask: UInt32 = 0
@@ -312,10 +345,66 @@ private final class WiiUSession: NSObject, ObservableObject {
         }
     }
 
-    func start(rom: PhoneLibrary.ROM, library: PhoneLibrary) {
+    nonisolated private static func applyPerformanceTuning(
+        core: WiiUCore,
+        performanceMode: Int,
+        graphicsAPI: Int,
+        showingGamePad: Bool
+    ) {
+        let jit = gc_ios_jit_available()
+        // 2 = native Metal (recommended), 1 = Vulkan (MoltenVK fallback)
+        core.setGraphicsAPI?(Int32(graphicsAPI))
+        core.setRecompiler?(jit)
+        core.setMulticoreEnabled?(true)
+        core.setFramebufferFetch?(true)
+        core.setLowPowerMode?(false)
+        // Skip rendering the hidden display (saves substantial GPU & memory bandwidth).
+        core.setSkipHiddenScreen?(showingGamePad, !showingGamePad)
+        core.setVisibleOutputs?(!showingGamePad, showingGamePad)
+
+        switch performanceMode {
+        case 0: // 极致流畅 (Manic EMU style smooth preset)
+            core.setFavourAccuracy?(false)
+            core.setFavourPerformance?(true)
+            core.setAsyncShaderCompile?(true)
+            core.setFullSpeedRenders?(true, 1) // skip shader-compile hitches
+            core.setTimebaseAutoEnabled?(true)
+            core.setVSyncEnabled?(jit)
+        case 1: // 均衡
+            core.setFavourAccuracy?(false)
+            core.setFavourPerformance?(true)
+            core.setAsyncShaderCompile?(true)
+            core.setFullSpeedRenders?(true, 0)
+            core.setTimebaseAutoEnabled?(true)
+            core.setVSyncEnabled?(true)
+        default: // 2: 高画质
+            core.setFavourPerformance?(false)
+            core.setFavourAccuracy?(true)
+            core.setAsyncShaderCompile?(false)
+            core.setFullSpeedRenders?(false, 0)
+            core.setTimebaseAutoEnabled?(false)
+            core.setVSyncEnabled?(true)
+        }
+    }
+
+    func updatePerformanceTuning(performanceMode: Int, graphicsAPI: Int) {
+        guard let core, !closing else { return }
+        let pad = gamePad
+        core.queue.async {
+            Self.applyPerformanceTuning(
+                core: core,
+                performanceMode: performanceMode,
+                graphicsAPI: graphicsAPI,
+                showingGamePad: pad
+            )
+        }
+    }
+
+    func start(rom: PhoneLibrary.ROM, library: PhoneLibrary, performanceMode: Int, graphicsAPI: Int) {
         guard !launched, !closing else { return }
         error = nil
         starting = true
+        jitActive = gc_ios_jit_available()
         // Release S2Arm's unused 60+ GiB constructor VA window before Cemu's MMU
         // reserves 4 GiB via vm_allocate (otherwise Cemu MMU.cpp exits immediately).
         if gc_s2arm_release_va_window() != 0 {
@@ -366,14 +455,22 @@ private final class WiiUSession: NSObject, ObservableObject {
                     }
                     self.launched = true
                     core.registerSurface(width: width, height: height, scale: scale)
+                    let initialPad = self.gamePad
                     core.queue.async { [weak self] in
                         var failure: String?
+                        var detectedJIT = gc_ios_jit_available()
                         do {
                             try core.prepare(root: root)
-                            // Native Metal renderer (2 = Metal, 1 = Vulkan); recompiler falls back to interpreter without JIT.
-                            core.setGraphicsAPI?(2)
-                            core.setRecompiler?(true)
+                            Self.applyPerformanceTuning(
+                                core: core,
+                                performanceMode: performanceMode,
+                                graphicsAPI: graphicsAPI,
+                                showingGamePad: initialPad
+                            )
                             let status = bootPath.withCString(core.boot)
+                            if let mode = core.cpuMode?(), mode == 2 {
+                                detectedJIT = true
+                            }
                             if status != 0 {
                                 let detail = core.latestStatus().map { "\n" + $0 } ?? ""
                                 switch status {
@@ -392,9 +489,11 @@ private final class WiiUSession: NSObject, ObservableObject {
                             guard let self else { return }
                             self.starting = false
                             self.error = failure
+                            self.jitActive = detectedJIT
                             if failure == nil {
                                 self.bootSucceeded = true
                                 self.startGamepadPolling()
+                                self.startFPSPolling()
                             } else {
                                 self.launched = false
                             }
@@ -415,11 +514,25 @@ private final class WiiUSession: NSObject, ObservableObject {
         }
     }
 
+    private func startFPSPolling() {
+        fpsTimer?.invalidate()
+        fpsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, let core = self.core, self.bootSucceeded, !self.closing else { return }
+                if let fps = core.getFPS?(), fps.isFinite, fps >= 0 {
+                    self.currentFPS = Int(fps.rounded())
+                }
+            }
+        }
+    }
+
     nonisolated private static func resolveBootPath(for url: URL) -> String {
         let fm = FileManager.default
         guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
             return url.path
         }
+        let metadata = url.appendingPathComponent("title.tmd")
+        if fm.fileExists(atPath: metadata.path) { return metadata.path }
         let code = url.appendingPathComponent("code", isDirectory: true)
         if let rpx = ((try? fm.contentsOfDirectory(at: code, includingPropertiesForKeys: nil)) ?? [])
             .sorted(by: { $0.path < $1.path })
@@ -439,6 +552,8 @@ private final class WiiUSession: NSObject, ObservableObject {
         guard !closing else { return }
         closing = true
         stopping = true
+        fpsTimer?.invalidate()
+        fpsTimer = nil
         stopGamepadPolling()
         guard let core else { completion(); return }
         core.view.resized = nil
@@ -456,6 +571,8 @@ private final class WiiUSession: NSObject, ObservableObject {
     func displayGamePad(_ enabled: Bool) {
         guard let core else { return }
         core.route(enabled, false)
+        core.setSkipHiddenScreen?(enabled, !enabled)
+        core.setVisibleOutputs?(!enabled, enabled)
         gamePad = enabled
     }
 }
@@ -476,8 +593,17 @@ struct WiiUPlayer: View {
     @State private var showVirtualPad = GCController.controllers().isEmpty
     @AppStorage("phone.player.padOpacity") private var padOpacity = 0.86
     @AppStorage(TouchPadHaptics.defaultsKey) private var hapticsEnabled = true
+    @AppStorage("phone.player.wiiu.performanceMode") private var performanceMode = 0
+    @AppStorage("phone.player.wiiu.graphicsAPI") private var graphicsAPI = 2
     let rom: PhoneLibrary.ROM
     let library: PhoneLibrary
+
+    private var pauseSubtitle: String {
+        let renderer = graphicsAPI == 2 ? "Metal" : "Vulkan"
+        let cpu = session.jitActive ? "JIT 重编译" : "无 JIT 优化"
+        let fps = session.currentFPS > 0 ? " · \(session.currentFPS) FPS" : ""
+        return "Wii U · Cemu (\(renderer) · \(cpu)\(fps))"
+    }
 
     var body: some View {
         FullScreenReader { fullSize, safeInsets in
@@ -629,7 +755,7 @@ struct WiiUPlayer: View {
                 if showingPauseMenu && !session.starting {
                     PlayerPauseOverlay(
                         title: rom.title,
-                        subtitle: "Wii U · Cemu",
+                        subtitle: pauseSubtitle,
                         hasController: hasController,
                         showVirtualPad: $showVirtualPad,
                         padOpacity: $padOpacity,
@@ -642,9 +768,30 @@ struct WiiUPlayer: View {
                         }
                     ) {
                         Divider().overlay(Color.white.opacity(0.08))
-                        Toggle("显示 GamePad 副屏", isOn: Binding(get: { session.gamePad }, set: session.displayGamePad))
+                        Toggle("显示 GamePad 副屏（自动跳过隐藏屏）", isOn: Binding(get: { session.gamePad }, set: session.displayGamePad))
                             .font(.system(size: 13, weight: .medium))
                             .tint(.white)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("性能模式（推荐极致流畅）")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.white.opacity(0.68))
+                            Picker("性能模式", selection: $performanceMode) {
+                                Text("极致流畅").tag(0)
+                                Text("均衡").tag(1)
+                                Text("高画质").tag(2)
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("图形后端（下次启动生效）")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.white.opacity(0.68))
+                            Picker("图形后端", selection: $graphicsAPI) {
+                                Text("Metal 原生").tag(2)
+                                Text("Vulkan (MoltenVK)").tag(1)
+                            }
+                            .pickerStyle(.segmented)
+                        }
                         Button {
                             importingKeys = true
                         } label: {
@@ -672,7 +819,13 @@ struct WiiUPlayer: View {
         .persistentSystemOverlays(.hidden)
         .task {
             syncControllerState()
-            session.start(rom: rom, library: library)
+            session.start(rom: rom, library: library, performanceMode: performanceMode, graphicsAPI: graphicsAPI)
+        }
+        .onChange(of: performanceMode) { _, mode in
+            session.updatePerformanceTuning(performanceMode: mode, graphicsAPI: graphicsAPI)
+        }
+        .onChange(of: graphicsAPI) { _, api in
+            session.updatePerformanceTuning(performanceMode: performanceMode, graphicsAPI: api)
         }
         .interactiveDismissDisabled()
         .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidConnect)) { _ in

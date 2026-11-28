@@ -4,6 +4,12 @@
 
 typedef struct GCRetro GCRetro;
 
+bool gc_ios_jit_available(void);
+void gc_retro_set_moltenvk_path(const char *path);
+void gc_retro_set_performance_profile(int profile);
+void gc_retro_apply_performance_profile(GCRetro *core, int profile);
+bool gc_retro_is_hw_rendered(GCRetro *core);
+
 GCRetro *gc_retro_open(const char *core, const char *rom, const char *system, const char *save);
 const char *gc_retro_error(void);
 const char *gc_retro_last_log_error(void);

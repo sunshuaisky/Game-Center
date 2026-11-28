@@ -1,5 +1,8 @@
+import Metal
+import QuartzCore
 import SwiftUI
 import UIKit
+import os.lock
 
 // MARK: - Edge-to-Edge Fullscreen Geometry Reader
 
@@ -57,48 +60,262 @@ struct PhoneTactileButtonStyle: ButtonStyle {
     }
 }
 
-/// Direct CALayer frame host for software-rendered Libretro cores.
-/// Updating `layer.contents` directly avoids triggering SwiftUI body diffs at 60fps
-/// and keeps touch controls responsive even when emulation frame times fluctuate.
+/// Zero-allocation Metal (`CAMetalLayer` + persistent `MTLTexture`) frame host for Libretro cores.
+/// Uploads frames directly from the core worker queue onto the GPU without allocating `Data` or
+/// `CGImage` per frame and without blocking the main thread / touch controls.
+/// Falls back to a `CALayer` presenter if Metal is unavailable.
 final class RetroScreenUIView: UIView {
     var onPointer: ((CGFloat, CGFloat, Bool) -> Void)?
     private var activeTouch: UITouch?
+
+    private var lock = os_unfair_lock()
     private var frameSize: CGSize = .zero
-    private let imageLayer = CALayer()
+    private var drawableBounds: CGSize = .zero
+    private var lastSmooth = false
+
+    // Metal pipeline state (zero-allocation direct GPU presentation)
+    private let device: MTLDevice?
+    private let commandQueue: MTLCommandQueue?
+    private let pipelineState: MTLRenderPipelineState?
+    private let nearestSampler: MTLSamplerState?
+    private let linearSampler: MTLSamplerState?
+    private var metalLayer: CAMetalLayer?
+    private var texture: MTLTexture?
+
+    // CALayer fallback when Metal is unavailable
+    private let fallbackLayer = CALayer()
+    private static let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
+    private static let bitmapInfo = CGBitmapInfo.byteOrder32Little.union(
+        CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)
+    )
+
+    private static let shaderSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    struct VertexOut {
+        float4 pos [[position]];
+        float2 uv;
+    };
+    vertex VertexOut gc_retro_vs(uint vid [[vertex_id]], constant float2 &scale [[buffer(0)]]) {
+        constexpr float2 pos[4] = {
+            float2(-1.0, -1.0),
+            float2( 1.0, -1.0),
+            float2(-1.0,  1.0),
+            float2( 1.0,  1.0)
+        };
+        constexpr float2 uv[4] = {
+            float2(0.0, 1.0),
+            float2(1.0, 1.0),
+            float2(0.0, 0.0),
+            float2(1.0, 0.0)
+        };
+        VertexOut out;
+        out.pos = float4(pos[vid] * scale, 0.0, 1.0);
+        out.uv = uv[vid];
+        return out;
+    }
+    fragment float4 gc_retro_fs(VertexOut in [[stage_in]],
+                                texture2d<float> tex [[texture(0)]],
+                                sampler samp [[sampler(0)]]) {
+        return float4(tex.sample(samp, in.uv).rgb, 1.0);
+    }
+    """
 
     override init(frame: CGRect) {
+        let mtlDevice = MTLCreateSystemDefaultDevice()
+        let queue = mtlDevice?.makeCommandQueue()
+        var pipeline: MTLRenderPipelineState?
+        var nearest: MTLSamplerState?
+        var linear: MTLSamplerState?
+        if let mtlDevice,
+           let library = try? mtlDevice.makeLibrary(source: Self.shaderSource, options: nil),
+           let vs = library.makeFunction(name: "gc_retro_vs"),
+           let fs = library.makeFunction(name: "gc_retro_fs") {
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = vs
+            desc.fragmentFunction = fs
+            desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            pipeline = try? mtlDevice.makeRenderPipelineState(descriptor: desc)
+
+            let nDesc = MTLSamplerDescriptor()
+            nDesc.minFilter = .linear
+            nDesc.magFilter = .nearest
+            nDesc.sAddressMode = .clampToEdge
+            nDesc.tAddressMode = .clampToEdge
+            nearest = mtlDevice.makeSamplerState(descriptor: nDesc)
+
+            let lDesc = MTLSamplerDescriptor()
+            lDesc.minFilter = .linear
+            lDesc.magFilter = .linear
+            lDesc.sAddressMode = .clampToEdge
+            lDesc.tAddressMode = .clampToEdge
+            linear = mtlDevice.makeSamplerState(descriptor: lDesc)
+        }
+
+        self.device = mtlDevice
+        self.commandQueue = queue
+        self.pipelineState = pipeline
+        self.nearestSampler = nearest
+        self.linearSampler = linear
+
         super.init(frame: frame)
         backgroundColor = .black
         isMultipleTouchEnabled = false
-        imageLayer.contentsGravity = .resizeAspect
-        imageLayer.magnificationFilter = .nearest
-        imageLayer.minificationFilter = .linear
-        imageLayer.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
-        layer.addSublayer(imageLayer)
+
+        if let mtlDevice, pipeline != nil, queue != nil {
+            let mLayer = CAMetalLayer()
+            mLayer.device = mtlDevice
+            mLayer.pixelFormat = .bgra8Unorm
+            mLayer.framebufferOnly = true
+            mLayer.isOpaque = true
+            mLayer.actions = ["bounds": NSNull(), "position": NSNull(), "contents": NSNull()]
+            layer.addSublayer(mLayer)
+            self.metalLayer = mLayer
+        } else {
+            fallbackLayer.contentsGravity = .resizeAspect
+            fallbackLayer.magnificationFilter = .nearest
+            fallbackLayer.minificationFilter = .linear
+            fallbackLayer.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
+            layer.addSublayer(fallbackLayer)
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        imageLayer.frame = bounds
+        let scale = window?.screen.scale ?? traitCollection.displayScale
+        if let mLayer = metalLayer {
+            let w = max(1, (bounds.width * scale).rounded())
+            let h = max(1, (bounds.height * scale).rounded())
+            mLayer.frame = bounds
+            mLayer.contentsScale = scale
+            mLayer.drawableSize = CGSize(width: w, height: h)
+            os_unfair_lock_lock(&lock)
+            drawableBounds = CGSize(width: w, height: h)
+            let hasTexture = (texture != nil)
+            let smooth = lastSmooth
+            os_unfair_lock_unlock(&lock)
+            if hasTexture {
+                presentCurrentTexture(smooth: smooth)
+            }
+        } else {
+            fallbackLayer.frame = bounds
+        }
+    }
+
+    /// Thread-safe zero-allocation GPU upload and present from the core worker queue.
+    func update(pixels: UnsafeRawPointer, width: Int, height: Int, smooth: Bool) {
+        guard width > 0, height > 0 else { return }
+        if let device, metalLayer != nil, pipelineState != nil, commandQueue != nil {
+            os_unfair_lock_lock(&lock)
+            if texture == nil || texture?.width != width || texture?.height != height {
+                let desc = MTLTextureDescriptor.texture2DDescriptor(
+                    pixelFormat: .bgra8Unorm,
+                    width: width,
+                    height: height,
+                    mipmapped: false
+                )
+                desc.usage = [.shaderRead]
+                desc.storageMode = .shared
+                texture = device.makeTexture(descriptor: desc)
+            }
+            if let tex = texture {
+                tex.replace(
+                    region: MTLRegionMake2D(0, 0, width, height),
+                    mipmapLevel: 0,
+                    withBytes: pixels,
+                    bytesPerRow: width * 4
+                )
+            }
+            frameSize = CGSize(width: width, height: height)
+            lastSmooth = smooth
+            os_unfair_lock_unlock(&lock)
+            presentCurrentTexture(smooth: smooth)
+            return
+        }
+
+        // Fallback CALayer path (only when Metal is unavailable).
+        let data = Data(bytes: pixels, count: width * height * 4)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let cgImage = CGImage(
+                  width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                  bytesPerRow: width * 4, space: Self.rgbColorSpace, bitmapInfo: Self.bitmapInfo,
+                  provider: provider, decode: nil, shouldInterpolate: smooth, intent: .defaultIntent
+              ) else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.update(image: cgImage)
+        }
+    }
+
+    private func presentCurrentTexture(smooth: Bool) {
+        guard let mLayer = metalLayer,
+              let queue = commandQueue,
+              let pipeline = pipelineState,
+              let sampler = smooth ? linearSampler : nearestSampler else { return }
+
+        os_unfair_lock_lock(&lock)
+        let tex = texture
+        let srcSize = frameSize
+        let dstSize = drawableBounds
+        os_unfair_lock_unlock(&lock)
+
+        guard let tex, srcSize.width > 0, srcSize.height > 0,
+              dstSize.width > 1, dstSize.height > 1 else { return }
+
+        autoreleasepool {
+            guard let drawable = mLayer.nextDrawable(),
+                  let cmd = queue.makeCommandBuffer() else { return }
+
+            let dstW = Double(drawable.texture.width)
+            let dstH = Double(drawable.texture.height)
+            let srcAspect = Double(srcSize.width / srcSize.height)
+            let dstAspect = dstW / max(1.0, dstH)
+            var scale = SIMD2<Float>(1, 1)
+            if dstAspect > srcAspect {
+                scale.x = Float(srcAspect / dstAspect)
+            } else if srcAspect > dstAspect {
+                scale.y = Float(dstAspect / srcAspect)
+            }
+
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = drawable.texture
+            pass.colorAttachments[0].loadAction = .clear
+            pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+            pass.colorAttachments[0].storeAction = .store
+
+            guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return }
+            enc.setRenderPipelineState(pipeline)
+            enc.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+            enc.setFragmentTexture(tex, index: 0)
+            enc.setFragmentSamplerState(sampler, index: 0)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            enc.endEncoding()
+            cmd.present(drawable)
+            cmd.commit()
+        }
     }
 
     func update(image: CGImage) {
+        os_unfair_lock_lock(&lock)
         frameSize = CGSize(width: image.width, height: image.height)
-        imageLayer.contents = image
+        os_unfair_lock_unlock(&lock)
+        fallbackLayer.contents = image
     }
 
     private func report(_ touch: UITouch, pressed: Bool) {
-        guard pressed, frameSize.width > 0, frameSize.height > 0,
+        os_unfair_lock_lock(&lock)
+        let size = frameSize
+        os_unfair_lock_unlock(&lock)
+        guard pressed, size.width > 0, size.height > 0,
               bounds.width > 0, bounds.height > 0 else {
             onPointer?(0, 0, false)
             return
         }
         let point = touch.location(in: self)
-        let scale = min(bounds.width / frameSize.width, bounds.height / frameSize.height)
-        let renderedWidth = frameSize.width * scale
-        let renderedHeight = frameSize.height * scale
+        let scale = min(bounds.width / size.width, bounds.height / size.height)
+        let renderedWidth = size.width * scale
+        let renderedHeight = size.height * scale
         let x = (point.x - (bounds.width - renderedWidth) / 2) / max(1, renderedWidth)
         let y = (point.y - (bounds.height - renderedHeight) / 2) / max(1, renderedHeight)
         onPointer?(x, y, (0...1).contains(x) && (0...1).contains(y))
