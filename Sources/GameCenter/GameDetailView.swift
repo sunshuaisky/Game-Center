@@ -31,29 +31,48 @@ struct GameDetailView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("游戏详情")
-                    .font(.system(size: 14, weight: .semibold))
-                Spacer()
-                SheetCloseButton { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 13)
-            .overlay(alignment: .bottom) {
-                Rectangle().fill(GameCenterColors.border).frame(height: 1)
-            }
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    hero
-                    synopsisSection
+        ZStack(alignment: .top) {
+            Color.clear
+                .frame(height: 196)
+                .overlay {
+                    GameArtwork(game: game, compact: true)
                 }
-                .padding(22)
-            }
+                .blur(radius: 40)
+                .opacity(0.24)
+                .mask(
+                    LinearGradient(
+                        colors: [.black, .black.opacity(0.4), .clear],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .clipped()
+                .allowsHitTesting(false)
 
-            footer
+            VStack(spacing: 0) {
+                HStack {
+                    Text("游戏详情")
+                        .font(.system(size: 14, weight: .semibold))
+                    Spacer()
+                    SheetCloseButton { dismiss() }
+                        .keyboardShortcut(.cancelAction)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 13)
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(GameCenterColors.border).frame(height: 1)
+                }
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        hero
+                        synopsisSection
+                    }
+                    .padding(22)
+                }
+
+                footer
+            }
         }
         .frame(width: modalWidth, height: modalHeight)
         .background(Color(nsColor: .windowBackgroundColor))
@@ -85,7 +104,8 @@ struct GameDetailView: View {
             GameArtwork(game: game, showPlatformBadge: false)
                 .frame(width: 132, height: 174)
                 .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(.white.opacity(0.12), lineWidth: 1))
+                .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(.white.opacity(0.14), lineWidth: 1))
+                .shadow(color: .black.opacity(0.45), radius: 14, y: 6)
 
             VStack(alignment: .leading, spacing: 10) {
                 Text(game.displayTitle)
@@ -121,7 +141,12 @@ struct GameDetailView: View {
 
                 HStack(spacing: 8) {
                     Button(action: onFavorite) {
-                        Label(game.isFavorite ? "已收藏" : "收藏", systemImage: game.isFavorite ? "heart.fill" : "heart")
+                        Label {
+                            Text(game.isFavorite ? "已收藏" : "收藏")
+                        } icon: {
+                            Image(systemName: game.isFavorite ? "heart.fill" : "heart")
+                                .symbolEffect(.bounce, value: game.isFavorite)
+                        }
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(game.isFavorite ? GameCenterColors.favoriteForeground : Color.primary)
                             .padding(.horizontal, 13)

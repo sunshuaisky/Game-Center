@@ -267,9 +267,11 @@ for framework in "$app"/Frameworks/*.framework; do
   codesign "${sign_args[@]}" "$framework" &
   sign_pids+=($!)
 done
-for pid in "${sign_pids[@]}"; do
-  wait "$pid"
-done
+if [[ ${#sign_pids[@]} -gt 0 ]]; then
+  for pid in "${sign_pids[@]}"; do
+    wait "$pid"
+  done
+fi
 if [[ ${#app_sign_args[@]} -gt 0 ]]; then
   codesign "${sign_args[@]}" "${app_sign_args[@]}" "$app"
 else

@@ -33,6 +33,9 @@ struct GameLibraryView: View {
     @FocusState private var isSearchFocused: Bool
     @State private var selectedGameID: UUID?
     @State private var isSettingsVisible = false
+    @State private var isSettingsHovered = false
+    @State private var isSearchHovered = false
+    @State private var didApplyInitialFilterFallback = false
     @StateObject private var mobileBuildSession = MobileAppBuildSession()
     @State private var isMobileBuildVisible = false
     @State private var actionMenuGameID: UUID?
@@ -209,10 +212,17 @@ struct GameLibraryView: View {
         }
     }
 
-    private var gridColumnCount: Int {
+    private var gridLayout: (columns: Int, cardWidth: CGFloat, cardHeight: CGFloat) {
+        let spacing: CGFloat = 18
         let usableWidth = max(windowSize.width - 72, 132)
-        return max(1, Int((usableWidth + 18) / (132 + 18)))
+        let columns = max(1, Int((usableWidth + spacing) / (136 + spacing)))
+        let rawWidth = floor((usableWidth - spacing * CGFloat(columns - 1)) / CGFloat(columns))
+        let cardWidth = min(156, max(126, rawWidth))
+        let cardHeight = round(cardWidth * 1.22)
+        return (columns, cardWidth, cardHeight)
     }
+
+    private var gridColumnCount: Int { gridLayout.columns }
 
     var body: some View {
         GeometryReader { container in
@@ -434,13 +444,28 @@ struct GameLibraryView: View {
             library.refreshMissingMetadata(language: value.scrapeLanguage)
         }
         .onAppear {
+            applyInitialFilterFallbackIfNeeded()
             selectedGameID = visibleGames.first?.id
             library.refreshMissingMetadata(language: language.scrapeLanguage)
             gamepad.refresh()
             bindGamepadActions()
         }
+        .onChange(of: library.games.count) { _, _ in
+            applyInitialFilterFallbackIfNeeded()
+        }
         .onChange(of: gamepad.connectionVersion) { _, _ in
             bindGamepadActions()
+        }
+    }
+
+    private func applyInitialFilterFallbackIfNeeded() {
+        guard !didApplyInitialFilterFallback, !library.games.isEmpty else { return }
+        didApplyInitialFilterFallback = true
+        guard libraryFilter == .recent, visibleGames.isEmpty else { return }
+        let counts = computeFilterCounts()
+        if let firstPlatform = GamePlatform.allCases.first(where: { (counts.byPlatform[$0] ?? 0) > 0 }) {
+            libraryFilter = .platform(firstPlatform)
+            selectedGameID = visibleGames.first?.id
         }
     }
 
@@ -474,6 +499,7 @@ struct GameLibraryView: View {
                 if let selectedGame {
                     GameArtwork(game: selectedGame, compact: true)
                         .frame(width: geometry.size.width, height: geometry.size.height)
+                        .id(selectedGame.id)
                         .transition(.opacity)
                 } else {
                     LinearGradient(
@@ -483,9 +509,9 @@ struct GameLibraryView: View {
                     )
                 }
                 LinearGradient(stops: [
-                    .init(color: .black.opacity(0.76), location: 0),
-                    .init(color: .black.opacity(0.40), location: 0.42),
-                    .init(color: .black.opacity(0.05), location: 0.80)
+                    .init(color: .black.opacity(0.80), location: 0),
+                    .init(color: .black.opacity(0.44), location: 0.42),
+                    .init(color: .black.opacity(0.06), location: 0.80)
                 ], startPoint: .leading, endPoint: .trailing)
                 LinearGradient(
                     stops: [
@@ -619,13 +645,15 @@ struct GameLibraryView: View {
             } label: {
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.92))
+                    .foregroundStyle(.white.opacity(isSettingsVisible || isSettingsHovered ? 1 : 0.90))
                     .frame(width: 30, height: 30)
-                    .background(.white.opacity(isSettingsVisible ? 0.18 : 0.09), in: Circle())
-                    .overlay(Circle().stroke(.white.opacity(0.11), lineWidth: 1))
+                    .background(.white.opacity(isSettingsVisible ? 0.20 : (isSettingsHovered ? 0.16 : 0.09)), in: Circle())
+                    .overlay(Circle().stroke(.white.opacity(isSettingsVisible || isSettingsHovered ? 0.20 : 0.11), lineWidth: 1))
                     .contentShape(Circle())
             }
             .buttonStyle(CursorButtonStyle())
+            .onHover { isSettingsHovered = $0 }
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: isSettingsHovered)
             .help("设置")
             .accessibilityLabel("设置")
             .popover(isPresented: $isSettingsVisible, arrowEdge: .bottom) {
@@ -638,13 +666,13 @@ struct GameLibraryView: View {
         HStack(spacing: 6) {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.white.opacity(0.62))
+                .foregroundStyle(.white.opacity(isSearchFocused ? 0.88 : 0.62))
             TextField(AppLanguage.localized("搜索"), text: $searchText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
                 .foregroundStyle(.white)
                 .focused($isSearchFocused)
-                .frame(width: isSearchFocused || !searchText.isEmpty ? 136 : 92)
+                .frame(width: isSearchFocused || !searchText.isEmpty ? 140 : 92)
             if !searchText.isEmpty {
                 Button {
                     searchText = ""
@@ -666,9 +694,11 @@ struct GameLibraryView: View {
         }
         .padding(.horizontal, 10)
         .frame(height: 30)
-        .background(Color.black.opacity(isSearchFocused ? 0.42 : 0.24), in: Capsule())
-        .overlay(Capsule().stroke(Color.white.opacity(isSearchFocused ? 0.28 : 0.11), lineWidth: 1))
+        .background(Color.black.opacity(isSearchFocused ? 0.44 : (isSearchHovered ? 0.34 : 0.24)), in: Capsule())
+        .overlay(Capsule().stroke(Color.white.opacity(isSearchFocused ? 0.30 : (isSearchHovered ? 0.20 : 0.11)), lineWidth: 1))
+        .onHover { isSearchHovered = $0 }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: isSearchFocused)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: isSearchHovered)
     }
 
     private var gamepadIndicator: some View {
@@ -891,53 +921,30 @@ struct GameLibraryView: View {
                             if selectedGame.isDirectlyLaunchable {
                                 Button(action: playSelected) {
                                     Label("开始游玩", systemImage: "play.fill")
-                                        .font(.system(size: 13, weight: .semibold))
-                                        .foregroundStyle(inverseColor)
-                                        .padding(.horizontal, 19)
-                                        .frame(height: 38)
-                                        .background(GameCenterColors.action, in: Capsule())
                                 }
-                                .buttonStyle(CursorButtonStyle())
+                                .buttonStyle(HeroCapsuleButtonStyle(prominence: .primary))
                             }
 
                             if selectedGame.platform == .switchConsole {
                                 let isPrimaryBuild = !selectedGame.isDirectlyLaunchable
                                 Button { presentBuild(for: selectedGame) } label: {
                                     Label(isPrimaryBuild ? "构建 Switch 游戏" : "构建版本", systemImage: "hammer")
-                                        .font(.system(size: 13, weight: isPrimaryBuild ? .semibold : .medium))
-                                        .foregroundStyle(isPrimaryBuild ? inverseColor : .white)
-                                        .padding(.horizontal, isPrimaryBuild ? 19 : 16)
-                                        .frame(height: 38)
-                                        .background(
-                                            isPrimaryBuild ? GameCenterColors.action : Color.white.opacity(0.11),
-                                            in: Capsule()
-                                        )
-                                        .overlay {
-                                            if !isPrimaryBuild {
-                                                Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                            }
-                                        }
                                 }
-                                .buttonStyle(CursorButtonStyle())
+                                .buttonStyle(HeroCapsuleButtonStyle(prominence: isPrimaryBuild ? .primary : .secondary))
                             }
 
                             Button { showDetails(for: selectedGame) } label: {
                                 Text(AppLanguage.localized("详情"))
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(.white.opacity(0.92))
-                                    .padding(.horizontal, 15)
-                                    .frame(height: 38)
-                                    .background(Color.white.opacity(0.10), in: Capsule())
-                                    .overlay(Capsule().stroke(Color.white.opacity(0.13), lineWidth: 1))
                             }
-                            .buttonStyle(CursorButtonStyle())
+                            .buttonStyle(HeroCapsuleButtonStyle(prominence: .secondary, horizontalPadding: 16))
 
                             Button {
                                 library.toggleFavorite(for: selectedGame.id)
                             } label: {
                                 Image(systemName: selectedGame.isFavorite ? "heart.fill" : "heart")
                                     .font(.system(size: 14, weight: .semibold))
-                                    .foregroundStyle(selectedGame.isFavorite ? GameCenterColors.favoriteForeground : .white.opacity(0.9))
+                                    .symbolEffect(.bounce, value: selectedGame.isFavorite)
+                                    .foregroundStyle(selectedGame.isFavorite ? GameCenterColors.favoriteForeground : .white.opacity(0.92))
                                     .frame(width: 38, height: 38)
                                     .background(
                                         selectedGame.isFavorite ? GameCenterColors.favoriteBackground : Color.white.opacity(0.10),
@@ -945,7 +952,7 @@ struct GameLibraryView: View {
                                     )
                                     .overlay(
                                         Circle().stroke(
-                                            selectedGame.isFavorite ? GameCenterColors.favoriteBorder : Color.white.opacity(0.13),
+                                            selectedGame.isFavorite ? GameCenterColors.favoriteBorder : Color.white.opacity(0.14),
                                             lineWidth: 1
                                         )
                                     )
@@ -1063,7 +1070,8 @@ struct GameLibraryView: View {
     }
 
     private func gameGrid(games: [Game], selectedID: UUID?) -> some View {
-        let columns = Array(repeating: GridItem(.fixed(132), spacing: 18, alignment: .top), count: gridColumnCount)
+        let layout = gridLayout
+        let columns = Array(repeating: GridItem(.fixed(layout.cardWidth), spacing: 18, alignment: .top), count: layout.columns)
         return Group {
             if games.isEmpty {
                 HStack(spacing: 9) {
@@ -1081,8 +1089,8 @@ struct GameLibraryView: View {
                             ForEach(games) { game in
                                 GameCoverTile(
                                     game: game,
-                                    cardWidth: 132,
-                                    cardHeight: 160,
+                                    cardWidth: layout.cardWidth,
+                                    cardHeight: layout.cardHeight,
                                     isSelected: game.id == selectedID,
                                     isBuildingThisGame: switchBuildSession.isBuilding && switchBuildSession.game?.id == game.id,
                                     isMenuOpen: actionMenuGameID == game.id,
@@ -1218,16 +1226,35 @@ struct GameLibraryView: View {
     }
 
     private var bottomHints: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "dpad").accessibilityHidden(true)
-            Text(AppLanguage.localized(selectedGameRequiresBuild
-                 ? "十字键/左摇杆浏览   LB/RB 切换平台   LT 收藏   A 详情   Y 选项   Menu/Options 设置   B 返回"
-                 : "十字键/左摇杆浏览   LB/RB 切换平台   LT 收藏   X 游玩   A 详情   Y 选项   Menu/Options 设置   B 返回"))
-                .fixedSize(horizontal: false, vertical: true)
+        HStack(spacing: 14) {
+            hintCap("◀▶▲▼", "浏览")
+            hintCap("LB/RB", "切换平台")
+            hintCap("LT", "收藏")
+            if !selectedGameRequiresBuild {
+                hintCap("X", "游玩")
+            }
+            hintCap("A", "详情")
+            hintCap("Y", "选项")
+            hintCap("Menu", "设置")
+            hintCap("B", "返回")
+            Spacer(minLength: 0)
         }
-        .font(.system(size: 12, weight: .medium))
-        .foregroundStyle(.white.opacity(0.76))
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func hintCap(_ key: String, _ label: String) -> some View {
+        HStack(spacing: 5) {
+            Text(key)
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .foregroundStyle(.white.opacity(0.92))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Color.white.opacity(0.13), in: RoundedRectangle(cornerRadius: 4.5, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 4.5, style: .continuous).stroke(Color.white.opacity(0.16), lineWidth: 0.75))
+            Text(AppLanguage.localized(label))
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.white.opacity(0.70))
+        }
     }
 
     private func bindGamepadActions() {
@@ -1536,10 +1563,12 @@ private struct GameCoverTile<BuildOverlay: View, ActionMenu: View, ContextMenuCo
 
                     if game.isFavorite {
                         Image(systemName: "heart.fill")
-                            .font(.system(size: 11, weight: .bold))
+                            .font(.system(size: 10.5, weight: .bold))
                             .foregroundStyle(GameCenterColors.favoriteForeground)
-                            .padding(9)
-                            .shadow(color: .black.opacity(0.5), radius: 3, y: 1)
+                            .frame(width: 24, height: 24)
+                            .background(Color.black.opacity(0.48), in: Circle())
+                            .overlay(Circle().stroke(.white.opacity(0.14), lineWidth: 0.75))
+                            .padding(8)
                             .allowsHitTesting(false)
                     }
                 }
@@ -1549,8 +1578,9 @@ private struct GameCoverTile<BuildOverlay: View, ActionMenu: View, ContextMenuCo
                         .font(.system(size: 12, weight: .bold))
                         .foregroundStyle(.white)
                         .frame(width: 28, height: 28)
-                        .background(.black.opacity(0.68), in: Circle())
-                        .overlay(Circle().strokeBorder(.white.opacity(0.28), lineWidth: 1))
+                        .background(.ultraThinMaterial, in: Circle())
+                        .background(.black.opacity(0.42), in: Circle())
+                        .overlay(Circle().strokeBorder(.white.opacity(0.26), lineWidth: 0.75))
                 }
                 .buttonStyle(CursorButtonStyle())
                 .padding(9)
@@ -1826,6 +1856,54 @@ struct CursorButtonStyle: ButtonStyle {
             .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1)
             .opacity(configuration.isPressed ? 0.85 : 1)
             .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: configuration.isPressed)
+            .pointingHandCursor()
+    }
+}
+
+private struct HeroCapsuleButtonStyle: ButtonStyle {
+    enum Prominence { case primary, secondary }
+    let prominence: Prominence
+    var horizontalPadding: CGFloat = 19
+
+    @State private var isHovered = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: prominence == .primary ? .semibold : .medium))
+            .foregroundStyle(prominence == .primary ? Color(white: 0.06) : .white.opacity(isHovered ? 1 : 0.92))
+            .padding(.horizontal, horizontalPadding)
+            .frame(height: 38)
+            .background {
+                if prominence == .primary {
+                    Capsule().fill(
+                        configuration.isPressed
+                            ? Color(white: 0.82)
+                            : (isHovered ? GameCenterColors.actionHover : GameCenterColors.action)
+                    )
+                } else {
+                    Capsule()
+                        .fill(.ultraThinMaterial)
+                        .overlay(
+                            Capsule().fill(Color.white.opacity(configuration.isPressed ? 0.18 : (isHovered ? 0.15 : 0.08)))
+                        )
+                }
+            }
+            .overlay {
+                if prominence == .secondary {
+                    Capsule().stroke(Color.white.opacity(isHovered ? 0.24 : 0.14), lineWidth: 1)
+                }
+            }
+            .shadow(
+                color: prominence == .primary ? .white.opacity(isHovered ? 0.22 : 0.12) : .clear,
+                radius: isHovered ? 14 : 10,
+                y: 3
+            )
+            .contentShape(Capsule())
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1)
+            .onHover { isHovered = $0 }
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: isHovered)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.10), value: configuration.isPressed)
             .pointingHandCursor()
     }
 }

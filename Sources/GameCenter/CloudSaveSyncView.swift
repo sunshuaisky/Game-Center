@@ -124,7 +124,7 @@ struct CloudSaveSyncView: View {
         }
         .frame(maxWidth: 560)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(white: 0.075))
+        .background(Color(white: 0.075).ignoresSafeArea())
         .task {
             let resolveRoot = saveRoot
             let savedBookmark = bookmark

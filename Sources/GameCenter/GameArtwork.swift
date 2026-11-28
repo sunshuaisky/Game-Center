@@ -81,8 +81,9 @@ struct GameArtwork: View {
                         .resizable()
                         .aspectRatio(contentMode: .fill)
                         .frame(width: geometry.size.width, height: geometry.size.height)
-                        .scaleEffect(displayedBlurred ? 1.12 : 1.0)
-                        .blur(radius: displayedBlurred ? 18 : 0)
+                        .scaleEffect(displayedBlurred ? 1.14 : (compact ? 1.02 : 1.0))
+                        .blur(radius: displayedBlurred ? 20 : 0)
+                        .saturation(displayedBlurred ? 1.12 : 1.0)
                         .clipped()
                 } else {
                     LinearGradient(colors: palette, startPoint: .topLeading, endPoint: .bottomTrailing)

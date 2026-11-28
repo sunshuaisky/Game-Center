@@ -7,20 +7,61 @@ import UniformTypeIdentifiers
 final class ShellLibrary: NSObject {
     @MainActor @objc(makeControllerWithInitialURL:)
     static func makeController(initialURL: URL?) -> UIViewController {
-        UIHostingController(rootView: LibraryView())
+        LibraryHostingController(rootView: LibraryView())
     }
 
     @MainActor @objc static func handleOpenURL(_ url: URL) -> Bool { false }
 }
 
+/// Custom UIHostingController that guarantees a dark full-bleed canvas from launch,
+/// crisp light status bar styling in portrait, and immersive status bar / home indicator
+/// auto-hiding in compact iPhone landscape.
+private final class LibraryHostingController: UIHostingController<LibraryView> {
+    private var lastCompactLandscape: Bool?
+
+    private var isCompactLandscape: Bool {
+        view.bounds.width > view.bounds.height && traitCollection.verticalSizeClass == .compact
+    }
+
+    override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+    override var prefersStatusBarHidden: Bool { isCompactLandscape }
+    override var prefersHomeIndicatorAutoHidden: Bool { isCompactLandscape }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = UIColor(white: 0.045, alpha: 1)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let compact = isCompactLandscape
+        if compact != lastCompactLandscape {
+            lastCompactLandscape = compact
+            setNeedsStatusBarAppearanceUpdate()
+            setNeedsUpdateOfHomeIndicatorAutoHidden()
+        }
+    }
+
+    override func viewWillTransition(to size: CGSize, with coordinator: any UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+        coordinator.animate(alongsideTransition: { _ in
+            self.setNeedsStatusBarAppearanceUpdate()
+            self.setNeedsUpdateOfHomeIndicatorAutoHidden()
+        })
+    }
+}
+
 private enum PhoneTheme {
+    static let canvas = Color(white: 0.045)
     static let action = Color(white: 0.94)
     static let inverseText = Color(white: 0.06)
     static let surface = Color.white.opacity(0.055)
+    static let glassTint = Color.white.opacity(0.09)
     static let border = Color.white.opacity(0.11)
+    static let borderStrong = Color.white.opacity(0.18)
     static let favoriteForeground = Color(red: 1.0, green: 0.52, blue: 0.58)
-    static let favoriteBackground = Color.red.opacity(0.20)
-    static let favoriteBorder = Color.red.opacity(0.36)
+    static let favoriteBackground = Color.red.opacity(0.22)
+    static let favoriteBorder = Color.red.opacity(0.40)
     static let destructiveForeground = Color(red: 1.0, green: 0.52, blue: 0.56)
     static let destructiveBackground = Color.red.opacity(0.14)
     static let destructiveBorder = Color.red.opacity(0.28)
@@ -69,6 +110,7 @@ private struct LibraryView: View {
     @State private var detailEntry: Entry?
     @State private var pendingDeleteEntry: Entry?
     @State private var showingSaveSync = false
+    @State private var isCompactLandscape = false
 
     @AppStorage("phone.library.favorites") private var favoriteData = Data()
     @AppStorage("museum.recent") private var recentData = Data()
@@ -248,41 +290,80 @@ private struct LibraryView: View {
 
     var body: some View {
         let snapshot = makeSnapshot()
-        GeometryReader { geometry in
-            let isLandscape = geometry.size.width > geometry.size.height
+        FullScreenReader { fullSize, safeInsets in
+            let isLandscape = fullSize.width > fullSize.height
+            let isPad = min(fullSize.width, fullSize.height) >= 600
+            let compactLandscape = isLandscape && fullSize.height < 500
+            let baseHorizontal: CGFloat = isPad ? 32 : (isLandscape ? 20 : 20)
+            let leadingInset = max(safeInsets.leading + (isLandscape ? 10 : 0), baseHorizontal)
+            let trailingInset = max(safeInsets.trailing + (isLandscape ? 10 : 0), baseHorizontal)
+            let topInset = safeInsets.top + (compactLandscape ? 8 : (isLandscape ? 12 : 6))
+            let bottomInset = max(safeInsets.bottom, isLandscape ? 10 : 18)
+            let usableWidth = max(200, fullSize.width - leadingInset - trailingInset)
             let gridColumnsCount = isLandscape
-                ? max(4, Int((geometry.size.width - 48) / 118))
-                : (geometry.size.width >= 600 ? 5 : 3)
+                ? max(4, min(8, Int((usableWidth + 14) / (isPad ? 138 : 106))))
+                : (isPad ? max(4, min(6, Int((usableWidth + 14) / 140))) : 3)
+            let landscapeDockHeight: CGFloat = compactLandscape
+                ? min(max(fullSize.height * 0.55, 210), 244)
+                : min(max(fullSize.height * 0.54, 290), 430)
 
             ZStack {
-                backdrop(size: geometry.size, isLandscape: isLandscape, selectedEntry: snapshot.selectedEntry)
+                backdrop(size: fullSize, isLandscape: isLandscape, selectedEntry: snapshot.selectedEntry)
 
                 VStack(spacing: 0) {
-                    topBar(isLandscape: isLandscape)
+                    topBar(isLandscape: isLandscape, isCompactLandscape: compactLandscape)
+                        .padding(.leading, leadingInset)
+                        .padding(.trailing, trailingInset)
+                        .padding(.top, topInset)
+                        .padding(.bottom, compactLandscape ? 4 : 6)
 
                     if showingPortraitSearch && !isLandscape {
-                        portraitSearchBar
+                        portraitSearchBar(matchCount: snapshot.visibleEntries.count)
+                            .padding(.leading, leadingInset)
+                            .padding(.trailing, trailingInset)
+                            .padding(.top, 4)
                             .transition(.move(edge: .top).combined(with: .opacity))
                     }
 
                     if isLandscape {
-                        landscapeHero(entry: snapshot.selectedEntry)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                            .padding(.horizontal, 24)
+                        landscapeHero(
+                            entry: snapshot.selectedEntry,
+                            isCompact: compactLandscape,
+                            isPad: isPad,
+                            totalCount: snapshot.visibleEntries.count
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                        .padding(.leading, leadingInset)
+                        .padding(.trailing, trailingInset)
                     } else {
-                        portraitHero(entry: snapshot.selectedEntry)
-                            .padding(.horizontal, 20)
-                            .padding(.top, 10)
-                            .padding(.bottom, 14)
+                        Spacer(minLength: showingPortraitSearch ? 10 : (isPad ? 48 : 22))
+                            .frame(maxHeight: showingPortraitSearch ? 16 : (isPad ? 128 : max(48, fullSize.height * 0.125)))
+
+                        portraitHero(
+                            entry: snapshot.selectedEntry,
+                            isPad: isPad,
+                            totalCount: snapshot.visibleEntries.count
+                        )
+                        .padding(.leading, leadingInset)
+                        .padding(.trailing, trailingInset)
+                        .padding(.bottom, 14)
                     }
 
                     bottomDock(
                         isLandscape: isLandscape,
-                        dockHeight: isLandscape ? max(geometry.size.height * 0.60, 210) : nil,
+                        isCompactLandscape: compactLandscape,
+                        dockHeight: isLandscape ? landscapeDockHeight : nil,
                         columnsCount: gridColumnsCount,
+                        leadingInset: leadingInset,
+                        trailingInset: trailingInset,
+                        bottomInset: bottomInset,
                         snapshot: snapshot
                     )
                 }
+                .frame(width: fullSize.width, height: fullSize.height)
+            }
+            .onChange(of: compactLandscape) { _, value in
+                isCompactLandscape = value
             }
             .onChange(of: snapshot.selectedEntry?.id) { _, _ in
                 if let entry = snapshot.selectedEntry {
@@ -309,6 +390,7 @@ private struct LibraryView: View {
                 bindGamepad(columnsCount: count)
             }
             .onAppear {
+                isCompactLandscape = compactLandscape
                 cachedFavorites = (try? JSONDecoder().decode(Set<String>.self, from: favoriteData)) ?? []
                 cachedRecentIDs = (try? JSONDecoder().decode([String].self, from: recentData)) ?? []
                 gamepad.refresh()
@@ -321,7 +403,7 @@ private struct LibraryView: View {
                 cachedRecentIDs = (try? JSONDecoder().decode([String].self, from: data)) ?? []
             }
         }
-        .background(Color(white: 0.045).ignoresSafeArea())
+        .background(PhoneTheme.canvas.ignoresSafeArea())
         .preferredColorScheme(.dark)
         .tint(.white)
         .task { await refresh() }
@@ -339,9 +421,9 @@ private struct LibraryView: View {
         }
         .sheet(item: $detailEntry) { entry in
             detailSheet(for: entry)
-                .presentationDetents([.medium, .large])
+                .presentationDetents(isCompactLandscape ? [.large] : [.medium, .large])
                 .presentationDragIndicator(.visible)
-                .presentationCornerRadius(26)
+                .presentationCornerRadius(28)
                 .presentationBackground(.ultraThinMaterial)
         }
         .sheet(isPresented: $showingSaveSync) {
@@ -403,30 +485,35 @@ private struct LibraryView: View {
 
     private func backdrop(size: CGSize, isLandscape: Bool, selectedEntry: Entry?) -> some View {
         ZStack {
-            Color(white: 0.045)
+            PhoneTheme.canvas
             if let entry = selectedEntry, let image = backdropImage(for: entry) {
                 let shouldBlur = !MetadataRefreshPolicy.isWideImage(width: image.size.width, height: image.size.height) && isLandscape
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
                     .frame(width: size.width, height: size.height)
-                    .scaleEffect(shouldBlur ? 1.12 : 1.0)
-                    .blur(radius: shouldBlur ? 18 : 0)
+                    .scaleEffect(shouldBlur ? 1.16 : 1.03)
+                    .blur(radius: shouldBlur ? 22 : 0)
+                    .saturation(shouldBlur ? 1.12 : 1.0)
+                    .brightness(shouldBlur ? -0.04 : 0)
                     .clipped()
+                    .id(entry.id)
                     .transition(.opacity)
             } else if let entry = selectedEntry {
                 LinearGradient(colors: placeholderPalette(for: entry), startPoint: .topLeading, endPoint: .bottomTrailing)
+                    .id(entry.id)
                     .transition(.opacity)
             } else {
-                LinearGradient(colors: [Color(white: 0.12), Color(white: 0.045)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                LinearGradient(colors: [Color(white: 0.13), PhoneTheme.canvas], startPoint: .topLeading, endPoint: .bottomTrailing)
             }
 
             if isLandscape {
                 LinearGradient(
                     stops: [
-                        .init(color: .black.opacity(0.78), location: 0),
-                        .init(color: .black.opacity(0.40), location: 0.44),
-                        .init(color: .black.opacity(0.08), location: 0.82)
+                        .init(color: .black.opacity(0.84), location: 0),
+                        .init(color: .black.opacity(0.52), location: 0.42),
+                        .init(color: .black.opacity(0.14), location: 0.78),
+                        .init(color: .black.opacity(0.04), location: 1)
                     ],
                     startPoint: .leading,
                     endPoint: .trailing
@@ -434,62 +521,98 @@ private struct LibraryView: View {
             }
 
             LinearGradient(
-                stops: [
-                    .init(color: .black.opacity(0.55), location: 0),
-                    .init(color: .black.opacity(0.18), location: 0.24),
-                    .init(color: .black.opacity(0.54), location: 0.56),
-                    .init(color: .black.opacity(0.95), location: 1)
-                ],
+                stops: isLandscape
+                    ? [
+                        .init(color: .black.opacity(0.46), location: 0),
+                        .init(color: .black.opacity(0.14), location: 0.22),
+                        .init(color: .black.opacity(0.44), location: 0.56),
+                        .init(color: .black.opacity(0.92), location: 1)
+                    ]
+                    : [
+                        .init(color: .black.opacity(0.52), location: 0),
+                        .init(color: .black.opacity(0.12), location: 0.22),
+                        .init(color: .black.opacity(0.38), location: 0.44),
+                        .init(color: .black.opacity(0.82), location: 0.68),
+                        .init(color: .black.opacity(0.96), location: 1)
+                    ],
                 startPoint: .top,
                 endPoint: .bottom
             )
         }
-        .ignoresSafeArea()
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.28), value: selectedEntry?.id)
+        .frame(width: size.width, height: size.height)
+        .clipped()
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.30), value: selectedEntry?.id)
     }
 
     // MARK: - Top Bar
 
-    private func topBar(isLandscape: Bool) -> some View {
-        HStack(spacing: 10) {
+    private func topBar(isLandscape: Bool, isCompactLandscape: Bool) -> some View {
+        let controlHeight: CGFloat = isCompactLandscape ? 32 : 36
+        return HStack(spacing: isCompactLandscape ? 8 : 10) {
             HStack(spacing: 8) {
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [Color(red: 0.28, green: 0.31, blue: 0.90), Color(red: 0.76, green: 0.23, blue: 0.84), Color(red: 1.0, green: 0.60, blue: 0.51)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
+                    .fill(.ultraThinMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(Color.white.opacity(0.10))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .strokeBorder(
+                                LinearGradient(
+                                    colors: [.white.opacity(0.32), .white.opacity(0.08)],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                ),
+                                lineWidth: 0.75
+                            )
                     )
                     .frame(width: 24, height: 24)
                     .overlay {
-                        Text("GC")
-                            .font(.system(size: 11, weight: .black, design: .rounded))
-                            .foregroundStyle(.white)
+                        Image(systemName: "gamecontroller.fill")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.95))
                     }
+                    .shadow(color: .black.opacity(0.35), radius: 6, y: 2)
+
                 Text("GAME CENTER")
                     .font(.system(size: 13, weight: .bold, design: .rounded))
                     .tracking(1.3)
-                    .foregroundStyle(.white.opacity(0.95))
+                    .foregroundStyle(.white.opacity(0.96))
+                    .shadow(color: .black.opacity(0.45), radius: 4, y: 1)
             }
 
             Spacer(minLength: 8)
 
             if isLandscape {
-                landscapeSearchPill
+                landscapeSearchPill(height: controlHeight)
                 if let name = gamepad.controllerName {
-                    Label(name, systemImage: "gamecontroller.fill")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.9))
-                        .lineLimit(1)
-                        .padding(.horizontal, 10)
-                        .frame(height: 32)
-                        .background(Color.white.opacity(0.12), in: Capsule())
-                        .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(PhoneTheme.ready)
+                            .frame(width: 6, height: 6)
+                        Image(systemName: "gamecontroller.fill")
+                            .font(.system(size: 11, weight: .medium))
+                        Text(name)
+                            .font(.system(size: 11, weight: .medium))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(.white.opacity(0.92))
+                    .padding(.horizontal, 10)
+                    .frame(height: controlHeight)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .background(Color.black.opacity(0.24), in: Capsule())
+                    .overlay(Capsule().stroke(Color.white.opacity(0.16), lineWidth: 0.75))
                 }
             } else {
-                topCircleButton(icon: showingPortraitSearch ? "xmark" : "magnifyingglass", label: "搜索") {
-                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                topCircleButton(
+                    icon: showingPortraitSearch ? "xmark" : "magnifyingglass",
+                    label: "搜索",
+                    size: controlHeight,
+                    active: showingPortraitSearch
+                ) {
+                    PhoneHaptics.light.impactOccurred()
+                    withAnimation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.86)) {
                         showingPortraitSearch.toggle()
                         if showingPortraitSearch {
                             searchFocused = true
@@ -503,26 +626,43 @@ private struct LibraryView: View {
 
             if isLandscape {
                 Button {
+                    PhoneHaptics.light.impactOccurred()
                     importing = true
                 } label: {
-                    Label(importingFiles ? "导入中…" : "导入", systemImage: "plus")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.92))
-                        .padding(.horizontal, 12)
-                        .frame(height: 32)
-                        .background(Color.white.opacity(0.10), in: Capsule())
-                        .overlay(Capsule().stroke(Color.white.opacity(0.13), lineWidth: 1))
+                    HStack(spacing: 5) {
+                        if importingFiles {
+                            ProgressView().controlSize(.mini).tint(.white)
+                        } else {
+                            Image(systemName: "plus")
+                                .font(.system(size: 11, weight: .bold))
+                        }
+                        Text(importingFiles ? "导入中…" : "导入")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .foregroundStyle(.white.opacity(0.94))
+                    .padding(.horizontal, 12)
+                    .frame(height: controlHeight)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .background(Color.black.opacity(0.24), in: Capsule())
+                    .overlay(Capsule().stroke(Color.white.opacity(0.16), lineWidth: 0.75))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PhoneTactileButtonStyle(pressedScale: 0.94))
                 .disabled(library == nil || refreshing || importingFiles)
             } else {
-                topCircleButton(icon: "plus", label: "导入游戏") {
+                topCircleButton(
+                    icon: "plus",
+                    label: "导入游戏",
+                    size: controlHeight,
+                    loading: importingFiles
+                ) {
+                    PhoneHaptics.light.impactOccurred()
                     importing = true
                 }
                 .disabled(library == nil || refreshing || importingFiles)
             }
 
-            topCircleButton(icon: "arrow.triangle.2.circlepath.icloud", label: "同步存档") {
+            topCircleButton(icon: "arrow.triangle.2.circlepath.icloud", label: "同步存档", size: controlHeight) {
+                PhoneHaptics.light.impactOccurred()
                 showingSaveSync = true
             }
 
@@ -535,126 +675,169 @@ private struct LibraryView: View {
                     let targets = makeSnapshot().allEntries.map(lookupTarget)
                     metadata.enqueueMissing(for: targets, force: true)
                 }
-                Button("同步存档 (iCloud)", systemImage: "arrow.triangle.2.circlepath.icloud") {
-                    showingSaveSync = true
-                }
             } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.9))
-                    .frame(width: 34, height: 34)
-                    .background(Color.white.opacity(0.10), in: Circle())
-                    .overlay(Circle().stroke(Color.white.opacity(0.13), lineWidth: 1))
+                Group {
+                    if refreshing {
+                        ProgressView().controlSize(.mini).tint(.white)
+                    } else {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                }
+                .foregroundStyle(.white.opacity(0.92))
+                .frame(width: controlHeight, height: controlHeight)
+                .background(.ultraThinMaterial, in: Circle())
+                .background(Color.black.opacity(0.24), in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.16), lineWidth: 0.75))
             }
             .accessibilityLabel("更多设置")
         }
-        .padding(.horizontal, isLandscape ? 24 : 20)
-        .padding(.top, isLandscape ? 8 : 6)
-        .padding(.bottom, 4)
     }
 
-    private func topCircleButton(icon: String, label: String, action: @escaping () -> Void) -> some View {
+    private func topCircleButton(
+        icon: String,
+        label: String,
+        size: CGFloat = 36,
+        active: Bool = false,
+        loading: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.92))
-                .frame(width: 34, height: 34)
-                .background(Color.white.opacity(0.10), in: Circle())
-                .overlay(Circle().stroke(Color.white.opacity(0.13), lineWidth: 1))
+            Group {
+                if loading {
+                    ProgressView().controlSize(.mini).tint(.white)
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 13, weight: .semibold))
+                }
+            }
+            .foregroundStyle(active ? PhoneTheme.inverseText : .white.opacity(0.94))
+            .frame(width: size, height: size)
+            .background {
+                if active {
+                    Circle().fill(PhoneTheme.action)
+                } else {
+                    Circle()
+                        .fill(.ultraThinMaterial)
+                        .overlay(Circle().fill(Color.black.opacity(0.24)))
+                }
+            }
+            .overlay(Circle().stroke(Color.white.opacity(active ? 0.30 : 0.16), lineWidth: 0.75))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PhoneTactileButtonStyle(pressedScale: 0.92))
         .accessibilityLabel(label)
     }
 
-    private var landscapeSearchPill: some View {
+    private func landscapeSearchPill(height: CGFloat) -> some View {
         HStack(spacing: 6) {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.white.opacity(0.55))
+                .foregroundStyle(.white.opacity(searchFocused ? 0.85 : 0.58))
             TextField("搜索游戏…", text: $searchText)
                 .font(.system(size: 12))
                 .foregroundStyle(.white)
                 .focused($searchFocused)
-                .frame(width: 120)
+                .submitLabel(.search)
+                .frame(width: (searchFocused || !searchText.isEmpty) ? 156 : 112)
             if !searchText.isEmpty {
                 Button { searchText = "" } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 12))
-                        .foregroundStyle(.white.opacity(0.55))
+                        .foregroundStyle(.white.opacity(0.62))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PhoneTactileButtonStyle(pressedScale: 0.90))
             }
         }
         .padding(.horizontal, 11)
-        .frame(height: 32)
-        .background(Color.black.opacity(0.32), in: Capsule())
-        .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+        .frame(height: height)
+        .background(.ultraThinMaterial, in: Capsule())
+        .background(Color.black.opacity(searchFocused ? 0.42 : 0.26), in: Capsule())
+        .overlay(Capsule().stroke(Color.white.opacity(searchFocused ? 0.34 : 0.16), lineWidth: 0.75))
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: searchFocused)
     }
 
-    private var portraitSearchBar: some View {
+    private func portraitSearchBar(matchCount: Int) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 13))
-                .foregroundStyle(.white.opacity(0.55))
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.white.opacity(0.60))
             TextField("搜索游戏名或平台…", text: $searchText)
                 .font(.system(size: 14))
                 .foregroundStyle(.white)
                 .focused($searchFocused)
                 .submitLabel(.search)
             if !searchText.isEmpty {
+                Text("\(matchCount)")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.55))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.white.opacity(0.10), in: Capsule())
                 Button { searchText = "" } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.white.opacity(0.55))
+                        .foregroundStyle(.white.opacity(0.62))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PhoneTactileButtonStyle(pressedScale: 0.90))
             }
         }
-        .padding(.horizontal, 12)
-        .frame(height: 38)
-        .background(Color.black.opacity(0.42), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.16), lineWidth: 1))
-        .padding(.horizontal, 20)
-        .padding(.top, 6)
+        .padding(.horizontal, 13)
+        .frame(height: 40)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .background(Color.black.opacity(0.36), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).stroke(Color.white.opacity(searchFocused ? 0.30 : 0.16), lineWidth: 0.75))
     }
 
     // MARK: - Hero (Portrait & Landscape)
 
-    private func portraitHero(entry: Entry?) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+    private func portraitHero(entry: Entry?, isPad: Bool, totalCount: Int) -> some View {
+        VStack(alignment: .leading, spacing: isPad ? 12 : 9) {
             if let entry {
-                HStack(spacing: 8) {
-                    Text(entry.platformTitle.uppercased())
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .tracking(1.2)
-                        .foregroundStyle(.white.opacity(0.92))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3.5)
-                        .background(Color.white.opacity(0.13), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 1))
-
-                    if !entry.isLaunchable {
-                        Text("未导入构建包")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.orange)
-                            .padding(.horizontal, 7)
+                VStack(alignment: .leading, spacing: isPad ? 11 : 8) {
+                    HStack(spacing: 7) {
+                        Text(entry.platformTitle.uppercased())
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .tracking(1.2)
+                            .foregroundStyle(.white.opacity(0.94))
+                            .padding(.horizontal, 8)
                             .padding(.vertical, 3.5)
-                            .background(Color.orange.opacity(0.16), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 0.75))
+
+                        if !entry.isLaunchable {
+                            Text("未导入构建包")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3.5)
+                                .background(Color.orange.opacity(0.18), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(Color.orange.opacity(0.30), lineWidth: 0.75))
+                        }
+
+                        Spacer(minLength: 4)
+
+                        Text("\(totalCount) 款")
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.56))
+                    }
+
+                    Text(displayTitle(entry))
+                        .font(.system(size: isPad ? 32 : 26, weight: .bold, design: .rounded))
+                        .tracking(-0.5)
+                        .lineLimit(2)
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.45), radius: 10, y: 2)
+
+                    if let synopsis = metadata.records[entry.id]?.synopsis, !synopsis.isEmpty {
+                        Text(synopsis)
+                            .font(.system(size: isPad ? 14 : 13))
+                            .foregroundStyle(.white.opacity(0.78))
+                            .lineLimit(2)
+                            .lineSpacing(2.5)
                     }
                 }
-
-                Text(displayTitle(entry))
-                    .font(.system(size: 26, weight: .bold, design: .rounded))
-                    .tracking(-0.4)
-                    .lineLimit(2)
-                    .foregroundStyle(.white)
-
-                if let synopsis = metadata.records[entry.id]?.synopsis, !synopsis.isEmpty {
-                    Text(synopsis)
-                        .font(.system(size: 13))
-                        .foregroundStyle(.white.opacity(0.74))
-                        .lineLimit(2)
-                        .lineSpacing(2)
-                }
+                .id(entry.id)
+                .transition(.opacity)
 
                 HStack(spacing: 10) {
                     Button {
@@ -664,99 +847,128 @@ private struct LibraryView: View {
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(PhoneTheme.inverseText)
                             .frame(maxWidth: .infinity)
-                            .frame(height: 44)
+                            .frame(height: 46)
                             .background(PhoneTheme.action, in: Capsule())
+                            .shadow(color: .white.opacity(0.18), radius: 12, y: 4)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(PhoneTactileButtonStyle())
 
-                    Button {
-                        detailEntry = entry
-                    } label: {
-                        Text("详情")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.92))
-                            .padding(.horizontal, 18)
-                            .frame(height: 44)
-                            .background(Color.white.opacity(0.11), in: Capsule())
-                            .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+                    if entry.isLaunchable {
+                        Button {
+                            PhoneHaptics.light.impactOccurred()
+                            detailEntry = entry
+                        } label: {
+                            Text("详情")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.94))
+                                .padding(.horizontal, 18)
+                                .frame(height: 46)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .background(Color.white.opacity(0.08), in: Capsule())
+                                .overlay(Capsule().stroke(Color.white.opacity(0.16), lineWidth: 0.75))
+                        }
+                        .buttonStyle(PhoneTactileButtonStyle())
                     }
-                    .buttonStyle(.plain)
 
-                    favoriteButton(for: entry, size: 44)
+                    favoriteButton(for: entry, size: 46)
                 }
-                .padding(.top, 2)
+                .padding(.top, 3)
             } else {
                 emptyHero(compact: false)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.20), value: entry?.id)
     }
 
-    private func landscapeHero(entry: Entry?) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
+    private func landscapeHero(entry: Entry?, isCompact: Bool, isPad: Bool, totalCount: Int) -> some View {
+        VStack(alignment: .leading, spacing: isCompact ? 6 : 10) {
             if let entry {
-                HStack(spacing: 8) {
-                    Text(entry.platformTitle.uppercased())
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .tracking(1.2)
-                        .foregroundStyle(.white.opacity(0.92))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(Color.white.opacity(0.13), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    if !entry.isLaunchable {
-                        Text("未导入构建包")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: isCompact ? 5 : 8) {
+                    HStack(spacing: 8) {
+                        Text(entry.platformTitle.uppercased())
+                            .font(.system(size: isPad ? 11 : 10, weight: .semibold, design: .rounded))
+                            .tracking(1.2)
+                            .foregroundStyle(.white.opacity(0.94))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 0.75))
+
+                        if !entry.isLaunchable {
+                            Text("未导入构建包")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Color.orange.opacity(0.18), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        }
+
+                        Text("·  \(totalCount) 款游戏")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.56))
+                    }
+
+                    Text(displayTitle(entry))
+                        .font(.system(size: isPad ? 34 : (isCompact ? 24 : 28), weight: .bold, design: .rounded))
+                        .tracking(-0.5)
+                        .lineLimit(1)
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.45), radius: 10, y: 2)
+
+                    if let synopsis = metadata.records[entry.id]?.synopsis, !synopsis.isEmpty {
+                        Text(synopsis)
+                            .font(.system(size: isPad ? 13 : 12))
+                            .foregroundStyle(.white.opacity(0.76))
+                            .lineLimit(isPad ? 2 : 1)
+                            .lineSpacing(2)
                     }
                 }
-
-                Text(displayTitle(entry))
-                    .font(.system(size: 25, weight: .bold, design: .rounded))
-                    .tracking(-0.4)
-                    .lineLimit(1)
-                    .foregroundStyle(.white)
-
-                if let synopsis = metadata.records[entry.id]?.synopsis, !synopsis.isEmpty {
-                    Text(synopsis)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.white.opacity(0.72))
-                        .lineLimit(1)
-                }
+                .id(entry.id)
+                .transition(.opacity)
 
                 HStack(spacing: 9) {
+                    let buttonHeight: CGFloat = isPad ? 42 : 36
                     Button {
                         launchOrInspect(entry)
                     } label: {
-                        Label(entry.isLaunchable ? "开始游玩" : "查看详情", systemImage: entry.isLaunchable ? "play.fill" : "info.circle")
-                            .font(.system(size: 13, weight: .semibold))
+                        Label(entry.isLaunchable ? "开始游玩" : "查看导入说明", systemImage: entry.isLaunchable ? "play.fill" : "info.circle")
+                            .font(.system(size: isPad ? 14 : 13, weight: .semibold))
                             .foregroundStyle(PhoneTheme.inverseText)
-                            .padding(.horizontal, 18)
-                            .frame(height: 36)
+                            .padding(.horizontal, isPad ? 22 : 18)
+                            .frame(height: buttonHeight)
                             .background(PhoneTheme.action, in: Capsule())
+                            .shadow(color: .white.opacity(0.16), radius: 10, y: 3)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(PhoneTactileButtonStyle())
 
-                    Button {
-                        detailEntry = entry
-                    } label: {
-                        Text("详情")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.92))
-                            .padding(.horizontal, 15)
-                            .frame(height: 36)
-                            .background(Color.white.opacity(0.11), in: Capsule())
-                            .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+                    if entry.isLaunchable {
+                        Button {
+                            PhoneHaptics.light.impactOccurred()
+                            detailEntry = entry
+                        } label: {
+                            Text("详情")
+                                .font(.system(size: isPad ? 14 : 13, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.94))
+                                .padding(.horizontal, isPad ? 18 : 15)
+                                .frame(height: buttonHeight)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .background(Color.white.opacity(0.08), in: Capsule())
+                                .overlay(Capsule().stroke(Color.white.opacity(0.16), lineWidth: 0.75))
+                        }
+                        .buttonStyle(PhoneTactileButtonStyle())
                     }
-                    .buttonStyle(.plain)
 
-                    favoriteButton(for: entry, size: 36)
+                    favoriteButton(for: entry, size: buttonHeight)
                 }
-                .padding(.top, 2)
+                .padding(.top, isCompact ? 1 : 3)
             } else {
                 emptyHero(compact: true)
             }
         }
-        .frame(maxWidth: 480, alignment: .leading)
+        .frame(maxWidth: isPad ? 560 : 480, alignment: .leading)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.20), value: entry?.id)
     }
 
     private func emptyHero(compact: Bool) -> some View {
@@ -764,35 +976,37 @@ private struct LibraryView: View {
             Text(filterTitle(activeFilter).uppercased())
                 .font(.system(size: 10, weight: .bold, design: .rounded))
                 .tracking(1.4)
-                .foregroundStyle(.white.opacity(0.55))
+                .foregroundStyle(.white.opacity(0.58))
             Text(!searchText.isEmpty ? "没有找到匹配的游戏" : (activeFilter == .recent ? "还没有游玩记录" : activeFilter == .favorites ? "还没有收藏的游戏" : "这个平台还没有游戏"))
-                .font(.system(size: compact ? 20 : 24, weight: .bold, design: .rounded))
+                .font(.system(size: compact ? 20 : 25, weight: .bold, design: .rounded))
                 .foregroundStyle(.white)
             Text(!searchText.isEmpty ? "换个关键词试试，或切换到其他平台。" : "点击右上角「＋」导入 ROM 或 Switch .gcimport 游戏包，或通过「文件」App 放入 GameLibrary 目录。")
-                .font(.system(size: 12))
-                .foregroundStyle(.white.opacity(0.65))
+                .font(.system(size: 12.5))
+                .foregroundStyle(.white.opacity(0.68))
                 .lineLimit(2)
 
             if !searchText.isEmpty {
                 Button("清除搜索") { searchText = "" }
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 14)
-                    .frame(height: 34)
-                    .background(Color.white.opacity(0.12), in: Capsule())
-                    .buttonStyle(.plain)
+                    .padding(.horizontal, 15)
+                    .frame(height: 36)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .overlay(Capsule().stroke(Color.white.opacity(0.16), lineWidth: 0.75))
+                    .buttonStyle(PhoneTactileButtonStyle())
             } else if activeFilter != .favorites {
                 Button {
+                    PhoneHaptics.light.impactOccurred()
                     importing = true
                 } label: {
                     Label("导入游戏", systemImage: "square.and.arrow.down")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(PhoneTheme.inverseText)
-                        .padding(.horizontal, 16)
-                        .frame(height: 36)
+                        .padding(.horizontal, 18)
+                        .frame(height: 38)
                         .background(PhoneTheme.action, in: Capsule())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PhoneTactileButtonStyle())
             }
         }
     }
@@ -803,24 +1017,42 @@ private struct LibraryView: View {
             toggleFavorite(entry)
         } label: {
             Image(systemName: isFav ? "heart.fill" : "heart")
-                .font(.system(size: size > 40 ? 15 : 13, weight: .semibold))
-                .foregroundStyle(isFav ? PhoneTheme.favoriteForeground : .white.opacity(0.9))
+                .font(.system(size: size > 40 ? 16 : 13, weight: .semibold))
+                .symbolEffect(.bounce, value: isFav)
+                .foregroundStyle(isFav ? PhoneTheme.favoriteForeground : .white.opacity(0.92))
                 .frame(width: size, height: size)
-                .background(isFav ? PhoneTheme.favoriteBackground : Color.white.opacity(0.10), in: Circle())
-                .overlay(Circle().stroke(isFav ? PhoneTheme.favoriteBorder : Color.white.opacity(0.14), lineWidth: 1))
+                .background {
+                    if isFav {
+                        Circle().fill(PhoneTheme.favoriteBackground)
+                    } else {
+                        Circle()
+                            .fill(.ultraThinMaterial)
+                            .overlay(Circle().fill(Color.white.opacity(0.08)))
+                    }
+                }
+                .overlay(Circle().stroke(isFav ? PhoneTheme.favoriteBorder : Color.white.opacity(0.16), lineWidth: 0.75))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PhoneTactileButtonStyle(pressedScale: 0.90))
         .accessibilityLabel(isFav ? "取消收藏" : "加入收藏")
     }
 
-    // MARK: - Bottom Glass Dock (Platform Tabs + Pure Multi-Row Grid)
+    // MARK: - Bottom Glass Dock (Full-Bleed Platform Tabs + Cover Grid)
 
-    private func bottomDock(isLandscape: Bool, dockHeight: CGFloat?, columnsCount: Int, snapshot: LibrarySnapshot) -> some View {
-        let horizontalInset: CGFloat = isLandscape ? 24 : 20
-        let columns = Array(repeating: GridItem(.flexible(), spacing: isLandscape ? 14 : 12, alignment: .top), count: columnsCount)
+    private func bottomDock(
+        isLandscape: Bool,
+        isCompactLandscape: Bool,
+        dockHeight: CGFloat?,
+        columnsCount: Int,
+        leadingInset: CGFloat,
+        trailingInset: CGFloat,
+        bottomInset: CGFloat,
+        snapshot: LibrarySnapshot
+    ) -> some View {
+        let gridSpacing: CGFloat = isLandscape ? 12 : 12
+        let columns = Array(repeating: GridItem(.flexible(), spacing: gridSpacing, alignment: .top), count: columnsCount)
 
         return VStack(spacing: 0) {
-            // Sliding Platform Tabs (trailing fade only — leading edge stays 100% crisp)
+            // Full-width sliding platform tabs optically aligned with Hero & Top Bar
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
@@ -828,50 +1060,56 @@ private struct LibraryView: View {
                             let isSelected = activeFilter == filter
                             Button {
                                 PhoneHaptics.light.impactOccurred()
-                                withAnimation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.86)) {
+                                withAnimation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.85)) {
                                     activeFilter = filter
                                 }
                             } label: {
                                 HStack(spacing: 5) {
                                     Text(filterTitle(filter))
-                                        .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                                        .font(.system(size: isCompactLandscape ? 12.5 : 13, weight: isSelected ? .semibold : .medium))
                                     Text("\(snapshot.count(for: filter))")
                                         .font(.system(size: 11, design: .monospaced))
-                                        .foregroundStyle(isSelected ? Color.black.opacity(0.52) : Color.white.opacity(0.42))
+                                        .monospacedDigit()
+                                        .foregroundStyle(isSelected ? Color.black.opacity(0.55) : Color.white.opacity(0.45))
                                 }
-                                .foregroundStyle(isSelected ? PhoneTheme.inverseText : Color.white.opacity(0.76))
+                                .foregroundStyle(isSelected ? PhoneTheme.inverseText : Color.white.opacity(0.78))
                                 .padding(.horizontal, 12)
-                                .frame(height: 34)
+                                .frame(height: isCompactLandscape ? 32 : 34)
                                 .background {
                                     if isSelected {
                                         RoundedRectangle(cornerRadius: 9, style: .continuous)
                                             .fill(PhoneTheme.action)
+                                            .shadow(color: .black.opacity(0.28), radius: 6, y: 2)
                                             .matchedGeometryEffect(id: "phoneFilterPill", in: filterPillNamespace)
                                     } else {
                                         RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                            .fill(Color.white.opacity(0.06))
+                                            .fill(Color.white.opacity(0.065))
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                                    .stroke(Color.white.opacity(0.08), lineWidth: 0.75)
+                                            )
                                     }
                                 }
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(PhoneTactileButtonStyle(pressedScale: 0.95))
                             .id(filter.id)
                         }
                     }
-                    .padding(.trailing, 24)
+                    .padding(.leading, leadingInset)
+                    .padding(.trailing, trailingInset + 16)
                     .padding(.vertical, 2)
                 }
-                .mask(trailingFadeMask)
+                .mask(horizontalEdgeFadeMask)
                 .onChange(of: activeFilter) { _, value in
                     withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
                         proxy.scrollTo(value.id, anchor: .center)
                     }
                 }
             }
-            .padding(.horizontal, horizontalInset)
-            .padding(.top, isLandscape ? 10 : 12)
-            .padding(.bottom, 6)
+            .padding(.top, isCompactLandscape ? 8 : 12)
+            .padding(.bottom, isCompactLandscape ? 4 : 6)
 
-            // Multi-row Pure Cover Grid (no redundant header row, no top-left platform badge)
+            // Full-bleed scrolling cover grid
             if snapshot.visibleEntries.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "square.stack.3d.up")
@@ -879,13 +1117,14 @@ private struct LibraryView: View {
                         .foregroundStyle(.white.opacity(0.36))
                     Text("导入后的游戏封面会整齐排列在这里")
                         .font(.system(size: 12))
-                        .foregroundStyle(.white.opacity(0.48))
+                        .foregroundStyle(.white.opacity(0.50))
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.bottom, bottomInset)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: false) {
-                        LazyVGrid(columns: columns, spacing: isLandscape ? 14 : 16) {
+                        LazyVGrid(columns: columns, spacing: isCompactLandscape ? 12 : 16) {
                             ForEach(snapshot.visibleEntries) { entry in
                                 coverTile(
                                     entry: entry,
@@ -895,10 +1134,12 @@ private struct LibraryView: View {
                                 .id(entry.id)
                             }
                         }
-                        .padding(.horizontal, horizontalInset)
+                        .padding(.leading, leadingInset)
+                        .padding(.trailing, trailingInset)
                         .padding(.top, 8)
-                        .padding(.bottom, isLandscape ? 16 : 28)
+                        .padding(.bottom, bottomInset + (isLandscape && gamepad.controllerName != nil ? 4 : 12))
                     }
+                    .scrollDismissesKeyboard(.interactively)
                     .mask(bottomFadeMask)
                     .onChange(of: snapshot.selectedEntry?.id) { _, id in
                         guard let id else { return }
@@ -910,31 +1151,32 @@ private struct LibraryView: View {
             }
 
             if isLandscape && gamepad.controllerName != nil {
-                HStack(spacing: 14) {
-                    Text("◀▶▲▼ 浏览")
-                    Text("LB/RB 切换平台")
-                    Text("A 开始游玩")
-                    Text("X 详情")
-                    Text("Y 收藏")
+                HStack(spacing: 12) {
+                    keycapHint("◀▶▲▼", "浏览")
+                    keycapHint("LB/RB", "平台")
+                    keycapHint("A", "游玩")
+                    keycapHint("X", "详情")
+                    keycapHint("Y", "收藏")
                     Spacer()
                 }
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.white.opacity(0.62))
-                .padding(.horizontal, horizontalInset)
-                .padding(.bottom, 6)
+                .padding(.leading, leadingInset)
+                .padding(.trailing, trailingInset)
+                .padding(.top, 2)
+                .padding(.bottom, max(bottomInset * 0.55, 6))
             }
         }
+        .frame(maxWidth: .infinity)
         .frame(height: dockHeight)
         .frame(maxHeight: dockHeight == nil ? .infinity : nil)
         .background {
             Rectangle()
-                .fill(.regularMaterial.opacity(0.55))
+                .fill(.regularMaterial.opacity(0.58))
                 .mask(
                     LinearGradient(
                         stops: [
                             .init(color: .clear, location: 0),
-                            .init(color: .black.opacity(0.45), location: 0.06),
-                            .init(color: .black, location: 0.20),
+                            .init(color: .black.opacity(0.50), location: 0.06),
+                            .init(color: .black, location: 0.18),
                             .init(color: .black, location: 1)
                         ],
                         startPoint: .top,
@@ -946,45 +1188,80 @@ private struct LibraryView: View {
                         stops: [
                             .init(color: .clear, location: 0),
                             .init(color: .black.opacity(0.24), location: 0.16),
-                            .init(color: .black.opacity(0.55), location: 1)
+                            .init(color: .black.opacity(0.58), location: 1)
                         ],
                         startPoint: .top,
                         endPoint: .bottom
                     )
                 )
-                .ignoresSafeArea(edges: .bottom)
+        }
+    }
+
+    private func keycapHint(_ key: String, _ label: String) -> some View {
+        HStack(spacing: 5) {
+            Text(key)
+                .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                .foregroundStyle(.white.opacity(0.92))
+                .padding(.horizontal, 5.5)
+                .padding(.vertical, 2)
+                .background(Color.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 4.5, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 4.5, style: .continuous).stroke(Color.white.opacity(0.16), lineWidth: 0.5))
+            Text(label)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.white.opacity(0.66))
         }
     }
 
     private func coverTile(entry: Entry, isSelected: Bool, isFavorite isFav: Bool) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             ZStack(alignment: .topTrailing) {
-                coverArtView(entry: entry, cornerRadius: 11)
+                coverArtView(entry: entry, cornerRadius: 12)
                     .aspectRatio(0.8, contentMode: .fit)
+                    .overlay(alignment: .bottomTrailing) {
+                        if isSelected && entry.isLaunchable {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(PhoneTheme.inverseText)
+                                .frame(width: 22, height: 22)
+                                .background(PhoneTheme.action, in: Circle())
+                                .shadow(color: .black.opacity(0.45), radius: 5, y: 2)
+                                .padding(7)
+                                .transition(.scale.combined(with: .opacity))
+                        } else if !entry.isLaunchable {
+                            Circle()
+                                .fill(Color.orange)
+                                .frame(width: 7, height: 7)
+                                .padding(5)
+                                .background(Color.black.opacity(0.55), in: Circle())
+                                .padding(7)
+                        }
+                    }
                     .overlay {
-                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
                             .strokeBorder(
-                                Color.white.opacity(isSelected ? 0.96 : 0.14),
-                                lineWidth: isSelected ? 2 : 1
+                                Color.white.opacity(isSelected ? 0.96 : 0.15),
+                                lineWidth: isSelected ? 2 : 0.75
                             )
                     }
-                    .shadow(color: isSelected ? .black.opacity(0.55) : .clear, radius: 10, y: 4)
+                    .shadow(color: isSelected ? .black.opacity(0.62) : .black.opacity(0.24), radius: isSelected ? 12 : 6, y: isSelected ? 5 : 2)
 
                 if isFav {
                     Image(systemName: "heart.fill")
-                        .font(.system(size: 10, weight: .bold))
+                        .font(.system(size: 9.5, weight: .bold))
                         .foregroundStyle(PhoneTheme.favoriteForeground)
-                        .padding(7)
-                        .shadow(color: .black.opacity(0.55), radius: 3, y: 1)
+                        .frame(width: 22, height: 22)
+                        .background(Color.black.opacity(0.48), in: Circle())
+                        .overlay(Circle().stroke(Color.white.opacity(0.14), lineWidth: 0.5))
+                        .padding(6)
                 }
             }
-            .contentShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .onTapGesture {
                 if isSelected {
                     launchOrInspect(entry)
                 } else {
                     PhoneHaptics.selection.selectionChanged()
-                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                    withAnimation(reduceMotion ? nil : .spring(response: 0.24, dampingFraction: 0.84)) {
                         selectedEntryID = entry.id
                     }
                 }
@@ -1010,11 +1287,12 @@ private struct LibraryView: View {
 
             Text(displayTitle(entry))
                 .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
-                .foregroundStyle(.white.opacity(isSelected ? 1 : 0.72))
+                .foregroundStyle(.white.opacity(isSelected ? 1 : 0.74))
                 .lineLimit(1)
         }
-        .scaleEffect(isSelected && !reduceMotion ? 1.02 : 1)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: isSelected)
+        .offset(y: isSelected && !reduceMotion ? -2 : 0)
+        .scaleEffect(isSelected && !reduceMotion ? 1.025 : 1)
+        .animation(reduceMotion ? nil : .spring(response: 0.24, dampingFraction: 0.84), value: isSelected)
     }
 
     private func coverArtView(entry: Entry, cornerRadius: CGFloat) -> some View {
@@ -1047,166 +1325,192 @@ private struct LibraryView: View {
 
     private func detailSheet(for entry: Entry) -> some View {
         let isFav = favorites.contains(entry.id)
-        return VStack(spacing: 0) {
-            HStack {
-                Text("游戏详情")
-                    .font(.system(size: 15, weight: .semibold))
-                Spacer()
-                Button {
-                    detailEntry = nil
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.8))
-                        .frame(width: 30, height: 30)
-                        .background(Color.white.opacity(0.10), in: Circle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("关闭")
-            }
-            .padding(.horizontal, 20)
-            .padding(.top, 14)
-            .padding(.bottom, 12)
-
-            Divider().overlay(PhoneTheme.border)
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    HStack(alignment: .top, spacing: 16) {
-                        coverArtView(entry: entry, cornerRadius: 12)
-                            .frame(width: 96, height: 120)
-                            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 1))
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(displayTitle(entry))
-                                .font(.system(size: 20, weight: .bold, design: .rounded))
-                                .fixedSize(horizontal: false, vertical: true)
-                                .lineLimit(3)
-
-                            Text(entry.platformTitle)
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.65))
-
-                            if case let .console(game) = entry {
-                                Text(game.status)
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(game.builds.isEmpty ? Color.orange : PhoneTheme.ready)
-                            } else if case let .rom(rom, _) = entry, let note = rom.platform.runtimeNote {
-                                Text(note)
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(.white.opacity(0.55))
-                            }
-
-                            HStack(spacing: 8) {
-                                Button {
-                                    toggleFavorite(entry)
-                                } label: {
-                                    Label(isFav ? "已收藏" : "收藏", systemImage: isFav ? "heart.fill" : "heart")
-                                        .font(.system(size: 12, weight: .semibold))
-                                        .foregroundStyle(isFav ? PhoneTheme.favoriteForeground : .white)
-                                        .padding(.horizontal, 12)
-                                        .frame(height: 34)
-                                        .background(isFav ? PhoneTheme.favoriteBackground : Color.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                                        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(isFav ? PhoneTheme.favoriteBorder : Color.white.opacity(0.13), lineWidth: 1))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                            .padding(.top, 2)
-                        }
-                        Spacer(minLength: 0)
+        return ZStack(alignment: .top) {
+            if let art = backdropImage(for: entry) ?? coverImage(for: entry) {
+                Color.clear
+                    .frame(height: 220)
+                    .overlay {
+                        Image(uiImage: art)
+                            .resizable()
+                            .scaledToFill()
                     }
+                    .blur(radius: 42)
+                    .opacity(0.28)
+                    .mask(
+                        LinearGradient(
+                            colors: [.black, .black.opacity(0.4), .clear],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .clipped()
+                    .ignoresSafeArea(edges: .top)
+                    .allowsHitTesting(false)
+            }
 
-                    // Launch Action(s)
-                    switch entry {
-                    case let .rom(rom, _):
-                        Button {
-                            detailEntry = nil
-                            remember(entry)
-                            selectedROM = rom
-                        } label: {
-                            Label("开始游戏", systemImage: "play.fill")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(PhoneTheme.inverseText)
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 46)
-                                .background(PhoneTheme.action, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-                        }
-                        .buttonStyle(.plain)
+            VStack(spacing: 0) {
+                HStack {
+                    Text("游戏详情")
+                        .font(.system(size: 15, weight: .semibold))
+                    Spacer()
+                    Button {
+                        detailEntry = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.84))
+                            .frame(width: 30, height: 30)
+                            .background(Color.white.opacity(0.11), in: Circle())
+                            .overlay(Circle().stroke(Color.white.opacity(0.14), lineWidth: 0.75))
+                    }
+                    .buttonStyle(PhoneTactileButtonStyle(pressedScale: 0.90))
+                    .accessibilityLabel("关闭")
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 16)
+                .padding(.bottom, 12)
 
-                    case let .console(game):
-                        if game.builds.isEmpty {
-                            HStack(spacing: 10) {
-                                Image(systemName: "desktopcomputer")
-                                    .foregroundStyle(.white.opacity(0.75))
-                                Text("尚未导入此游戏的 iOS 构建包。请在 Mac 端 Game Center 构建 .gcimport 后，点右上角「＋」导入。")
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(.white.opacity(0.68))
+                Divider().overlay(PhoneTheme.border)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        HStack(alignment: .top, spacing: 16) {
+                            coverArtView(entry: entry, cornerRadius: 13)
+                                .frame(width: 98, height: 124)
+                                .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).stroke(Color.white.opacity(0.16), lineWidth: 0.75))
+                                .shadow(color: .black.opacity(0.45), radius: 14, y: 6)
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(displayTitle(entry))
+                                    .font(.system(size: 20, weight: .bold, design: .rounded))
                                     .fixedSize(horizontal: false, vertical: true)
+                                    .lineLimit(3)
+
+                                Text(entry.platformTitle)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.68))
+
+                                if case let .console(game) = entry {
+                                    Text(game.status)
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(game.builds.isEmpty ? Color.orange : PhoneTheme.ready)
+                                } else if case let .rom(rom, _) = entry, let note = rom.platform.runtimeNote {
+                                    Text(note)
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.white.opacity(0.58))
+                                }
+
+                                HStack(spacing: 8) {
+                                    Button {
+                                        toggleFavorite(entry)
+                                    } label: {
+                                        Label(isFav ? "已收藏" : "收藏", systemImage: isFav ? "heart.fill" : "heart")
+                                            .font(.system(size: 12, weight: .semibold))
+                                            .foregroundStyle(isFav ? PhoneTheme.favoriteForeground : .white)
+                                            .padding(.horizontal, 12)
+                                            .frame(height: 34)
+                                            .background(isFav ? PhoneTheme.favoriteBackground : Color.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                                            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(isFav ? PhoneTheme.favoriteBorder : Color.white.opacity(0.14), lineWidth: 0.75))
+                                    }
+                                    .buttonStyle(PhoneTactileButtonStyle())
+                                }
+                                .padding(.top, 2)
                             }
-                            .padding(14)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(PhoneTheme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(PhoneTheme.border, lineWidth: 1))
-                        } else if game.builds.count == 1, let build = game.builds.first {
+                            Spacer(minLength: 0)
+                        }
+
+                        // Launch Action(s)
+                        switch entry {
+                        case let .rom(rom, _):
                             Button {
                                 detailEntry = nil
-                                launchSwitch(build, entry: entry)
+                                remember(entry)
+                                selectedROM = rom
                             } label: {
-                                Label("运行游戏 (\(build.engine.rawValue))", systemImage: "play.fill")
+                                Label("开始游戏", systemImage: "play.fill")
                                     .font(.system(size: 15, weight: .semibold))
                                     .foregroundStyle(PhoneTheme.inverseText)
                                     .frame(maxWidth: .infinity)
                                     .frame(height: 46)
-                                    .background(PhoneTheme.action, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                                    .background(PhoneTheme.action, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                             }
-                            .buttonStyle(.plain)
-                        } else {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("选择运行引擎")
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(.white.opacity(0.55))
+                            .buttonStyle(PhoneTactileButtonStyle())
+
+                        case let .console(game):
+                            if game.builds.isEmpty {
                                 HStack(spacing: 10) {
-                                    ForEach(Array(game.builds.enumerated()), id: \.element.engine) { idx, build in
-                                        Button {
-                                            detailEntry = nil
-                                            launchSwitch(build, entry: entry)
-                                        } label: {
-                                            Label(build.engine.rawValue, systemImage: "play.fill")
-                                                .font(.system(size: 14, weight: .semibold))
-                                                .foregroundStyle(idx == 0 ? PhoneTheme.inverseText : .white)
-                                                .frame(maxWidth: .infinity)
-                                                .frame(height: 44)
-                                                .background(idx == 0 ? PhoneTheme.action : Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                                                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(idx == 0 ? 0 : 0.14), lineWidth: 1))
+                                    Image(systemName: "desktopcomputer")
+                                        .foregroundStyle(.white.opacity(0.75))
+                                    Text("尚未导入此游戏的 iOS 构建包。请在 Mac 端 Game Center 构建 .gcimport 后，点右上角「＋」导入。")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.white.opacity(0.70))
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                .padding(14)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(PhoneTheme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(PhoneTheme.border, lineWidth: 0.75))
+                            } else if game.builds.count == 1, let build = game.builds.first {
+                                Button {
+                                    detailEntry = nil
+                                    launchSwitch(build, entry: entry)
+                                } label: {
+                                    Label("运行游戏 (\(build.engine.rawValue))", systemImage: "play.fill")
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .foregroundStyle(PhoneTheme.inverseText)
+                                        .frame(maxWidth: .infinity)
+                                        .frame(height: 46)
+                                        .background(PhoneTheme.action, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                }
+                                .buttonStyle(PhoneTactileButtonStyle())
+                            } else {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("选择运行引擎")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(.white.opacity(0.58))
+                                    HStack(spacing: 10) {
+                                        ForEach(Array(game.builds.enumerated()), id: \.element.engine) { idx, build in
+                                            Button {
+                                                detailEntry = nil
+                                                launchSwitch(build, entry: entry)
+                                            } label: {
+                                                Label(build.engine.rawValue, systemImage: "play.fill")
+                                                    .font(.system(size: 14, weight: .semibold))
+                                                    .foregroundStyle(idx == 0 ? PhoneTheme.inverseText : .white)
+                                                    .frame(maxWidth: .infinity)
+                                                    .frame(height: 44)
+                                                    .background(idx == 0 ? PhoneTheme.action : Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                                                    .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).stroke(Color.white.opacity(idx == 0 ? 0 : 0.14), lineWidth: 0.75))
+                                            }
+                                            .buttonStyle(PhoneTactileButtonStyle())
                                         }
-                                        .buttonStyle(.plain)
                                     }
                                 }
                             }
                         }
-                    }
 
-                    PhoneMetadataSection(metadata: metadata, id: entry.id) {
-                        Task { await lookupMetadata(entry, force: true) }
-                    }
-
-                    if entry.isDeletable {
-                        Button {
-                            detailEntry = nil
-                            pendingDeleteEntry = entry
-                        } label: {
-                            Label("从设备删除游戏…", systemImage: "trash")
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(PhoneTheme.destructiveForeground)
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 42)
-                                .background(PhoneTheme.destructiveBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(PhoneTheme.destructiveBorder, lineWidth: 1))
+                        PhoneMetadataSection(metadata: metadata, id: entry.id) {
+                            Task { await lookupMetadata(entry, force: true) }
                         }
-                        .buttonStyle(.plain)
+
+                        if entry.isDeletable {
+                            Button {
+                                detailEntry = nil
+                                pendingDeleteEntry = entry
+                            } label: {
+                                Label("从设备删除游戏…", systemImage: "trash")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(PhoneTheme.destructiveForeground)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 42)
+                                    .background(PhoneTheme.destructiveBackground, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                                    .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).stroke(PhoneTheme.destructiveBorder, lineWidth: 0.75))
+                            }
+                            .buttonStyle(PhoneTactileButtonStyle())
+                        }
                     }
+                    .padding(20)
                 }
-                .padding(20)
             }
         }
         .preferredColorScheme(.dark)
@@ -1215,11 +1519,12 @@ private struct LibraryView: View {
 
     // MARK: - Helpers & Masks
 
-    private var trailingFadeMask: some View {
+    private var horizontalEdgeFadeMask: some View {
         LinearGradient(
             stops: [
-                .init(color: .black, location: 0),
-                .init(color: .black, location: 0.92),
+                .init(color: .clear, location: 0),
+                .init(color: .black, location: 0.03),
+                .init(color: .black, location: 0.94),
                 .init(color: .clear, location: 1)
             ],
             startPoint: .leading,
@@ -1231,7 +1536,7 @@ private struct LibraryView: View {
         LinearGradient(
             stops: [
                 .init(color: .black, location: 0),
-                .init(color: .black, location: 0.92),
+                .init(color: .black, location: 0.96),
                 .init(color: .clear, location: 1)
             ],
             startPoint: .top,

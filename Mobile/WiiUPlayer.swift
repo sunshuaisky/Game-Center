@@ -480,10 +480,10 @@ struct WiiUPlayer: View {
     let library: PhoneLibrary
 
     var body: some View {
-        GeometryReader { size in
-            let wide = size.size.width > size.size.height
+        FullScreenReader { fullSize, safeInsets in
+            let wide = fullSize.width > fullSize.height
             ZStack {
-                Color.black.ignoresSafeArea()
+                Color.black
 
                 if let error = session.error {
                     VStack(spacing: 16) {
@@ -502,7 +502,7 @@ struct WiiUPlayer: View {
                             .padding(.horizontal, 22)
                             .frame(height: 42)
                             .background(Color(white: 0.94), in: Capsule())
-                            .buttonStyle(.plain)
+                            .buttonStyle(PhoneTactileButtonStyle())
                     }
                     .padding(24)
                 } else {
@@ -517,15 +517,14 @@ struct WiiUPlayer: View {
                                 }
                                 Spacer()
                             }
-                            .padding(.top, 6)
+                            .padding(.top, max(safeInsets.top, 8) + 4)
                             .padding(.bottom, 8)
                         }
 
-                        wiiUSurfaceView
+                        wiiUSurfaceView(rounded: !wide)
                             .frame(maxWidth: .infinity, maxHeight: wide ? .infinity : nil)
                             .padding(.horizontal, wide ? 0 : 10)
                             .padding(.bottom, wide ? 0 : 10)
-                            .ignoresSafeArea(edges: (wide && !showVirtualPad) ? .all : [])
 
                         if !wide {
                             if showVirtualPad {
@@ -566,11 +565,12 @@ struct WiiUPlayer: View {
                                         .frame(width: 74, height: 74)
                                     }
                                 }
-                                .padding(.horizontal, 18)
-                                .padding(.vertical, 14)
-                                .background(Color.white.opacity(0.03))
+                                .padding(.horizontal, max(max(safeInsets.leading, safeInsets.trailing), 18))
+                                .padding(.top, 14)
+                                .padding(.bottom, max(safeInsets.bottom, 16) + 4)
+                                .background(Color.white.opacity(0.035))
                                 .overlay(alignment: .top) {
-                                    Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+                                    Rectangle().fill(Color.white.opacity(0.08)).frame(height: 0.75)
                                 }
                                 .opacity(padOpacity)
                                 .transition(.opacity)
@@ -584,7 +584,8 @@ struct WiiUPlayer: View {
                                         .foregroundStyle(.white.opacity(0.6))
                                 }
                                 .frame(maxWidth: .infinity)
-                                .padding(.vertical, 36)
+                                .padding(.top, 28)
+                                .padding(.bottom, max(safeInsets.bottom, 28) + 8)
                             }
                         }
                     }
@@ -595,8 +596,10 @@ struct WiiUPlayer: View {
                                 Spacer()
                                 rightWiiUControls
                             }
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 12)
+                            .padding(.leading, max(safeInsets.leading, 14))
+                            .padding(.trailing, max(safeInsets.trailing, 14))
+                            .padding(.top, max(safeInsets.top, 12))
+                            .padding(.bottom, max(safeInsets.bottom, 12))
                             .opacity(padOpacity)
                             .transition(.opacity)
                         }
@@ -606,7 +609,7 @@ struct WiiUPlayer: View {
                             PlayerFloatingPill(title: rom.title, hasController: hasController) {
                                 openPauseMenu()
                             }
-                            .padding(.top, 10)
+                            .padding(.top, max(safeInsets.top, 10))
                         }
                     }
                 }
@@ -656,7 +659,7 @@ struct WiiUPlayer: View {
                             .foregroundStyle(.white.opacity(0.88))
                             .padding(.vertical, 4)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(PhoneTactileButtonStyle())
                     }
                     .transition(.opacity)
                 }
@@ -664,7 +667,9 @@ struct WiiUPlayer: View {
             .animation(.easeOut(duration: 0.18), value: showVirtualPad)
             .animation(.easeOut(duration: 0.16), value: showingPauseMenu)
         }
+        .background(Color.black.ignoresSafeArea())
         .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
         .task {
             syncControllerState()
             session.start(rom: rom, library: library)
@@ -703,11 +708,11 @@ struct WiiUPlayer: View {
     }
 
     @ViewBuilder
-    private var wiiUSurfaceView: some View {
+    private func wiiUSurfaceView(rounded: Bool) -> some View {
         if let core = session.core {
             WiiUSurface(core: core)
                 .aspectRatio(16 / 9, contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: rounded ? 12 : 0, style: .continuous))
                 .gesture(DragGesture(minimumDistance: 0).onChanged { value in
                     let size = core.view.bounds.size
                     guard session.gamePad, size.width > 0, size.height > 0 else { return }

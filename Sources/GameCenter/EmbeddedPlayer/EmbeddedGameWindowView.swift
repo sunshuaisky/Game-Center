@@ -181,19 +181,27 @@ struct EmbeddedGameWindowView: View {
             .animation(.easeInOut(duration: 0.16), value: session.statusToast)
 
             // Side drawers
-            if showSaveStates {
-                drawerContainer(title: "即时存档", onClose: { showSaveStates = false }) {
-                    saveStatesDrawer
-                }
-            } else if showCoreOptions {
-                drawerContainer(title: "\(session.descriptor.displayName) 核心选项", onClose: { showCoreOptions = false }) {
-                    coreOptionsDrawer
-                }
-            } else if showControlsGuide {
-                drawerContainer(title: "键盘 / 鼠标 / 手柄操作", onClose: { showControlsGuide = false }) {
-                    controlsGuideDrawer
+            Group {
+                if showSaveStates {
+                    drawerContainer(title: "即时存档", onClose: { showSaveStates = false }) {
+                        saveStatesDrawer
+                    }
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                } else if showCoreOptions {
+                    drawerContainer(title: "\(session.descriptor.displayName) 核心选项", onClose: { showCoreOptions = false }) {
+                        coreOptionsDrawer
+                    }
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                } else if showControlsGuide {
+                    drawerContainer(title: "键盘 / 鼠标 / 手柄操作", onClose: { showControlsGuide = false }) {
+                        controlsGuideDrawer
+                    }
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
+            .animation(.easeOut(duration: 0.2), value: showSaveStates)
+            .animation(.easeOut(duration: 0.2), value: showCoreOptions)
+            .animation(.easeOut(duration: 0.2), value: showControlsGuide)
         }
         .preferredColorScheme(.dark)
         .frame(minWidth: 640, minHeight: 480)

@@ -1,6 +1,62 @@
 import SwiftUI
 import UIKit
 
+// MARK: - Edge-to-Edge Fullscreen Geometry Reader
+
+private struct SafeAreaInsetsPreferenceKey: PreferenceKey {
+    static var defaultValue = EdgeInsets()
+    static func reduce(value: inout EdgeInsets, nextValue: () -> EdgeInsets) {
+        let next = nextValue()
+        if next != EdgeInsets() || value == EdgeInsets() {
+            value = next
+        }
+    }
+}
+
+/// Provides the true physical edge-to-edge screen size alongside the real device safe area insets.
+/// Prevents black safe-area letterboxing in landscape (Dynamic Island / rounded edges)
+/// and portrait (status bar / home indicator) while keeping interactive controls safely inset.
+struct FullScreenReader<Content: View>: View {
+    @ViewBuilder let content: (_ fullSize: CGSize, _ safeInsets: EdgeInsets) -> Content
+    @State private var safeInsets = EdgeInsets()
+
+    var body: some View {
+        ZStack {
+            GeometryReader { safeProxy in
+                Color.clear
+                    .preference(key: SafeAreaInsetsPreferenceKey.self, value: safeProxy.safeAreaInsets)
+            }
+            .ignoresSafeArea(.keyboard)
+            .allowsHitTesting(false)
+
+            GeometryReader { fullProxy in
+                content(fullProxy.size, safeInsets)
+                    .frame(width: fullProxy.size.width, height: fullProxy.size.height)
+            }
+            .ignoresSafeArea()
+        }
+        .onPreferenceChange(SafeAreaInsetsPreferenceKey.self) { next in
+            if next != safeInsets {
+                safeInsets = next
+            }
+        }
+    }
+}
+
+/// Crisp tactile press feedback for iOS controls (respects Reduce Motion).
+struct PhoneTactileButtonStyle: ButtonStyle {
+    var pressedScale: CGFloat = 0.96
+    var pressedOpacity: Double = 0.86
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? pressedScale : 1)
+            .opacity(configuration.isPressed ? pressedOpacity : 1)
+            .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.78), value: configuration.isPressed)
+    }
+}
+
 /// Direct CALayer frame host for software-rendered Libretro cores.
 /// Updating `layer.contents` directly avoids triggering SwiftUI body diffs at 60fps
 /// and keeps touch controls responsive even when emulation frame times fluctuate.
@@ -90,11 +146,15 @@ final class PadButtonUIView: UIView {
         super.init(frame: frame)
         isMultipleTouchEnabled = true
         isExclusiveTouch = false
-        backgroundColor = UIColor.white.withAlphaComponent(0.14)
-        layer.borderColor = UIColor.white.withAlphaComponent(0.22).cgColor
+        backgroundColor = UIColor(white: 0.09, alpha: 0.42)
+        layer.borderColor = UIColor.white.withAlphaComponent(0.24).cgColor
         layer.borderWidth = 1
-        label.textColor = .white
-        label.font = .systemFont(ofSize: 15, weight: .semibold)
+        layer.shadowColor = UIColor.black.cgColor
+        layer.shadowOpacity = 0.35
+        layer.shadowRadius = 4
+        layer.shadowOffset = CGSize(width: 0, height: 2)
+        label.textColor = UIColor.white.withAlphaComponent(0.95)
+        label.font = .systemFont(ofSize: 14, weight: .semibold)
         label.textAlignment = .center
         label.adjustsFontSizeToFitWidth = true
         label.minimumScaleFactor = 0.7
@@ -123,8 +183,11 @@ final class PadButtonUIView: UIView {
         guard isPressedState != pressed else { return }
         isPressedState = pressed
         if pressed { TouchPadHaptics.tap() }
-        backgroundColor = UIColor.white.withAlphaComponent(pressed ? 0.36 : 0.14)
-        transform = pressed ? CGAffineTransform(scaleX: 0.94, y: 0.94) : .identity
+        backgroundColor = pressed
+            ? UIColor.white.withAlphaComponent(0.38)
+            : UIColor(white: 0.09, alpha: 0.42)
+        layer.borderColor = UIColor.white.withAlphaComponent(pressed ? 0.65 : 0.24).cgColor
+        transform = pressed ? CGAffineTransform(scaleX: 0.93, y: 0.93) : .identity
         onChange?(pressed)
     }
 
@@ -177,21 +240,23 @@ final class TouchDPadUIView: UIView {
         isMultipleTouchEnabled = true
         isExclusiveTouch = false
         backgroundColor = .clear
-        for (cell, text) in [(upCell, "↑"), (downCell, "↓"), (leftCell, "←"), (rightCell, "→")] {
+        for (cell, text) in [(upCell, "▲"), (downCell, "▼"), (leftCell, "◀"), (rightCell, "▶")] {
             cell.text = text
-            cell.textColor = .white
-            cell.font = .systemFont(ofSize: 18, weight: .bold)
+            cell.textColor = UIColor.white.withAlphaComponent(0.92)
+            cell.font = .systemFont(ofSize: 13, weight: .bold)
             cell.textAlignment = .center
-            cell.backgroundColor = UIColor.white.withAlphaComponent(0.14)
-            cell.layer.cornerRadius = 10
+            cell.backgroundColor = UIColor(white: 0.09, alpha: 0.44)
+            cell.layer.cornerRadius = 11
             cell.layer.masksToBounds = true
-            cell.layer.borderColor = UIColor.white.withAlphaComponent(0.20).cgColor
+            cell.layer.borderColor = UIColor.white.withAlphaComponent(0.22).cgColor
             cell.layer.borderWidth = 1
             cell.isUserInteractionEnabled = false
             addSubview(cell)
         }
-        centerCap.backgroundColor = UIColor.white.withAlphaComponent(0.08)
-        centerCap.layer.cornerRadius = 8
+        centerCap.backgroundColor = UIColor(white: 0.09, alpha: 0.32)
+        centerCap.layer.cornerRadius = 10
+        centerCap.layer.borderColor = UIColor.white.withAlphaComponent(0.12).cgColor
+        centerCap.layer.borderWidth = 1
         centerCap.isUserInteractionEnabled = false
         addSubview(centerCap)
     }
@@ -238,10 +303,14 @@ final class TouchDPadUIView: UIView {
     }
 
     private func updateHighlights() {
-        upCell.backgroundColor = UIColor.white.withAlphaComponent(current.up ? 0.38 : 0.14)
-        downCell.backgroundColor = UIColor.white.withAlphaComponent(current.down ? 0.38 : 0.14)
-        leftCell.backgroundColor = UIColor.white.withAlphaComponent(current.left ? 0.38 : 0.14)
-        rightCell.backgroundColor = UIColor.white.withAlphaComponent(current.right ? 0.38 : 0.14)
+        let restBg = UIColor(white: 0.09, alpha: 0.44)
+        let activeBg = UIColor.white.withAlphaComponent(0.42)
+        let restBorder = UIColor.white.withAlphaComponent(0.22).cgColor
+        let activeBorder = UIColor.white.withAlphaComponent(0.68).cgColor
+        for (cell, active) in [(upCell, current.up), (downCell, current.down), (leftCell, current.left), (rightCell, current.right)] {
+            cell.backgroundColor = active ? activeBg : restBg
+            cell.layer.borderColor = active ? activeBorder : restBorder
+        }
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -302,11 +371,11 @@ final class TouchDiamondPadUIView: UIView {
         isExclusiveTouch = false
         backgroundColor = .clear
         for cell in [topView, leftView, rightView, bottomView] {
-            cell.textColor = .white
-            cell.font = .systemFont(ofSize: 18, weight: .bold)
+            cell.textColor = UIColor.white.withAlphaComponent(0.95)
+            cell.font = .systemFont(ofSize: 17, weight: .bold)
             cell.textAlignment = .center
-            cell.backgroundColor = UIColor.white.withAlphaComponent(0.16)
-            cell.layer.borderColor = UIColor.white.withAlphaComponent(0.24).cgColor
+            cell.backgroundColor = UIColor(white: 0.09, alpha: 0.46)
+            cell.layer.borderColor = UIColor.white.withAlphaComponent(0.26).cgColor
             cell.layer.borderWidth = 1
             cell.layer.masksToBounds = true
             cell.isUserInteractionEnabled = false
@@ -410,10 +479,15 @@ final class TouchDiamondPadUIView: UIView {
     }
 
     private func updateHighlights() {
-        topView.backgroundColor = UIColor.white.withAlphaComponent(current.top ? 0.40 : 0.16)
-        leftView.backgroundColor = UIColor.white.withAlphaComponent(current.left ? 0.40 : 0.16)
-        rightView.backgroundColor = UIColor.white.withAlphaComponent(current.right ? 0.40 : 0.16)
-        bottomView.backgroundColor = UIColor.white.withAlphaComponent(current.bottom ? 0.40 : 0.16)
+        let restBg = UIColor(white: 0.09, alpha: 0.46)
+        let activeBg = UIColor.white.withAlphaComponent(0.44)
+        let restBorder = UIColor.white.withAlphaComponent(0.26).cgColor
+        let activeBorder = UIColor.white.withAlphaComponent(0.72).cgColor
+        for (cell, active) in [(topView, current.top), (leftView, current.left), (rightView, current.right), (bottomView, current.bottom)] {
+            cell.backgroundColor = active ? activeBg : restBg
+            cell.layer.borderColor = active ? activeBorder : restBorder
+            cell.transform = active ? CGAffineTransform(scaleX: 0.92, y: 0.92) : .identity
+        }
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -465,13 +539,19 @@ final class TouchAnalogStickUIView: UIView {
         isMultipleTouchEnabled = true
         isExclusiveTouch = false
         backgroundColor = .clear
-        baseView.backgroundColor = UIColor.white.withAlphaComponent(0.12)
-        baseView.layer.borderColor = UIColor.white.withAlphaComponent(0.22).cgColor
+        baseView.backgroundColor = UIColor(white: 0.09, alpha: 0.42)
+        baseView.layer.borderColor = UIColor.white.withAlphaComponent(0.24).cgColor
         baseView.layer.borderWidth = 1
         baseView.isUserInteractionEnabled = false
         addSubview(baseView)
 
-        knobView.backgroundColor = UIColor.white.withAlphaComponent(0.36)
+        knobView.backgroundColor = UIColor.white.withAlphaComponent(0.42)
+        knobView.layer.borderColor = UIColor.white.withAlphaComponent(0.55).cgColor
+        knobView.layer.borderWidth = 1
+        knobView.layer.shadowColor = UIColor.black.cgColor
+        knobView.layer.shadowOpacity = 0.35
+        knobView.layer.shadowRadius = 4
+        knobView.layer.shadowOffset = CGSize(width: 0, height: 2)
         knobView.isUserInteractionEnabled = false
         addSubview(knobView)
     }
@@ -483,7 +563,7 @@ final class TouchAnalogStickUIView: UIView {
         let side = min(bounds.width, bounds.height)
         baseView.frame = CGRect(x: (bounds.width - side) / 2, y: (bounds.height - side) / 2, width: side, height: side)
         baseView.layer.cornerRadius = side / 2
-        let knob = side * 0.38
+        let knob = side * 0.40
         knobView.bounds = CGRect(x: 0, y: 0, width: knob, height: knob)
         knobView.layer.cornerRadius = knob / 2
         if activeTouch == nil {
@@ -494,7 +574,10 @@ final class TouchAnalogStickUIView: UIView {
     private func updateStick(for touch: UITouch?) {
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
         guard let touch else {
-            knobView.center = center
+            UIView.animate(withDuration: 0.14, delay: 0, usingSpringWithDamping: 0.78, initialSpringVelocity: 0.4, options: [.allowUserInteraction, .beginFromCurrentState]) {
+                self.knobView.center = center
+                self.knobView.backgroundColor = UIColor.white.withAlphaComponent(0.42)
+            }
             onChange?(0, 0)
             return
         }
@@ -508,6 +591,7 @@ final class TouchAnalogStickUIView: UIView {
             dy = dy / dist * maxRadius
         }
         knobView.center = CGPoint(x: center.x + dx, y: center.y + dy)
+        knobView.backgroundColor = UIColor.white.withAlphaComponent(0.62)
         let nx = Float(dx / maxRadius)
         let ny = Float((invertY ? -dy : dy) / maxRadius)
         onChange?(nx, ny)
@@ -615,9 +699,10 @@ struct PlayerFloatingPill: View {
             .frame(height: 30)
             .background(.ultraThinMaterial, in: Capsule())
             .background(Color.black.opacity(0.42), in: Capsule())
-            .overlay(Capsule().stroke(Color.white.opacity(0.16), lineWidth: 1))
+            .overlay(Capsule().stroke(Color.white.opacity(0.16), lineWidth: 0.75))
+            .shadow(color: .black.opacity(0.35), radius: 8, y: 2)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PhoneTactileButtonStyle(pressedScale: 0.95))
         .accessibilityLabel("暂停与菜单")
     }
 }
@@ -660,98 +745,103 @@ struct PlayerPauseOverlay<ExtraContent: View>: View {
 
     var body: some View {
         ZStack {
-            Color.black.opacity(0.62)
+            Color.black.opacity(0.64)
                 .ignoresSafeArea()
                 .onTapGesture {
                     if !isExiting { onResume() }
                 }
 
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(alignment: .top, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(title)
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .lineLimit(1)
-                        Text(hasController ? "\(subtitle) · 已连接实体手柄" : subtitle)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.white.opacity(0.55))
-                    }
-                    Spacer()
-                    Button(action: onResume) {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.8))
-                            .frame(width: 30, height: 30)
-                            .background(Color.white.opacity(0.10), in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isExiting)
-                }
-
-                VStack(alignment: .leading, spacing: 12) {
-                    Toggle("显示虚拟按键", isOn: $showVirtualPad)
-                        .font(.system(size: 13, weight: .medium))
-                        .tint(.white)
-
-                    if showVirtualPad {
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Text("按键透明度")
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(.white.opacity(0.68))
-                                Spacer()
-                                Text("\(Int(padOpacity * 100))%")
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.8))
-                            }
-                            Slider(value: $padOpacity, in: 0.25...1.0)
-                                .tint(.white)
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(alignment: .top, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(title)
+                                .font(.system(size: 16, weight: .semibold, design: .rounded))
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                            Text(hasController ? "\(subtitle) · 已连接实体手柄" : subtitle)
+                                .font(.system(size: 12))
+                                .foregroundStyle(.white.opacity(0.58))
                         }
+                        Spacer()
+                        Button(action: onResume) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.84))
+                                .frame(width: 30, height: 30)
+                                .background(Color.white.opacity(0.11), in: Circle())
+                                .overlay(Circle().stroke(Color.white.opacity(0.12), lineWidth: 0.75))
+                        }
+                        .buttonStyle(PhoneTactileButtonStyle(pressedScale: 0.92))
+                        .disabled(isExiting)
                     }
 
-                    Toggle("按键震动反馈", isOn: $hapticsEnabled)
-                        .font(.system(size: 13, weight: .medium))
-                        .tint(.white)
+                    VStack(alignment: .leading, spacing: 12) {
+                        Toggle("显示虚拟按键", isOn: $showVirtualPad)
+                            .font(.system(size: 13, weight: .medium))
+                            .tint(.white)
 
-                    extraContent()
+                        if showVirtualPad {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("按键透明度")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.white.opacity(0.70))
+                                    Spacer()
+                                    Text("\(Int(padOpacity * 100))%")
+                                        .font(.system(size: 12, design: .monospaced))
+                                        .foregroundStyle(.white.opacity(0.84))
+                                }
+                                Slider(value: $padOpacity, in: 0.25...1.0)
+                                    .tint(.white)
+                            }
+                        }
+
+                        Toggle("按键震动反馈", isOn: $hapticsEnabled)
+                            .font(.system(size: 13, weight: .medium))
+                            .tint(.white)
+
+                        extraContent()
+                    }
+                    .padding(14)
+                    .background(Color.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.white.opacity(0.10), lineWidth: 0.75))
+
+                    VStack(spacing: 9) {
+                        Button(action: onResume) {
+                            Text("继续游戏")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(Color(white: 0.06))
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 44)
+                                .background(Color(white: 0.94), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        }
+                        .buttonStyle(PhoneTactileButtonStyle())
+                        .disabled(isExiting)
+
+                        Button(action: onExit) {
+                            Text(isExiting ? "正在保存并退出…" : "保存并退出游戏")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(Color(red: 1.0, green: 0.52, blue: 0.56))
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 42)
+                                .background(Color.red.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.red.opacity(0.28), lineWidth: 0.75))
+                        }
+                        .buttonStyle(PhoneTactileButtonStyle())
+                        .disabled(isExiting)
+                    }
                 }
-                .padding(14)
-                .background(Color.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.white.opacity(0.09), lineWidth: 1))
-
-                VStack(spacing: 9) {
-                    Button(action: onResume) {
-                        Text("继续游戏")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(Color(white: 0.06))
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 44)
-                            .background(Color(white: 0.94), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isExiting)
-
-                    Button(action: onExit) {
-                        Text(isExiting ? "正在保存并退出…" : "保存并退出游戏")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(Color(red: 1.0, green: 0.52, blue: 0.56))
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 42)
-                            .background(Color.red.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.red.opacity(0.28), lineWidth: 1))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isExiting)
-                }
+                .padding(20)
             }
-            .padding(20)
-            .frame(maxWidth: 350)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-            .background(Color(white: 0.09).opacity(0.75), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 1))
-            .shadow(color: .black.opacity(0.6), radius: 30, y: 12)
-            .padding(20)
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(maxWidth: 360)
+            .fixedSize(horizontal: false, vertical: true)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .background(Color(white: 0.08).opacity(0.76), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.white.opacity(0.16), lineWidth: 0.75))
+            .shadow(color: .black.opacity(0.65), radius: 32, y: 14)
+            .padding(16)
         }
         .preferredColorScheme(.dark)
     }

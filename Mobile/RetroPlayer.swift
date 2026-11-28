@@ -35,12 +35,12 @@ struct RetroPlayer: View {
     }
 
     var body: some View {
-        GeometryReader { size in
-            let wide = size.size.width > size.size.height
-            let padSide: CGFloat = wide ? min(132, size.size.height * 0.42) : min(136, size.size.width * 0.36)
+        FullScreenReader { fullSize, safeInsets in
+            let wide = fullSize.width > fullSize.height
+            let padSide: CGFloat = wide ? min(132, fullSize.height * 0.42) : min(136, fullSize.width * 0.36)
 
             ZStack {
-                Color.black.ignoresSafeArea()
+                Color.black
 
                 if let error = session.error {
                     VStack(spacing: 16) {
@@ -52,13 +52,12 @@ struct RetroPlayer: View {
                             .padding(.horizontal, 22)
                             .frame(height: 42)
                             .background(Color(white: 0.94), in: Capsule())
-                            .buttonStyle(.plain)
+                            .buttonStyle(PhoneTactileButtonStyle())
                     }
                     .padding(24)
                 } else if wide {
                     ZStack {
-                        screenArea
-                            .ignoresSafeArea(edges: showVirtualPad ? [] : .all)
+                        screenArea(rounded: false)
 
                         if showVirtualPad {
                             HStack {
@@ -66,8 +65,10 @@ struct RetroPlayer: View {
                                 Spacer()
                                 rightControls(padSide: padSide)
                             }
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 12)
+                            .padding(.leading, max(safeInsets.leading, 14))
+                            .padding(.trailing, max(safeInsets.trailing, 14))
+                            .padding(.top, max(safeInsets.top, 12))
+                            .padding(.bottom, max(safeInsets.bottom, 12))
                             .opacity(padOpacity)
                             .transition(.opacity)
                         }
@@ -76,7 +77,7 @@ struct RetroPlayer: View {
                         PlayerFloatingPill(title: rom.title, hasController: hasController) {
                             openPauseMenu()
                         }
-                        .padding(.top, 10)
+                        .padding(.top, max(safeInsets.top, 10))
                     }
                 } else {
                     VStack(spacing: 0) {
@@ -87,10 +88,10 @@ struct RetroPlayer: View {
                             }
                             Spacer()
                         }
-                        .padding(.top, 6)
+                        .padding(.top, max(safeInsets.top, 8) + 4)
                         .padding(.bottom, 8)
 
-                        screenArea
+                        screenArea(rounded: true)
                             .padding(.horizontal, 10)
                             .padding(.bottom, 10)
 
@@ -161,12 +162,12 @@ struct RetroPlayer: View {
                                     .frame(width: 82, height: 34)
                                 }
                             }
-                            .padding(.horizontal, 20)
+                            .padding(.horizontal, max(max(safeInsets.leading, safeInsets.trailing), 20))
                             .padding(.top, 14)
-                            .padding(.bottom, 16)
-                            .background(Color.white.opacity(0.03))
+                            .padding(.bottom, max(safeInsets.bottom, 16) + 4)
+                            .background(Color.white.opacity(0.035))
                             .overlay(alignment: .top) {
-                                Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+                                Rectangle().fill(Color.white.opacity(0.08)).frame(height: 0.75)
                             }
                             .opacity(padOpacity)
                             .transition(.opacity)
@@ -183,7 +184,8 @@ struct RetroPlayer: View {
                                     .foregroundStyle(.white.opacity(0.38))
                             }
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 36)
+                            .padding(.top, 28)
+                            .padding(.bottom, max(safeInsets.bottom, 28) + 8)
                         }
                     }
                 }
@@ -204,7 +206,9 @@ struct RetroPlayer: View {
             .animation(.easeOut(duration: 0.18), value: showVirtualPad)
             .animation(.easeOut(duration: 0.16), value: showingPauseMenu)
         }
+        .background(Color.black.ignoresSafeArea())
         .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
         .task {
             syncControllerState()
             session.start(rom: rom, library: library)
@@ -240,11 +244,11 @@ struct RetroPlayer: View {
         }
     }
 
-    private var screenArea: some View {
+    private func screenArea(rounded: Bool) -> some View {
         ZStack {
             RetroScreenView(view: session.screenView)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: rounded ? 12 : 0, style: .continuous))
             if !session.hasFrame {
                 ProgressView("正在读取游戏")
                     .tint(.white)

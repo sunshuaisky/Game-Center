@@ -388,32 +388,32 @@ struct PhoneMetadataSection: View {
                         Text(metadata.searching.contains(id) ? "查找中…" : "刷新资料")
                             .font(.system(size: 12, weight: .medium))
                     }
-                    .foregroundStyle(.white.opacity(0.9))
-                    .padding(.horizontal, 11)
+                    .foregroundStyle(.white.opacity(0.92))
+                    .padding(.horizontal, 12)
                     .frame(height: 30)
                     .background(Color.white.opacity(0.09), in: Capsule())
-                    .overlay(Capsule().stroke(Color.white.opacity(0.12), lineWidth: 1))
+                    .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 0.75))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PhoneTactileButtonStyle())
                 .disabled(metadata.searching.contains(id))
             }
 
             if let synopsis = metadata.records[id]?.synopsis, !synopsis.isEmpty {
                 Text(synopsis)
-                    .font(.system(size: 13))
-                    .lineSpacing(4)
-                    .foregroundStyle(.white.opacity(0.78))
+                    .font(.system(size: 13.5))
+                    .lineSpacing(4.5)
+                    .foregroundStyle(.white.opacity(0.82))
                     .textSelection(.enabled)
             } else {
                 Text(metadata.searching.contains(id) ? "正在联网查找简介与封面…" : "点击「刷新资料」自动匹配在线简介与封面。")
                     .font(.system(size: 13))
-                    .foregroundStyle(.white.opacity(0.48))
+                    .foregroundStyle(.white.opacity(0.50))
             }
 
             if let message = metadata.messages[id] {
                 Text(message)
                     .font(.system(size: 12))
-                    .foregroundStyle(.white.opacity(0.55))
+                    .foregroundStyle(.white.opacity(0.56))
             }
 
             if let source = metadata.records[id]?.source,
@@ -422,7 +422,7 @@ struct PhoneMetadataSection: View {
                 Divider().overlay(Color.white.opacity(0.08))
                 HStack {
                     Text("简介来源")
-                        .font(.system(size: 11))
+                        .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.white.opacity(0.45))
                     Spacer()
                     Link(destination: url) {
@@ -433,13 +433,13 @@ struct PhoneMetadataSection: View {
                                 .font(.system(size: 10, weight: .semibold))
                         }
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.82))
+                        .foregroundStyle(.white.opacity(0.86))
                     }
                 }
             }
         }
         .padding(16)
-        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.white.opacity(0.09), lineWidth: 1))
+        .background(Color.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color.white.opacity(0.10), lineWidth: 0.75))
     }
 }
